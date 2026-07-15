@@ -115,16 +115,25 @@ func (e *Engine) handlePageFetch(ctx context.Context, item store.FrontierItem) e
 			if !e.reservePage(linkHost, budget) {
 				continue
 			}
-			if _, err := e.frontier.Enqueue(&store.FrontierItem{
+			added, err := e.frontier.Enqueue(&store.FrontierItem{
 				RunID:    e.opts.RunID,
 				Kind:     store.KindPageFetch,
 				URL:      link,
 				Host:     linkHost,
 				Depth:    item.Depth + 1,
 				DedupKey: dedupKey(store.KindPageFetch, link),
-			}); err != nil {
+			})
+			if err != nil {
 				e.releasePage(linkHost)
 				e.logger.Warn("crawler: failed to enqueue page_fetch", "url", link, "error", err)
+				continue
+			}
+			if !added {
+				// Dedup no-op: the link was already queued, so no new page
+				// was enqueued — free the budget unit we reserved, or
+				// repeated nav links would exhaust the per-domain budget
+				// without fetching that many distinct pages.
+				e.releasePage(linkHost)
 			}
 		}
 	}

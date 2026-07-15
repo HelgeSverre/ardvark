@@ -78,6 +78,11 @@ func (f *Frontier) Enqueue(item *store.FrontierItem) (bool, error) {
 		"attempts":   0,
 		"last_error": "",
 		"run_id":     item.RunID,
+		// Adopt the re-enqueue's depth. Without this a reference cycle
+		// (e.g. two registries referring to each other) keeps re-activating
+		// a done item at its original shallow depth, so the depth guard
+		// never trips and the crawl loops forever.
+		"depth": item.Depth,
 	})
 	if res.Error != nil {
 		return false, fmt.Errorf("frontier: re-enqueue: %w", res.Error)
@@ -161,6 +166,32 @@ func (f *Frontier) Dequeue(n int) ([]store.FrontierItem, error) {
 func lockingSupported(tx *gorm.DB) bool {
 	name := tx.Dialector.Name()
 	return name == "mysql" || name == "postgres"
+}
+
+// Requeue returns an item to pending without touching its attempt counter.
+// Used when work is interrupted (context cancelled) rather than failed, so a
+// resumed run picks it up again cleanly.
+func (f *Frontier) Requeue(id uint) error {
+	res := f.db.Model(&store.FrontierItem{}).Where("id = ?", id).
+		Updates(map[string]any{"status": store.FrontierStatusPending})
+	if res.Error != nil {
+		return fmt.Errorf("frontier: requeue %d: %w", id, res.Error)
+	}
+	return nil
+}
+
+// ReclaimInFlight returns any items stuck in_flight to pending and reports how
+// many were reclaimed. ardvark runs one crawl process at a time, so an
+// in_flight item at startup is always the residue of a previous process that
+// was killed mid-batch; reclaiming them makes crash recovery resumable.
+func (f *Frontier) ReclaimInFlight() (int64, error) {
+	res := f.db.Model(&store.FrontierItem{}).
+		Where("status = ?", store.FrontierStatusInFlight).
+		Updates(map[string]any{"status": store.FrontierStatusPending})
+	if res.Error != nil {
+		return 0, fmt.Errorf("frontier: reclaim in-flight: %w", res.Error)
+	}
+	return res.RowsAffected, nil
 }
 
 // Complete marks a frontier item as done.

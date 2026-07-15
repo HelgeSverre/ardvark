@@ -103,9 +103,14 @@ func TestParseURN(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "uppercase publisher",
-			input:   "urn:air:Example.com:name",
-			wantErr: true,
+			name:  "uppercase publisher is normalized, not rejected",
+			input: "urn:air:Example.com:agents:name",
+			want: URN{
+				NID:       "air",
+				Publisher: "example.com",
+				Namespace: []string{"agents"},
+				Name:      "name",
+			},
 		},
 		{
 			name:    "publisher without dot",

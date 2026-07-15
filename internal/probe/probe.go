@@ -133,19 +133,21 @@ func probeRobotsAgentmap(ctx context.Context, client *fetch.Client, host string)
 
 	if raw == "" {
 		return Result{
-			Method:  MethodRobotsAgentmap,
-			URL:     robotsURL,
-			Outcome: OutcomeMiss,
+			Method:      MethodRobotsAgentmap,
+			URL:         robotsURL,
+			Outcome:     OutcomeMiss,
+			ErrorDetail: "no robots.txt",
 		}
 	}
 
 	urls := parseAgentmapDirectives(raw, robotsURL)
 	if len(urls) == 0 {
 		return Result{
-			Method:     MethodRobotsAgentmap,
-			URL:        robotsURL,
-			HTTPStatus: http.StatusOK,
-			Outcome:    OutcomeMiss,
+			Method:      MethodRobotsAgentmap,
+			URL:         robotsURL,
+			HTTPStatus:  http.StatusOK,
+			Outcome:     OutcomeMiss,
+			ErrorDetail: "no Agentmap directive",
 		}
 	}
 

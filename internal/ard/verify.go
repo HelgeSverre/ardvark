@@ -303,7 +303,12 @@ func semanticChecks(c Catalog, servingDomain string) []Check {
 			checks = append(checks, checkPublisherMatches(urn, servingDomain, subject))
 		}
 
-		checks = append(checks, checkQueriesCount(e, subject))
+		// representativeQueries describe a callable capability; they are not
+		// meaningful for container/pointer entries (a nested catalog or a
+		// registry endpoint), so don't warn on their absence there.
+		if !isPointerMediaType(e.Type) {
+			checks = append(checks, checkQueriesCount(e, subject))
+		}
 		checks = append(checks, checkMediaType(e, subject))
 	}
 
@@ -421,6 +426,12 @@ func checkPublisherMatches(u URN, servingDomain, subject string) Check {
 
 // checkQueriesCount: queries.count (warning) — 2-5 representativeQueries
 // recommended.
+// isPointerMediaType reports whether an entry type is a container or endpoint
+// pointer (a nested catalog or a registry) rather than a callable capability.
+func isPointerMediaType(mediaType string) bool {
+	return mediaType == "application/ai-catalog+json" || mediaType == "application/ai-registry+json"
+}
+
 func checkQueriesCount(e Entry, subject string) Check {
 	n := len(e.RepresentativeQueries)
 	passed := n >= 2 && n <= 5

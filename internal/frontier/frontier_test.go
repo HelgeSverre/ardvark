@@ -249,3 +249,88 @@ func TestConcurrentDequeueNoDoubleDelivery(t *testing.T) {
 		}
 	}
 }
+
+// A done item re-enqueued at a deeper depth must adopt that depth, or a
+// reference cycle (two registries referring to each other) would re-activate
+// it forever at its original shallow depth and never trip the depth guard.
+func TestEnqueueResetAdoptsDeeperDepth(t *testing.T) {
+	f := newTestFrontier(t)
+
+	item := &store.FrontierItem{Kind: store.KindRegistryHarvest, URL: "https://r.example/api", Depth: 0, DedupKey: "reg:r"}
+	if _, err := f.Enqueue(item); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := f.Complete(item.ID); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	// Re-enqueue the same dedup key at depth 2 (as a referral would).
+	reenq := &store.FrontierItem{Kind: store.KindRegistryHarvest, URL: "https://r.example/api", Depth: 2, DedupKey: "reg:r"}
+	ok, err := f.Enqueue(reenq)
+	if err != nil {
+		t.Fatalf("re-Enqueue: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected re-enqueue of a done item to reset it to pending")
+	}
+
+	items, err := f.Dequeue(1)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(items) != 1 || items[0].Depth != 2 {
+		t.Fatalf("expected reclaimed item at depth 2, got %+v", items)
+	}
+}
+
+// ReclaimInFlight returns items stranded in_flight by a killed process back to
+// pending so a resumed crawl picks them up.
+func TestReclaimInFlight(t *testing.T) {
+	f := newTestFrontier(t)
+
+	if _, err := f.Enqueue(&store.FrontierItem{Kind: store.KindHostProbe, Host: "a.example", DedupKey: "hp:a"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	// Dequeue moves it to in_flight but we never Complete/Fail it (crash).
+	if _, err := f.Dequeue(1); err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if got, _ := f.Dequeue(1); len(got) != 0 {
+		t.Fatal("expected nothing pending while item is in_flight")
+	}
+
+	n, err := f.ReclaimInFlight()
+	if err != nil {
+		t.Fatalf("ReclaimInFlight: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("reclaimed %d, want 1", n)
+	}
+	if got, _ := f.Dequeue(1); len(got) != 1 {
+		t.Fatal("expected reclaimed item to be dequeuable again")
+	}
+}
+
+// Requeue returns an item to pending without burning an attempt (used on
+// graceful shutdown so interrupted work resumes cleanly).
+func TestRequeue(t *testing.T) {
+	f := newTestFrontier(t)
+
+	item := &store.FrontierItem{Kind: store.KindHostProbe, Host: "b.example", DedupKey: "hp:b"}
+	if _, err := f.Enqueue(item); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := f.Dequeue(1); err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if err := f.Requeue(item.ID); err != nil {
+		t.Fatalf("Requeue: %v", err)
+	}
+	got, err := f.Dequeue(1)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(got) != 1 || got[0].Attempts != 0 {
+		t.Fatalf("expected requeued item with 0 attempts, got %+v", got)
+	}
+}

@@ -445,3 +445,25 @@ func TestVerify_GoldenCorpus(t *testing.T) {
 		}
 	})
 }
+
+// queries.count must not fire for container/pointer entries (nested catalogs
+// and registry endpoints), which legitimately have no representativeQueries.
+func TestVerify_QueriesCountSkipsPointerEntries(t *testing.T) {
+	doc := []byte(`{
+		"specVersion": "1.0",
+		"host": {"displayName": "T"},
+		"entries": [
+			{"identifier": "urn:air:example.com:registry:main", "displayName": "R", "type": "application/ai-registry+json", "url": "https://example.com/api"},
+			{"identifier": "urn:air:example.com:bundle:x", "displayName": "B", "type": "application/ai-catalog+json", "url": "https://example.com/nested.json"}
+		]
+	}`)
+	report := Verify(doc, "example.com")
+	for _, c := range report.Checks {
+		if c.CheckID == "queries.count" {
+			t.Fatalf("queries.count should be skipped for pointer entries, got check on %q", c.Subject)
+		}
+	}
+	if report.Verdict == VerdictInvalid {
+		t.Fatalf("pointer-only catalog should not be invalid, got %s", report.Verdict)
+	}
+}

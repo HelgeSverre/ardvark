@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -62,7 +64,7 @@ func runProbe(cmd *cobra.Command, args []string) error {
 				p.Errorf("probe: failed to record probe for %q: %v", host, err)
 			}
 
-			status, extra := probeRowStatus(r)
+			status, result, extra := probeRowStatus(r)
 			switch r.Outcome {
 			case probe.OutcomeHit:
 				hits++
@@ -71,7 +73,7 @@ func runProbe(cmd *cobra.Command, args []string) error {
 			case probe.OutcomeError:
 				errs++
 			}
-			p.Row(status, host, r.Method, r.Outcome, extra)
+			p.Row(status, host, r.Method, result, extra)
 		}
 	}
 
@@ -83,18 +85,30 @@ func runProbe(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// probeRowStatus maps a probe.Result to a ui.Status and a detail string for
-// display.
-func probeRowStatus(r probe.Result) (ui.Status, string) {
+// probeRowStatus maps a probe.Result to a ui.Status, a result label, and an
+// optional detail, matching the column semantics of the crawl command's rows
+// (the result column carries meaning; it does not repeat the status word).
+func probeRowStatus(r probe.Result) (status ui.Status, result, extra string) {
 	switch r.Outcome {
 	case probe.OutcomeHit:
-		return ui.StatusHit, fmt.Sprintf("%d %s", r.HTTPStatus, r.ContentType)
+		return ui.StatusHit, "found", strings.TrimSpace(fmt.Sprintf("%d %s", r.HTTPStatus, r.ContentType))
 	case probe.OutcomeError:
-		return ui.StatusError, r.ErrorDetail
+		return ui.StatusError, "error", r.ErrorDetail
 	default:
-		if r.HTTPStatus != 0 {
-			return ui.StatusMiss, fmt.Sprintf("%d", r.HTTPStatus)
-		}
-		return ui.StatusMiss, ""
+		return ui.StatusMiss, probeMissReason(r), ""
+	}
+}
+
+// probeMissReason gives the human reason for a miss: the recorded detail
+// (e.g. "no Agentmap directive", "non-JSON response") when present, else the
+// HTTP status, else a generic fallback.
+func probeMissReason(r probe.Result) string {
+	switch {
+	case r.ErrorDetail != "":
+		return r.ErrorDetail
+	case r.HTTPStatus != 0:
+		return strconv.Itoa(r.HTTPStatus)
+	default:
+		return "not found"
 	}
 }

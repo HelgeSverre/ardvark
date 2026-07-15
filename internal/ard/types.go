@@ -127,7 +127,10 @@ func ParseURN(s string) (URN, error) {
 		return URN{}, fmt.Errorf("ard: invalid urn %q: requires at least publisher and name", s)
 	}
 
-	publisher := segments[0]
+	// DNS names are case-insensitive and the official schema permits an
+	// uppercase publisher, so normalize rather than reject — a capitalized
+	// domain must not force the catalog to "invalid".
+	publisher := strings.ToLower(segments[0])
 	name := segments[len(segments)-1]
 	namespace := segments[1 : len(segments)-1]
 
@@ -144,11 +147,8 @@ func ParseURN(s string) (URN, error) {
 }
 
 // validatePublisher does a light sanity check that publisher looks like an
-// FQDN: lowercase, at least one dot, no whitespace.
+// FQDN: at least one dot, no whitespace. Case is normalized by the caller.
 func validatePublisher(publisher string) error {
-	if publisher != strings.ToLower(publisher) {
-		return fmt.Errorf("publisher %q must be lowercase", publisher)
-	}
 	if !strings.Contains(publisher, ".") {
 		return fmt.Errorf("publisher %q must be a fully-qualified domain name", publisher)
 	}

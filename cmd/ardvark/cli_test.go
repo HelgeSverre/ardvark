@@ -103,7 +103,7 @@ func TestProbeRowStatus(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotStatus, _ := probeRowStatus(tt.result)
+			gotStatus, _, _ := probeRowStatus(tt.result)
 			if gotStatus != tt.wantStatus {
 				t.Fatalf("probeRowStatus() status = %v, want %v", gotStatus, tt.wantStatus)
 			}

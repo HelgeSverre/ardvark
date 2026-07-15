@@ -50,13 +50,14 @@ func (e *Engine) emit(ev ProbeEvent) {
 // generic "not found" when neither is available (e.g. a robots.txt with no
 // Agentmap directive).
 func probeDetail(r probe.Result) string {
+	// Prefer the human reason (e.g. "no Agentmap directive", "non-JSON
+	// response") over a bare status code, which for robots_agentmap misses
+	// would misleadingly show the robots.txt "200".
 	switch {
-	case r.Outcome == probe.OutcomeError && r.ErrorDetail != "":
+	case r.ErrorDetail != "":
 		return r.ErrorDetail
 	case r.HTTPStatus > 0:
 		return strconv.Itoa(r.HTTPStatus)
-	case r.ErrorDetail != "":
-		return r.ErrorDetail
 	default:
 		return "not found"
 	}

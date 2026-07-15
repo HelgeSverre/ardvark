@@ -168,6 +168,14 @@ func (e *Engine) EnqueueSeedHost(host, discoverySource string) (bool, error) {
 // empty or ctx is cancelled (graceful shutdown: no new batch is started,
 // but the current in-flight batch is allowed to finish).
 func (e *Engine) Run(ctx context.Context) error {
+	// Reclaim items left in_flight by a previously killed process (ardvark
+	// runs one crawl at a time, so any in_flight row at startup is stale).
+	if n, err := e.frontier.ReclaimInFlight(); err != nil {
+		return fmt.Errorf("crawler: reclaim in-flight: %w", err)
+	} else if n > 0 {
+		e.logger.Info("crawler: reclaimed stale in-flight items", "count", n)
+	}
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil
@@ -231,6 +239,16 @@ func (e *Engine) process(ctx context.Context, item store.FrontierItem) {
 			return
 		}
 		e.logger.Info("crawler: item complete", "item_id", item.ID, "kind", item.Kind, "url", item.URL, "host", item.Host)
+		return
+	}
+
+	// Interrupted by shutdown, not a real failure: return the item to pending
+	// so a resumed run retries it, rather than burning an attempt or marking
+	// it permanently failed and silently losing the work.
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+		if rerr := e.frontier.Requeue(item.ID); rerr != nil {
+			e.logger.Error("crawler: failed to requeue interrupted item", "item_id", item.ID, "error", rerr)
+		}
 		return
 	}
 
