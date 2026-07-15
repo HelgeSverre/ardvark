@@ -3,7 +3,9 @@ package frontier
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/helgesverre/ardvark/internal/store"
 )
@@ -347,5 +349,294 @@ func TestRequeue(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].Attempts != 0 {
 		t.Fatalf("expected requeued item with 0 attempts, got %+v", got)
+	}
+}
+
+// -- Lease-based claiming ----------------------------------------------
+
+// Dequeue must stamp a future leased_until and a non-empty worker_id on
+// every item it marks in_flight, both in the returned slice and in the
+// persisted row.
+func TestDequeueSetsLease(t *testing.T) {
+	f := newTestFrontier(t)
+
+	item := &store.FrontierItem{Kind: store.KindHostProbe, Host: "lease.example", DedupKey: "hp:lease"}
+	if _, err := f.Enqueue(item); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	before := time.Now()
+	items, err := f.Dequeue(1)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	got := items[0]
+	if got.LeasedUntil == nil {
+		t.Fatal("expected LeasedUntil to be set on the returned item")
+	}
+	if !got.LeasedUntil.After(before) {
+		t.Fatalf("expected LeasedUntil in the future, got %v (before=%v)", got.LeasedUntil, before)
+	}
+	if got.WorkerID == "" {
+		t.Fatal("expected WorkerID to be set on the returned item")
+	}
+
+	var reloaded store.FrontierItem
+	if err := f.db.First(&reloaded, item.ID).Error; err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.LeasedUntil == nil {
+		t.Fatal("expected LeasedUntil to be persisted")
+	}
+	if reloaded.WorkerID == "" {
+		t.Fatal("expected WorkerID to be persisted")
+	}
+}
+
+// WithLeaseSeconds must control the lease duration Dequeue stamps.
+func TestWithLeaseSecondsOption(t *testing.T) {
+	s, err := store.Open("sqlite", "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	f := New(s.DB, WithLeaseSeconds(120), WithWorkerID("worker-a"))
+	if _, err := f.Enqueue(&store.FrontierItem{Kind: store.KindHostProbe, Host: "opt.example", DedupKey: "hp:opt"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	items, err := f.Dequeue(1)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	if items[0].WorkerID != "worker-a" {
+		t.Fatalf("WorkerID = %q, want %q", items[0].WorkerID, "worker-a")
+	}
+	remaining := time.Until(*items[0].LeasedUntil)
+	if remaining < 100*time.Second || remaining > 130*time.Second {
+		t.Fatalf("expected ~120s lease remaining, got %v", remaining)
+	}
+}
+
+// WithLeaseSeconds(0) (or a negative value) must be a no-op: config keys
+// use 0/absent to mean "use the default", not "no lease".
+func TestWithLeaseSecondsZeroIsNoOp(t *testing.T) {
+	s, err := store.Open("sqlite", "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	f := New(s.DB, WithLeaseSeconds(0))
+	if f.leaseDuration != defaultLeaseSeconds*time.Second {
+		t.Fatalf("leaseDuration = %v, want default %v", f.leaseDuration, defaultLeaseSeconds*time.Second)
+	}
+}
+
+// Complete, Fail, and Requeue must all clear leased_until/worker_id, so a
+// finished or returned-to-pending item never looks like it's still
+// (validly) leased.
+func TestCompleteClearsLease(t *testing.T) {
+	f := newTestFrontier(t)
+	item := &store.FrontierItem{Kind: store.KindHostProbe, Host: "c.example", DedupKey: "hp:c"}
+	if _, err := f.Enqueue(item); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := f.Dequeue(1); err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if err := f.Complete(item.ID); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	assertLeaseCleared(t, f, item.ID)
+}
+
+func TestFailClearsLease(t *testing.T) {
+	f := newTestFrontier(t)
+	item := &store.FrontierItem{Kind: store.KindHostProbe, Host: "f.example", DedupKey: "hp:f"}
+	if _, err := f.Enqueue(item); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := f.Dequeue(1); err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if _, err := f.Fail(item.ID, errors.New("boom"), 3); err != nil {
+		t.Fatalf("Fail: %v", err)
+	}
+	assertLeaseCleared(t, f, item.ID)
+}
+
+func TestRequeueClearsLease(t *testing.T) {
+	f := newTestFrontier(t)
+	item := &store.FrontierItem{Kind: store.KindHostProbe, Host: "r.example", DedupKey: "hp:r"}
+	if _, err := f.Enqueue(item); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := f.Dequeue(1); err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if err := f.Requeue(item.ID); err != nil {
+		t.Fatalf("Requeue: %v", err)
+	}
+	assertLeaseCleared(t, f, item.ID)
+}
+
+func assertLeaseCleared(t *testing.T, f *Frontier, id uint) {
+	t.Helper()
+	var reloaded store.FrontierItem
+	if err := f.db.First(&reloaded, id).Error; err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.LeasedUntil != nil {
+		t.Fatalf("expected LeasedUntil cleared, got %v", reloaded.LeasedUntil)
+	}
+	if reloaded.WorkerID != "" {
+		t.Fatalf("expected WorkerID cleared, got %q", reloaded.WorkerID)
+	}
+}
+
+// ReclaimExpired must reset only in_flight items whose lease has passed,
+// leaving still-valid leases (a peer worker's legitimate in-flight item)
+// untouched.
+func TestReclaimExpiredOnlyExpired(t *testing.T) {
+	f := newTestFrontier(t)
+
+	for _, host := range []string{"expired.example", "fresh.example"} {
+		if _, err := f.Enqueue(&store.FrontierItem{Kind: store.KindHostProbe, Host: host, DedupKey: "hp:" + host}); err != nil {
+			t.Fatalf("Enqueue %s: %v", host, err)
+		}
+	}
+
+	items, err := f.Dequeue(2)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
+	}
+
+	// Simulate a lease that already expired for the first item only.
+	past := time.Now().Add(-time.Hour)
+	if err := f.db.Model(&store.FrontierItem{}).Where("id = ?", items[0].ID).
+		Update("leased_until", &past).Error; err != nil {
+		t.Fatalf("forcing expired lease: %v", err)
+	}
+
+	n, err := f.ReclaimExpired()
+	if err != nil {
+		t.Fatalf("ReclaimExpired: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("reclaimed %d, want 1", n)
+	}
+
+	var expired, fresh store.FrontierItem
+	if err := f.db.First(&expired, items[0].ID).Error; err != nil {
+		t.Fatalf("reload expired: %v", err)
+	}
+	if expired.Status != store.FrontierStatusPending {
+		t.Fatalf("expired item status = %q, want pending", expired.Status)
+	}
+	if expired.LeasedUntil != nil {
+		t.Fatalf("expected expired item's lease cleared, got %v", expired.LeasedUntil)
+	}
+
+	if err := f.db.First(&fresh, items[1].ID).Error; err != nil {
+		t.Fatalf("reload fresh: %v", err)
+	}
+	if fresh.Status != store.FrontierStatusInFlight {
+		t.Fatalf("fresh item status = %q, want in_flight (must not be reclaimed)", fresh.Status)
+	}
+	if fresh.LeasedUntil == nil {
+		t.Fatal("expected fresh item's lease to remain set")
+	}
+}
+
+// -- Counts --------------------------------------------------------------
+
+func TestCounts(t *testing.T) {
+	f := newTestFrontier(t)
+
+	for _, host := range []string{"a.example", "b.example", "c.example"} {
+		if _, err := f.Enqueue(&store.FrontierItem{Kind: store.KindHostProbe, Host: host, DedupKey: "hp:" + host}); err != nil {
+			t.Fatalf("Enqueue %s: %v", host, err)
+		}
+	}
+	if _, err := f.Dequeue(2); err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+
+	pending, inFlight, err := f.Counts()
+	if err != nil {
+		t.Fatalf("Counts: %v", err)
+	}
+	if pending != 1 {
+		t.Fatalf("pending = %d, want 1", pending)
+	}
+	if inFlight != 2 {
+		t.Fatalf("inFlight = %d, want 2", inFlight)
+	}
+}
+
+// -- Re-enqueue race guard -------------------------------------------------
+
+// Enqueue's reset-a-finished-item-to-pending path is a read (lookup the
+// existing row) followed by a write (guarded UPDATE); concurrent callers
+// racing to re-enqueue the same finished dedup key must produce exactly one
+// winner, not one winner per concurrent caller that happened to read the
+// row before any of the writes landed. Because sqlite serializes writes,
+// this test is deterministic: whichever UPDATE actually executes first
+// flips the status away from done/failed, so every later UPDATE's
+// "AND status IN (...)" guard matches zero rows and reports (false, nil).
+func TestEnqueueReenqueueRaceGuard(t *testing.T) {
+	f := newTestFrontier(t)
+
+	item := &store.FrontierItem{Kind: store.KindHostProbe, Host: "race.example", DedupKey: "hp:race"}
+	if _, err := f.Enqueue(item); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := f.Complete(item.ID); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	const racers = 10
+	var wg sync.WaitGroup
+	var wins atomic.Int64
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			reenq := &store.FrontierItem{Kind: store.KindHostProbe, Host: "race.example", DedupKey: "hp:race"}
+			ok, err := f.Enqueue(reenq)
+			if err != nil {
+				t.Errorf("Enqueue: %v", err)
+				return
+			}
+			if ok {
+				wins.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := wins.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 winning re-enqueue, got %d", got)
+	}
+
+	// The row itself must end up pending exactly once — not corrupted by
+	// losing racers' partial updates.
+	count, err := f.PendingCount()
+	if err != nil {
+		t.Fatalf("PendingCount: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("PendingCount = %d, want 1", count)
 	}
 }

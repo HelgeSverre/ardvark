@@ -58,6 +58,15 @@ type CrawlerConfig struct {
 	UserAgent                string  `json:"userAgent"`
 	RespectRobotsTxt         bool    `json:"respectRobotsTxt"`
 	RefreshAfterHours        int     `json:"refreshAfterHours"`
+	// LeaseSeconds is how long a dequeued frontier item's in_flight lease
+	// lasts before internal/frontier's ReclaimExpired considers it
+	// abandoned and returns it to pending. This only matters for
+	// distributed crawling (mysql/postgres, multiple worker processes): a
+	// worker that dies mid-item can no longer requeue it itself, so the
+	// lease is what lets another worker eventually pick it back up. 0 (or
+	// unset) means "use the frontier package's own default" rather than
+	// "no lease" — see frontier.defaultLeaseSeconds.
+	LeaseSeconds int `json:"leaseSeconds"`
 }
 
 // ARDConfig controls catalog resolution depth.
@@ -180,6 +189,7 @@ func Defaults() Config {
 			UserAgent:                "ardvark/0.1 (+https://github.com/helgesverre/ardvark)",
 			RespectRobotsTxt:         true,
 			RefreshAfterHours:        168,
+			LeaseSeconds:             300,
 		},
 		ARD: ARDConfig{
 			MaxCatalogDepth: 3,

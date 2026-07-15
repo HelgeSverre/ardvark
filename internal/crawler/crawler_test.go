@@ -899,6 +899,94 @@ func TestRun_ForceCatalogCycleTerminates(t *testing.T) {
 	}
 }
 
+// -- distributed termination (Frontier.Counts) ----------------------------
+
+func TestIsSQLiteDriver(t *testing.T) {
+	cases := map[string]bool{
+		"":         true,
+		"sqlite":   true,
+		"sqlite3":  true,
+		"mysql":    false,
+		"postgres": false,
+	}
+	for driver, want := range cases {
+		if got := isSQLiteDriver(driver); got != want {
+			t.Errorf("isSQLiteDriver(%q) = %v, want %v", driver, got, want)
+		}
+	}
+}
+
+// TestRun_DoesNotTerminateWhileGloballyInFlight is the regression test for
+// distributed crawling's termination fix: this worker's own queue and
+// in-flight counter being empty must not be enough to exit when a peer
+// worker process (simulated here by dequeuing an item through the same
+// frontier without ever routing it through this Engine's Run loop) still
+// holds an in_flight item, since it could enqueue more work. cfg.Storage
+// .Driver is set to "postgres" purely to route Run through the
+// distributed (ReclaimExpired, not blanket ReclaimInFlight) branch; the
+// underlying store is still sqlite (see newTestStore).
+func TestRun_DoesNotTerminateWhileGloballyInFlight(t *testing.T) {
+	cfg := testCrawlerConfig()
+	cfg.Storage.Driver = "postgres"
+	eng, _ := newTestEngine(t, cfg)
+
+	if _, err := eng.frontier.Enqueue(&store.FrontierItem{
+		Kind: store.KindHostProbe, Host: "peer.example", DedupKey: "hp:peer",
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := eng.frontier.Dequeue(1); err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if err := eng.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("expected Run to keep polling (hitting the context deadline) while a peer's item is globally in_flight, not exit early")
+	}
+}
+
+// TestRun_TerminatesOnceGloballyInFlightItemCompletes complements the test
+// above: once the peer's item completes (frontier.Counts reports zero
+// pending and zero in_flight), Run must notice and return well before its
+// context deadline.
+func TestRun_TerminatesOnceGloballyInFlightItemCompletes(t *testing.T) {
+	cfg := testCrawlerConfig()
+	cfg.Storage.Driver = "postgres"
+	eng, _ := newTestEngine(t, cfg)
+
+	item := &store.FrontierItem{Kind: store.KindHostProbe, Host: "peer2.example", DedupKey: "hp:peer2"}
+	if _, err := eng.frontier.Enqueue(item); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := eng.frontier.Dequeue(1); err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		if err := eng.frontier.Complete(item.ID); err != nil {
+			t.Errorf("Complete: %v", err)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := eng.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("Run hit the context deadline instead of noticing the peer's item had completed")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("Run took %v to notice the peer's item completed; expected roughly one globalCountsCheckInterval (~1s)", elapsed)
+	}
+}
+
 // -- fixtures -------------------------------------------------------------
 
 const hostPlaceholder = "__HOST__"

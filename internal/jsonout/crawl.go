@@ -59,7 +59,7 @@ func Crawl(ctx context.Context, cfg config.Config, st *store.Store, seeds []stri
 		return CrawlResult{}, err
 	}
 
-	fr := frontier.New(st.DB)
+	fr := frontier.New(st.DB, frontier.WithLeaseSeconds(cfg.Crawler.LeaseSeconds))
 	fc := fetch.New(cfg.Crawler)
 	eng := crawler.New(cfg, st, fr, fc, logger, crawler.Options{
 		RunID:       run.ID,

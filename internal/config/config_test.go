@@ -49,6 +49,12 @@ func TestLoad_ValidConfig(t *testing.T) {
 	}
 }
 
+func TestDefaults_LeaseSeconds(t *testing.T) {
+	if got := Defaults().Crawler.LeaseSeconds; got != 300 {
+		t.Errorf("Defaults().Crawler.LeaseSeconds = %d, want 300", got)
+	}
+}
+
 func TestLoadBytes_InvalidCases(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -74,6 +80,11 @@ func TestLoadBytes_InvalidCases(t *testing.T) {
 			name:       "negative max depth",
 			json:       `{"crawler": {"maxDepth": -1}}`,
 			wantSubstr: `config.crawler.maxDepth`,
+		},
+		{
+			name:       "negative lease seconds",
+			json:       `{"crawler": {"leaseSeconds": -1}}`,
+			wantSubstr: `config.crawler.leaseSeconds`,
 		},
 		{
 			name:       "unknown top-level key",

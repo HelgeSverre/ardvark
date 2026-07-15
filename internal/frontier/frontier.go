@@ -7,7 +7,9 @@ package frontier
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
+	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -15,21 +17,77 @@ import (
 	"github.com/helgesverre/ardvark/internal/store"
 )
 
+// defaultLeaseSeconds is the in_flight lease duration used when neither
+// New's caller nor config.Config.Crawler.LeaseSeconds specifies one. See
+// store.FrontierItem.LeasedUntil's doc comment for what the lease is for.
+const defaultLeaseSeconds = 300
+
 // Frontier is a persistent, dedup'd work queue backed by the
 // frontier_items table.
 //
 // Mutators addressed by item id (Complete, Requeue, Fail) return an error
 // wrapping store.ErrNotFound when the id matches no row: an in-flight item
 // vanishing mid-crawl indicates a logic bug, never a normal outcome.
-// ReclaimInFlight is a bulk sweep for which zero matched rows is normal (a
-// clean start has nothing to reclaim).
+// ReclaimInFlight and ReclaimExpired are bulk sweeps for which zero matched
+// rows is normal (a clean start, or one with no expired leases, has nothing
+// to reclaim).
 type Frontier struct {
-	db *gorm.DB
+	db            *gorm.DB
+	leaseDuration time.Duration
+	workerID      string
 }
 
-// New wraps a *gorm.DB (or Store.DB) in a Frontier.
-func New(db *gorm.DB) *Frontier {
-	return &Frontier{db: db}
+// Option configures a Frontier at construction time. See WithLeaseSeconds
+// and WithWorkerID.
+type Option func(*Frontier)
+
+// WithLeaseSeconds sets how long a dequeued item's in_flight lease lasts
+// (see store.FrontierItem.LeasedUntil). seconds <= 0 is a no-op, leaving
+// the default (or a previously-applied option) in place — config keys use
+// 0/absent to mean "use the default", so callers can pass
+// cfg.Crawler.LeaseSeconds straight through without a branch.
+func WithLeaseSeconds(seconds int) Option {
+	return func(f *Frontier) {
+		if seconds > 0 {
+			f.leaseDuration = time.Duration(seconds) * time.Second
+		}
+	}
+}
+
+// WithWorkerID sets the identifier recorded in frontier_items.worker_id for
+// items this Frontier dequeues. Purely informational (reclaiming is
+// decided by LeasedUntil, not worker identity); useful for operational
+// visibility into which worker process is holding which item.
+func WithWorkerID(id string) Option {
+	return func(f *Frontier) {
+		f.workerID = id
+	}
+}
+
+// New wraps a *gorm.DB (or Store.DB) in a Frontier. Without options the
+// lease duration is defaultLeaseSeconds and the worker id is a
+// best-effort hostname:pid string (see defaultWorkerID).
+func New(db *gorm.DB, opts ...Option) *Frontier {
+	f := &Frontier{
+		db:            db,
+		leaseDuration: defaultLeaseSeconds * time.Second,
+		workerID:      defaultWorkerID(),
+	}
+	for _, opt := range opts {
+		opt(f)
+	}
+	return f
+}
+
+// defaultWorkerID returns a best-effort "hostname:pid" identifier for the
+// current process, falling back to just the pid if the hostname is
+// unavailable. Never fails: worker_id is informational only.
+func defaultWorkerID() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		return fmt.Sprintf("pid-%d", os.Getpid())
+	}
+	return fmt.Sprintf("%s:%d", host, os.Getpid())
 }
 
 // Item is a unit of frontier work.
@@ -74,19 +132,36 @@ func (f *Frontier) Enqueue(item *store.FrontierItem) (bool, error) {
 		return false, nil
 	}
 
-	res := f.db.Model(&store.FrontierItem{}).Where("id = ?", existing.ID).Updates(map[string]any{
-		"status":     store.FrontierStatusPending,
-		"attempts":   0,
-		"last_error": "",
-		"run_id":     item.RunID,
-		// Adopt the re-enqueue's depth. Without this a reference cycle
-		// (e.g. two registries referring to each other) keeps re-activating
-		// a done item at its original shallow depth, so the depth guard
-		// never trips and the crawl loops forever.
-		"depth": item.Depth,
-	})
+	// The status check above and this UPDATE are not atomic: another
+	// worker could dequeue/complete/fail the same row in between (e.g.
+	// re-enqueue a "done" reference-cycle target concurrently with a
+	// fresh dequeue of it after some other path reset it to pending). The
+	// WHERE clause's own status guard makes the UPDATE itself the atomic
+	// decision point — if it matches zero rows, someone else already
+	// changed the row's status out from under us, so this call lost the
+	// race and must not report success.
+	res := f.db.Model(&store.FrontierItem{}).
+		Where("id = ? AND status IN ?", existing.ID, []string{store.FrontierStatusDone, store.FrontierStatusFailed}).
+		Updates(map[string]any{
+			"status":       store.FrontierStatusPending,
+			"attempts":     0,
+			"last_error":   "",
+			"run_id":       item.RunID,
+			"leased_until": nil,
+			"worker_id":    "",
+			// Adopt the re-enqueue's depth. Without this a reference cycle
+			// (e.g. two registries referring to each other) keeps re-activating
+			// a done item at its original shallow depth, so the depth guard
+			// never trips and the crawl loops forever.
+			"depth": item.Depth,
+		})
 	if res.Error != nil {
 		return false, fmt.Errorf("frontier: re-enqueue: %w", res.Error)
+	}
+	if res.RowsAffected == 0 {
+		// Someone else won the race (already reset or re-dequeued this
+		// row); this enqueue attempt did nothing.
+		return false, nil
 	}
 	return true, nil
 }
@@ -146,13 +221,20 @@ func (f *Frontier) Dequeue(n int) ([]store.FrontierItem, error) {
 		for i, it := range items {
 			ids[i] = it.ID
 		}
+		leasedUntil := time.Now().Add(f.leaseDuration)
 		if err := tx.Model(&store.FrontierItem{}).
 			Where("id IN ?", ids).
-			Updates(map[string]any{"status": store.FrontierStatusInFlight}).Error; err != nil {
+			Updates(map[string]any{
+				"status":       store.FrontierStatusInFlight,
+				"leased_until": leasedUntil,
+				"worker_id":    f.workerID,
+			}).Error; err != nil {
 			return fmt.Errorf("marking items in_flight: %w", err)
 		}
 		for i := range items {
 			items[i].Status = store.FrontierStatusInFlight
+			items[i].LeasedUntil = &leasedUntil
+			items[i].WorkerID = f.workerID
 		}
 		return nil
 	})
@@ -174,7 +256,11 @@ func lockingSupported(tx *gorm.DB) bool {
 // resumed run picks it up again cleanly.
 func (f *Frontier) Requeue(id uint) error {
 	res := f.db.Model(&store.FrontierItem{}).Where("id = ?", id).
-		Updates(map[string]any{"status": store.FrontierStatusPending})
+		Updates(map[string]any{
+			"status":       store.FrontierStatusPending,
+			"leased_until": nil,
+			"worker_id":    "",
+		})
 	if res.Error != nil {
 		return fmt.Errorf("frontier: requeue %d: %w", id, res.Error)
 	}
@@ -184,24 +270,58 @@ func (f *Frontier) Requeue(id uint) error {
 	return nil
 }
 
-// ReclaimInFlight returns any items stuck in_flight to pending and reports how
-// many were reclaimed. ardvark runs one crawl process at a time, so an
-// in_flight item at startup is always the residue of a previous process that
-// was killed mid-batch; reclaiming them makes crash recovery resumable.
+// ReclaimInFlight returns every item currently in_flight to pending
+// (clearing its lease), regardless of whether its lease has expired, and
+// reports how many were reclaimed. This blanket sweep is only safe under
+// the single-process assumption: ardvark's sqlite storage backend supports
+// exactly one crawl process at a time (see store.Open's connection-pool
+// comment), so an in_flight row at startup is always the residue of a
+// previous process that was killed mid-batch, never a peer still working
+// on it. On mysql/postgres, where multiple worker processes may share the
+// frontier concurrently, use ReclaimExpired instead.
 func (f *Frontier) ReclaimInFlight() (int64, error) {
 	res := f.db.Model(&store.FrontierItem{}).
 		Where("status = ?", store.FrontierStatusInFlight).
-		Updates(map[string]any{"status": store.FrontierStatusPending})
+		Updates(map[string]any{
+			"status":       store.FrontierStatusPending,
+			"leased_until": nil,
+			"worker_id":    "",
+		})
 	if res.Error != nil {
 		return 0, fmt.Errorf("frontier: reclaim in-flight: %w", res.Error)
 	}
 	return res.RowsAffected, nil
 }
 
-// Complete marks a frontier item as done.
+// ReclaimExpired returns to pending only those items that are in_flight
+// with a lease that has already passed, clearing their lease fields, and
+// reports how many were reclaimed. Unlike ReclaimInFlight's blanket sweep,
+// this is safe to run at any time against a frontier shared by multiple
+// worker processes (mysql/postgres): an in_flight row whose lease has not
+// yet expired may still be legitimately owned by a live peer, so only
+// expired leases are ever touched.
+func (f *Frontier) ReclaimExpired() (int64, error) {
+	res := f.db.Model(&store.FrontierItem{}).
+		Where("status = ? AND leased_until < ?", store.FrontierStatusInFlight, time.Now()).
+		Updates(map[string]any{
+			"status":       store.FrontierStatusPending,
+			"leased_until": nil,
+			"worker_id":    "",
+		})
+	if res.Error != nil {
+		return 0, fmt.Errorf("frontier: reclaim expired: %w", res.Error)
+	}
+	return res.RowsAffected, nil
+}
+
+// Complete marks a frontier item as done, releasing its lease.
 func (f *Frontier) Complete(id uint) error {
 	res := f.db.Model(&store.FrontierItem{}).Where("id = ?", id).
-		Updates(map[string]any{"status": store.FrontierStatusDone})
+		Updates(map[string]any{
+			"status":       store.FrontierStatusDone,
+			"leased_until": nil,
+			"worker_id":    "",
+		})
 	if res.Error != nil {
 		return fmt.Errorf("frontier: complete %d: %w", id, res.Error)
 	}
@@ -240,9 +360,11 @@ func (f *Frontier) Fail(id uint, cause error, maxAttempts int) (permanent bool, 
 	}
 
 	res := f.db.Model(&store.FrontierItem{}).Where("id = ?", id).Updates(map[string]any{
-		"attempts":   attempts,
-		"last_error": errMsg,
-		"status":     status,
+		"attempts":     attempts,
+		"last_error":   errMsg,
+		"status":       status,
+		"leased_until": nil,
+		"worker_id":    "",
 	})
 	if res.Error != nil {
 		return false, fmt.Errorf("frontier: fail %d: %w", id, res.Error)
@@ -262,4 +384,24 @@ func (f *Frontier) PendingCount() (int64, error) {
 		return 0, fmt.Errorf("frontier: pending count: %w", err)
 	}
 	return count, nil
+}
+
+// Counts returns the number of items currently pending and in_flight. The
+// crawl engine uses this as its global termination check: a dequeue coming
+// back empty only means this worker's view of the frontier is exhausted,
+// not that the frontier is — other worker processes sharing the same
+// mysql/postgres database may still be holding in_flight items (which
+// could enqueue further work) or have pending items yet to be claimed.
+func (f *Frontier) Counts() (pending, inFlight int64, err error) {
+	if err = f.db.Model(&store.FrontierItem{}).
+		Where("status = ?", store.FrontierStatusPending).
+		Count(&pending).Error; err != nil {
+		return 0, 0, fmt.Errorf("frontier: counts (pending): %w", err)
+	}
+	if err = f.db.Model(&store.FrontierItem{}).
+		Where("status = ?", store.FrontierStatusInFlight).
+		Count(&inFlight).Error; err != nil {
+		return 0, 0, fmt.Errorf("frontier: counts (in_flight): %w", err)
+	}
+	return pending, inFlight, nil
 }

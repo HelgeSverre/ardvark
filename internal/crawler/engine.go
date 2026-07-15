@@ -54,6 +54,19 @@ const defaultRegistryTimeout = 15 * time.Second
 // may enqueue new work, so the crawl cannot terminate yet).
 const idlePollInterval = 25 * time.Millisecond
 
+// globalCountsCheckInterval throttles how often Run queries
+// Frontier.Counts() while locally idle. Counts is a real query (two, on
+// most drivers), so it is checked at a coarser cadence than
+// idlePollInterval rather than on every poll tick.
+const globalCountsCheckInterval = time.Second
+
+// expiredLeaseReclaimInterval is how often Run's dispatcher sweeps for
+// expired in_flight leases on mysql/postgres, where multiple worker
+// processes may share the frontier and a blanket startup reclaim (safe only
+// under sqlite's single-process assumption) would be wrong: a peer's
+// legitimately in-flight item must not be reclaimed out from under it.
+const expiredLeaseReclaimInterval = 30 * time.Second
+
 // ARD entry media types the engine treats specially (see
 // processCatalog).
 const (
@@ -214,17 +227,42 @@ func (e *Engine) enqueue(kind, url, host string, depth int) (bool, error) {
 // in_flight atomically, so the single dispatcher is the only frontier
 // reader and workers never race for items). A slow item therefore occupies
 // one worker, not the whole pool. Run returns nil once the frontier is
-// empty and every worker is idle — "queue empty" alone is not termination,
-// since an in-flight item may enqueue new work — or when ctx is cancelled
-// (graceful shutdown: items already dequeued are still dispatched, and
-// process requeues them once it sees ctx.Err).
+// globally empty — this worker's dequeue comes back empty, this worker has
+// no items in flight, AND Frontier.Counts() reports zero pending and zero
+// in_flight — or when ctx is cancelled (graceful shutdown: items already
+// dequeued are still dispatched, and process requeues them once it sees
+// ctx.Err).
+//
+// The global check matters for distributed crawling (mysql/postgres,
+// multiple worker processes sharing one frontier): this process's own
+// queue being empty says nothing about whether a peer process is still
+// working on (or holding pending) items that could enqueue more work, so
+// "locally idle" alone is never sufficient to terminate.
 func (e *Engine) Run(ctx context.Context) error {
-	// Reclaim items left in_flight by a previously killed process (ardvark
-	// runs one crawl at a time, so any in_flight row at startup is stale).
-	if n, err := e.frontier.ReclaimInFlight(); err != nil {
-		return fmt.Errorf("crawler: reclaim in-flight: %w", err)
-	} else if n > 0 {
-		e.logger.Info("crawler: reclaimed stale in-flight items", "count", n)
+	sqliteBackend := isSQLiteDriver(e.cfg.Storage.Driver)
+
+	if sqliteBackend {
+		// sqlite's storage backend supports exactly one crawl process at a
+		// time (see store.Open), so any in_flight row at startup is always
+		// the residue of a previous process killed mid-batch: reclaim all
+		// of them unconditionally.
+		if n, err := e.frontier.ReclaimInFlight(); err != nil {
+			return fmt.Errorf("crawler: reclaim in-flight: %w", err)
+		} else if n > 0 {
+			e.logger.Info("crawler: reclaimed stale in-flight items", "count", n)
+		}
+	} else {
+		// mysql/postgres may have other worker processes concurrently
+		// holding legitimate in_flight items, so only leases that have
+		// actually expired are reclaimed (see ReclaimExpired). Run once at
+		// startup in addition to the periodic sweep in the dispatcher loop
+		// below, so a crash-and-restart doesn't wait a full
+		// expiredLeaseReclaimInterval before resuming stranded work.
+		if n, err := e.frontier.ReclaimExpired(); err != nil {
+			return fmt.Errorf("crawler: reclaim expired: %w", err)
+		} else if n > 0 {
+			e.logger.Info("crawler: reclaimed expired in-flight items", "count", n)
+		}
 	}
 
 	workers := e.concurrency()
@@ -243,11 +281,22 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 
 	var runErr error
+	lastReclaim := time.Now()
+	var lastCountsCheck time.Time
 	for ctx.Err() == nil {
+		if !sqliteBackend && time.Since(lastReclaim) >= expiredLeaseReclaimInterval {
+			if n, err := e.frontier.ReclaimExpired(); err != nil {
+				e.logger.Error("crawler: periodic reclaim expired failed", "error", err)
+			} else if n > 0 {
+				e.logger.Info("crawler: reclaimed expired in-flight items", "count", n)
+			}
+			lastReclaim = time.Now()
+		}
+
 		// Snapshot idleness before dequeuing: if nothing was in flight then
-		// and the dequeue still comes back empty, no worker can have
-		// enqueued new work in between (workers commit all enqueues before
-		// their in-flight count drops), so the crawl is done.
+		// and the dequeue still comes back empty, no worker goroutine of
+		// *this* process can have enqueued new work in between (workers
+		// commit all enqueues before their in-flight count drops).
 		idle := inFlight.Load() == 0
 		batch, err := e.frontier.Dequeue(workers)
 		if err != nil {
@@ -256,7 +305,22 @@ func (e *Engine) Run(ctx context.Context) error {
 		}
 		if len(batch) == 0 {
 			if idle {
-				break
+				// Locally idle, but other worker processes may still hold
+				// pending or in_flight work that could enqueue more.
+				// Counts() is a real query, so it is only checked at
+				// globalCountsCheckInterval granularity rather than on
+				// every idlePollInterval tick.
+				if time.Since(lastCountsCheck) >= globalCountsCheckInterval {
+					pending, globalInFlight, cerr := e.frontier.Counts()
+					lastCountsCheck = time.Now()
+					if cerr != nil {
+						runErr = fmt.Errorf("crawler: counts: %w", cerr)
+						break
+					}
+					if pending == 0 && globalInFlight == 0 {
+						break
+					}
+				}
 			}
 			select {
 			case <-ctx.Done():
@@ -272,6 +336,13 @@ func (e *Engine) Run(ctx context.Context) error {
 	close(items)
 	wg.Wait()
 	return runErr
+}
+
+// isSQLiteDriver reports whether driver names ardvark's sqlite storage
+// backend ("sqlite" or "sqlite3"), including the config.Defaults() default
+// of an empty driver string being treated as sqlite by store.Open.
+func isSQLiteDriver(driver string) bool {
+	return driver == "" || driver == "sqlite" || driver == "sqlite3"
 }
 
 // concurrency returns the configured worker pool size.

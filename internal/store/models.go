@@ -150,6 +150,19 @@ type FrontierItem struct {
 	LastError string `gorm:"type:text"`
 	DedupKey  string `gorm:"uniqueIndex;size:512"`
 
+	// LeasedUntil is set when a worker dequeues an item (status moves to
+	// in_flight): it is now plus the frontier's configured lease duration.
+	// A distributed reclaimer (frontier.ReclaimExpired) resets any in_flight
+	// row whose lease has passed back to pending, so a worker process that
+	// dies mid-item does not strand that item forever — this is what makes
+	// multiple worker processes sharing one mysql/postgres database safe.
+	// Cleared (nil) whenever an item leaves in_flight (Complete/Fail/Requeue).
+	LeasedUntil *time.Time `gorm:"index"`
+	// WorkerID identifies which worker process currently holds the lease
+	// (informational — reclaiming is decided purely by LeasedUntil, not by
+	// which worker is recorded here). Cleared alongside LeasedUntil.
+	WorkerID string `gorm:"size:64"`
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
