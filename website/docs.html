@@ -411,7 +411,7 @@ go install github.com/helgesverre/ardvark/cmd/ardvark@latest</pre>
         <button class="copy" data-copy="go install github.com/helgesverre/ardvark/cmd/ardvark@latest">copy</button>
       </div>
       <p>Or grab a binary from the <a href="https://github.com/helgesverre/ardvark/releases">releases page</a> — macOS, Linux, and Windows are all published.</p>
-      <p><b>Availability</b> — the <a href="#mcp">MCP server</a> and the <a href="#json-output"><code>--json</code></a> flag ship in the next release after v0.2.0; they're available now via <code>go install ...@latest</code>. Everything else on this page is in v0.2.0.</p>
+      <p><b>Availability</b> — everything on this page is in v0.3.0 or later.</p>
     </section>
 
     <section id="quickstart">
@@ -825,7 +825,7 @@ ardvark verify https://example.com/.well-known/ai-catalog.json">copy</button>
   }
 }'>copy</button>
         </div>
-        <p>Clients rarely launch servers from your project directory, so either pass an absolute <code>--config</code> path or keep your config in the user config dir (<code>~/.config/ardvark/ardvark.json</code>, <code>%AppData%\ardvark\ardvark.json</code>) — and use an absolute <code>storage.dsn</code> in it — to make the tools hit the database you expect. With no config at all you get the defaults, resolved relative to whatever directory the client starts the server in.</p>
+        <p>Clients rarely launch servers from your project directory, so either pass an absolute <code>--config</code> path or keep your config in the user config dir (<code>~/.config/ardvark/ardvark.json</code>, <code>%AppData%\ardvark\ardvark.json</code>). Relative paths in a config file resolve against the config file's directory, so a user-dir config keeps its database and event log there — no absolute paths needed. Only with no config file at all do the defaults land in whatever directory the client starts the server in.</p>
         <p><b>Long-running crawls</b> — <code>ardvark_crawl</code> drains the entire frontier at polite per-host rates and can take minutes to hours depending on what's queued, and many MCP clients time out tool calls well before that. Prefer <code>ardvark_probe</code> for quick checks of specific hosts, keep <code>ardvark_crawl</code> for small seed lists, and run big crawls from the CLI.</p>
         <p><b>Testing by hand</b> — piping a one-shot request into stdin (<code>echo '...' | ardvark mcp</code>) closes stdin immediately, and the server exits when its input does — usually before you see the responses. Hold stdin open for the whole session, the way real clients do (an interactive terminal, a coprocess, or an MCP inspector tool), and start with the protocol's initialize handshake.</p>
         <p>ardvark.no describes this server in its own catalog: a server card at <a href="https://ardvark.no/.well-known/ardvark-mcp.json"><code>/.well-known/ardvark-mcp.json</code></a>, referenced from <a href="https://ardvark.no/.well-known/ai-catalog.json"><code>/.well-known/ai-catalog.json</code></a>.</p>
@@ -1067,7 +1067,7 @@ ardvark verify https://example.com/.well-known/ai-catalog.json">copy</button>
           <div class="term-bar"><span></span><span></span><span></span><span class="term-title">ardvark info</span></div>
           <pre><span class="c-p">$</span> ardvark info
 ardvark
-<span class="c-m">  version</span>                      0.2.0
+<span class="c-m">  version</span>                      0.3.0
 config
 <span class="c-m">  path</span>                         /Users/you/ardvark.json
 <span class="c-m">  exists</span>                       false
@@ -1102,14 +1102,14 @@ log
 
     <section id="configuration">
       <h2>Configuration</h2>
-      <p>ardvark runs with sensible defaults and no config file. To change anything, drop an <code>ardvark.json</code> in the working directory or in your user config dir (<code>~/.config/ardvark/ardvark.json</code> on Unix/macOS, <code>%AppData%\ardvark\ardvark.json</code> on Windows), or pass <code>--config path</code> — explicit flag wins, then working directory, then user config dir. The file is schema-validated — a typo'd key or bad value gets a precise <code>config.&lt;path&gt;: ...</code> error, not silent misbehavior. Values present in the file override defaults; missing keys keep their default.</p>
+      <p>ardvark runs with sensible defaults and no config file. To change anything, drop an <code>ardvark.json</code> in the working directory or in your user config dir (<code>~/.config/ardvark/ardvark.json</code> on Unix/macOS, <code>%AppData%\ardvark\ardvark.json</code> on Windows), or pass <code>--config path</code> — explicit flag wins, then working directory, then user config dir. Relative file paths in a config file (<code>storage.dsn</code> for sqlite, <code>log.file</code>) resolve against the config file's directory, not the process's working directory — a user-dir config keeps its database and event log in <code>~/.config/ardvark/</code> unless it says otherwise. With no config file at all, the defaults land in the working directory. The file is schema-validated — a typo'd key or bad value gets a precise <code>config.&lt;path&gt;: ...</code> error, not silent misbehavior. Values present in the file override defaults; missing keys keep their default.</p>
       <p><b>Environment</b> — <code>GITHUB_TOKEN</code> is the only environment variable ardvark reads for its own behavior; it's required by <a href="#seed-github"><code>seed github</code></a> and nothing else. (The standard <code>NO_COLOR</code>/<code>TERM</code> conventions are honored for color, alongside <code>--color</code>.)</p>
       <table class="docs-flags docs-config-table">
         <thead><tr><th>Key</th><th>Default</th><th>Meaning</th></tr></thead>
         <tbody>
           <tr><td><code>storage.driver</code></td><td><code>sqlite</code></td><td><code>sqlite</code>, <code>mysql</code>, or <code>postgres</code></td></tr>
-          <tr><td><code>storage.dsn</code></td><td><code>ardvark.db</code></td><td>File path (sqlite) or DSN (mysql/postgres)</td></tr>
-          <tr><td><code>log.file</code></td><td><code>ardvark.jsonl</code></td><td>JSONL event log path</td></tr>
+          <tr><td><code>storage.dsn</code></td><td><code>ardvark.db</code></td><td>File path (sqlite; relative resolves against the config file's directory) or DSN (mysql/postgres)</td></tr>
+          <tr><td><code>log.file</code></td><td><code>ardvark.jsonl</code></td><td>JSONL event log path (relative resolves against the config file's directory)</td></tr>
           <tr><td><code>log.level</code></td><td><code>info</code></td><td><code>debug</code>, <code>info</code>, <code>warn</code>, or <code>error</code></td></tr>
           <tr><td><code>crawler.concurrency</code></td><td><code>8</code></td><td>Parallel workers</td></tr>
           <tr><td><code>crawler.maxDepth</code></td><td><code>2</code></td><td>Anchor-following depth from seeds</td></tr>

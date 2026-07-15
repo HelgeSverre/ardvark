@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -137,7 +138,7 @@ func TestColorOptions(t *testing.T) {
 func executeRoot(t *testing.T, args ...string) (string, error) {
 	t.Helper()
 	t.Cleanup(func() {
-		configPath = "./ardvark.json"
+		configPath = ""
 		colorMode = "auto"
 		jsonOut = false
 		verifyStored = false
@@ -192,6 +193,100 @@ func TestStatsJSONOutput(t *testing.T) {
 		if _, ok := parsed[key]; !ok {
 			t.Errorf("stats --json output missing %q key:\n%s", key, out)
 		}
+	}
+}
+
+// `ardvark info --json` must emit parseable JSON with the documented
+// top-level sections and resolve the sqlite database path from the config.
+func TestInfoJSONOutput(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "ardvark.json")
+	dbPath := filepath.Join(dir, "test.db")
+	cfg := fmt.Sprintf(`{"storage":{"driver":"sqlite","dsn":%q},"log":{"file":%q}}`,
+		dbPath, filepath.Join(dir, "test.jsonl"))
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	out, err := executeRoot(t, "--config", cfgPath, "info", "--json")
+	if err != nil {
+		t.Fatalf("info --json: %v", err)
+	}
+
+	var parsed struct {
+		Version string `json:"version"`
+		Config  struct {
+			Path   string `json:"path"`
+			Exists bool   `json:"exists"`
+		} `json:"config"`
+		Storage struct {
+			Driver string `json:"driver"`
+			Path   string `json:"path"`
+		} `json:"storage"`
+		Log struct {
+			File string `json:"file"`
+		} `json:"log"`
+	}
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("info --json output is not valid JSON: %v\n%s", err, out)
+	}
+	if parsed.Version == "" {
+		t.Errorf("info --json version is empty:\n%s", out)
+	}
+	if !parsed.Config.Exists || parsed.Config.Path != cfgPath {
+		t.Errorf("info --json config = %+v, want exists=true path=%s", parsed.Config, cfgPath)
+	}
+	if parsed.Storage.Driver != "sqlite" || parsed.Storage.Path != dbPath {
+		t.Errorf("info --json storage = %+v, want driver=sqlite path=%s", parsed.Storage, dbPath)
+	}
+	if parsed.Log.File == "" {
+		t.Errorf("info --json log.file is empty:\n%s", out)
+	}
+}
+
+// Without --config, commands must fall back to the per-user config directory
+// (XDG on Unix/macOS) when the working directory has no ardvark.json.
+func TestConfigResolvedFromUserConfigDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test drives XDG_CONFIG_HOME, which Windows does not use")
+	}
+	dir := t.TempDir()
+	xdg := t.TempDir()
+	t.Chdir(dir) // no ./ardvark.json here
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+
+	userCfg := filepath.Join(xdg, "ardvark", "ardvark.json")
+	if err := os.MkdirAll(filepath.Dir(userCfg), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cfg := fmt.Sprintf(`{"storage":{"driver":"sqlite","dsn":%q},"log":{"file":%q}}`,
+		filepath.Join(dir, "test.db"), filepath.Join(dir, "test.jsonl"))
+	if err := os.WriteFile(userCfg, []byte(cfg), 0o644); err != nil {
+		t.Fatalf("writing user config: %v", err)
+	}
+
+	out, err := executeRoot(t, "info", "--json")
+	if err != nil {
+		t.Fatalf("info --json: %v", err)
+	}
+
+	var parsed struct {
+		Config struct {
+			Path   string `json:"path"`
+			Exists bool   `json:"exists"`
+		} `json:"config"`
+		Storage struct {
+			Path string `json:"path"`
+		} `json:"storage"`
+	}
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("info --json output is not valid JSON: %v\n%s", err, out)
+	}
+	if !parsed.Config.Exists || parsed.Config.Path != userCfg {
+		t.Errorf("config = %+v, want exists=true path=%s", parsed.Config, userCfg)
+	}
+	if want := filepath.Join(dir, "test.db"); parsed.Storage.Path != want {
+		t.Errorf("storage.path = %q, want %q", parsed.Storage.Path, want)
 	}
 }
 

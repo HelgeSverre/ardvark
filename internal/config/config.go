@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
@@ -292,7 +293,37 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("config: reading %s: %w", path, err)
 	}
 
-	return LoadBytes(raw)
+	cfg, err := LoadBytes(raw)
+	if err != nil {
+		return cfg, err
+	}
+	return anchorPaths(cfg, filepath.Dir(path)), nil
+}
+
+// anchorPaths resolves the config's relative file paths against base, the
+// directory containing the loaded config file. Relative paths in a config
+// file are relative to the file, not to whatever directory the process
+// happens to run from — so a config in ~/.config/ardvark/ keeps its database
+// and event log there unless it says otherwise. For a config in the working
+// directory base is ".", making this a no-op. Only plain file paths are
+// touched: sqlite DSNs that aren't file: URIs or :memory:, and the event log
+// path. Server DSNs (mysql, postgres) pass through untouched.
+func anchorPaths(cfg Config, base string) Config {
+	if cfg.Storage.Driver == "sqlite" && isPlainRelPath(cfg.Storage.DSN) {
+		cfg.Storage.DSN = filepath.Join(base, cfg.Storage.DSN)
+	}
+	if isPlainRelPath(cfg.Log.File) {
+		cfg.Log.File = filepath.Join(base, cfg.Log.File)
+	}
+	return cfg
+}
+
+// isPlainRelPath reports whether p is a relative filesystem path that is
+// safe to re-anchor: not empty, not absolute, and not a sqlite special form
+// (file: URI or :memory:).
+func isPlainRelPath(p string) bool {
+	return p != "" && p != ":memory:" &&
+		!strings.HasPrefix(p, "file:") && !filepath.IsAbs(p)
 }
 
 // LoadBytes parses and validates raw JSON config bytes, decoding over

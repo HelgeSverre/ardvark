@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -52,6 +53,68 @@ func TestLoad_ValidConfig(t *testing.T) {
 func TestDefaults_LeaseSeconds(t *testing.T) {
 	if got := Defaults().Crawler.LeaseSeconds; got != 300 {
 		t.Errorf("Defaults().Crawler.LeaseSeconds = %d, want 300", got)
+	}
+}
+
+// Relative storage.dsn (sqlite) and log.file in a config file must resolve
+// against the config file's directory, not the process's working directory.
+// Absolute paths, sqlite special forms, and server DSNs pass through.
+func TestLoad_AnchorsRelativePathsToConfigDir(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ardvark.json")
+
+	writeFile(t, path, `{"storage": {"driver": "sqlite", "dsn": "data.db"}, "log": {"file": "events.jsonl"}}`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if want := filepath.Join(dir, "data.db"); cfg.Storage.DSN != want {
+		t.Errorf("Storage.DSN = %q, want %q", cfg.Storage.DSN, want)
+	}
+	if want := filepath.Join(dir, "events.jsonl"); cfg.Log.File != want {
+		t.Errorf("Log.File = %q, want %q", cfg.Log.File, want)
+	}
+
+	// Defaults from an empty config anchor the same way: the database and
+	// log live next to the config file.
+	writeFile(t, path, `{}`)
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if want := filepath.Join(dir, "ardvark.db"); cfg.Storage.DSN != want {
+		t.Errorf("default Storage.DSN = %q, want %q", cfg.Storage.DSN, want)
+	}
+
+	// Absolute paths and sqlite special forms are left alone.
+	abs := filepath.Join(t.TempDir(), "abs.db")
+	writeFile(t, path, `{"storage": {"driver": "sqlite", "dsn": `+strconv.Quote(abs)+`}}`)
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if cfg.Storage.DSN != abs {
+		t.Errorf("absolute Storage.DSN = %q, want %q", cfg.Storage.DSN, abs)
+	}
+	for _, special := range []string{":memory:", "file:data.db?cache=shared"} {
+		writeFile(t, path, `{"storage": {"driver": "sqlite", "dsn": `+strconv.Quote(special)+`}}`)
+		cfg, err = Load(path)
+		if err != nil {
+			t.Fatalf("Load() unexpected error: %v", err)
+		}
+		if cfg.Storage.DSN != special {
+			t.Errorf("special Storage.DSN = %q, want %q untouched", cfg.Storage.DSN, special)
+		}
+	}
+
+	// Server DSNs are not file paths and must never be rewritten.
+	writeFile(t, path, `{"storage": {"driver": "mysql", "dsn": "user:pass@tcp(localhost:3306)/ardvark"}}`)
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+	if cfg.Storage.DSN != "user:pass@tcp(localhost:3306)/ardvark" {
+		t.Errorf("mysql Storage.DSN = %q, want untouched", cfg.Storage.DSN)
 	}
 }
 

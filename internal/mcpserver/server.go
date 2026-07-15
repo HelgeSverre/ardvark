@@ -27,6 +27,7 @@ import (
 // file yields pure defaults).
 type Server struct {
 	configPath string
+	version    string
 	srv        *mcp.Server
 	logger     *log.Logger
 }
@@ -35,6 +36,7 @@ type Server struct {
 func New(configPath, version string) *Server {
 	s := &Server{
 		configPath: configPath,
+		version:    version,
 		logger:     log.New(os.Stderr, "ardvark mcp: ", log.LstdFlags),
 	}
 	s.srv = mcp.NewServer(&mcp.Implementation{
@@ -87,6 +89,14 @@ func New(configPath, version string) *Server {
 			"verdict, and catalog entries by media type. Read-only and fast; call this first to see what " +
 			"the index currently holds.",
 	}, s.stats)
+
+	mcp.AddTool(s.srv, &mcp.Tool{
+		Name: "ardvark_info",
+		Description: "Report installation metadata: ardvark version, resolved config file path and whether " +
+			"it exists, the storage backend (driver, DSN, absolute sqlite database path, existence, size), " +
+			"and the event log location. Read-only and instant; never opens the database or the network, " +
+			"so it works even when storage is misconfigured.",
+	}, s.info)
 
 	mcp.AddTool(s.srv, &mcp.Tool{
 		Name: "ardvark_export",
@@ -249,6 +259,14 @@ func (s *Server) stats(ctx context.Context, req *mcp.CallToolRequest, args any) 
 		return nil, jsonout.StatsReport{}, err
 	}
 	return nil, rep, nil
+}
+
+func (s *Server) info(ctx context.Context, req *mcp.CallToolRequest, args any) (*mcp.CallToolResult, jsonout.InfoReport, error) {
+	cfg, err := config.Load(s.configPath)
+	if err != nil {
+		return nil, jsonout.InfoReport{}, err
+	}
+	return nil, jsonout.Info(cfg, s.configPath, s.version), nil
 }
 
 // ExportArgs are the arguments to ardvark_export.
