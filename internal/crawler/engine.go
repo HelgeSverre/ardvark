@@ -20,6 +20,7 @@
 package crawler
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"fmt"
@@ -93,12 +94,31 @@ type Engine struct {
 	// provenance caveat as the maps above.
 	catalogMethodByURL map[string]string
 
-	// pagesMu guards pageCounts, an in-memory approximation of "pages
-	// fetched so far per domain" used to enforce maxPagesPerDomain without
-	// an extra store query per link.
+	// pagesMu guards pageCounts/pageOrder/pageElems, an in-memory
+	// approximation of "pages fetched so far per domain" used to enforce
+	// maxPagesPerDomain without an extra store query per link. Unlike the
+	// provenance maps above, a host's entry cannot simply be dropped once
+	// "consumed" — the budget must hold for the domain's entire life in
+	// the crawl, and page_fetch items for a host can keep arriving as long
+	// as its budget isn't exhausted. So instead of per-entry release this
+	// is bounded with an LRU cap (maxTrackedDomains): once that many
+	// distinct hosts are tracked, the least-recently-touched host is
+	// evicted to make room. This is a deliberate, documented
+	// approximation (see reservePage) — an evicted host that reappears
+	// much later starts a fresh count, so it could exceed
+	// maxPagesPerDomain by a bounded amount. Given the cap is large
+	// relative to any single crawl's realistic per-run host cardinality,
+	// eviction is rare in practice; it exists purely to bound memory for
+	// very long-running crawls over huge seed sets (e.g. CT-log seeding).
 	pagesMu    sync.Mutex
 	pageCounts map[string]int
+	pageOrder  *list.List
+	pageElems  map[string]*list.Element
 }
+
+// maxTrackedDomains bounds the number of distinct hosts pageCounts (and its
+// LRU bookkeeping) will track at once. See the pagesMu doc comment.
+const maxTrackedDomains = 20000
 
 // registryContext carries the provenance an in-flight registry_harvest
 // item needs: which catalog entry declared the registry, which catalog its
@@ -125,6 +145,8 @@ func New(cfg config.Config, st *store.Store, fr *frontier.Frontier, fetchClient 
 		registryCtxByURL:   make(map[string]registryContext),
 		catalogMethodByURL: make(map[string]string),
 		pageCounts:         make(map[string]int),
+		pageOrder:          list.New(),
+		pageElems:          make(map[string]*list.Element),
 	}
 }
 
@@ -238,6 +260,11 @@ func (e *Engine) process(ctx context.Context, item store.FrontierItem) {
 			e.logger.Error("crawler: failed to mark item complete", "item_id", item.ID, "kind", item.Kind, "error", cerr)
 			return
 		}
+		// The item will never be dispatched again (barring a future
+		// re-enqueue of the same dedup key, which always calls the
+		// matching setXxx before re-enqueueing — see releaseProvenance's
+		// doc comment), so its in-memory provenance entry can be dropped.
+		e.releaseProvenance(item)
 		e.logger.Info("crawler: item complete", "item_id", item.ID, "kind", item.Kind, "url", item.URL, "host", item.Host)
 		return
 	}
@@ -264,6 +291,14 @@ func (e *Engine) process(ctx context.Context, item store.FrontierItem) {
 	if ferr := e.frontier.Fail(item.ID, err, max); ferr != nil {
 		e.logger.Error("crawler: failed to record item failure", "item_id", item.ID, "kind", item.Kind, "error", ferr)
 		return
+	}
+	// Mirror frontier.Fail's own pending-vs-failed decision (attempts,
+	// after this failure, reaching max) to know whether the item will ever
+	// be dispatched again. A still-pending item (more retries left) still
+	// needs its provenance entry for the next attempt; a permanently
+	// failed one never will.
+	if item.Attempts+1 >= max {
+		e.releaseProvenance(item)
 	}
 	e.logger.Warn("crawler: item failed", "item_id", item.ID, "kind", item.Kind, "url", item.URL, "host", item.Host, "transient", transient, "error", err.Error())
 }
@@ -342,6 +377,24 @@ func (e *Engine) registryHTTPClient() *http.Client {
 }
 
 // -- Provenance tracking (see package doc for the resumability caveat) ----
+//
+// Lifecycle: each entry is written by a setXxx call immediately before the
+// frontier item that will consume it is enqueued, and read once by the
+// item's handler while it is being processed. Once process() learns the
+// item will never be dispatched again — it completed successfully, or it
+// failed permanently (attempts exhausted) — releaseProvenance drops the
+// entry so these maps do not grow for the lifetime of a long crawl,
+// retaining only entries for work still pending or in flight (including
+// items with retries remaining, which still need their entry for the next
+// attempt).
+//
+// A reference cycle (catalog A -> B -> A, or registry referrals pointing
+// back at each other) re-enqueues an already-completed dedup key at a
+// deeper depth (frontier.Enqueue's doc comment); the corresponding setXxx
+// call always happens again before that re-enqueue, so the entry exists by
+// the time the item is redispatched even though it was dropped after the
+// first completion. This ordering — set-then-enqueue, dequeue-then-read,
+// complete-then-release — is what makes eager release safe.
 
 func (e *Engine) setParentCatalog(url string, catalogID uint) {
 	e.provMu.Lock()
@@ -395,6 +448,28 @@ func (e *Engine) registryContextFor(url string) (registryContext, bool) {
 	return ctx, ok
 }
 
+// releaseProvenance drops item's in-memory provenance entry (parent
+// catalog, artifact entry, catalog discovery method, or registry context)
+// once process() knows item will never be dispatched again. See the
+// "Provenance tracking" doc comment above for why this is safe.
+func (e *Engine) releaseProvenance(item store.FrontierItem) {
+	switch item.Kind {
+	case store.KindCatalogFetch:
+		e.provMu.Lock()
+		delete(e.parentCatalogByURL, item.URL)
+		delete(e.catalogMethodByURL, item.URL)
+		e.provMu.Unlock()
+	case store.KindArtifactFetch:
+		e.provMu.Lock()
+		delete(e.artifactEntryByURL, item.URL)
+		e.provMu.Unlock()
+	case store.KindRegistryHarvest:
+		e.provMu.Lock()
+		delete(e.registryCtxByURL, item.URL)
+		e.provMu.Unlock()
+	}
+}
+
 // -- Page-count tracking for maxPagesPerDomain -----------------------------
 
 // reservePage atomically checks-and-reserves one unit of host's
@@ -406,6 +481,7 @@ func (e *Engine) registryContextFor(url string) (registryContext, bool) {
 func (e *Engine) reservePage(host string, budget int) bool {
 	e.pagesMu.Lock()
 	defer e.pagesMu.Unlock()
+	e.touchPageLocked(host)
 	if e.pageCounts[host] >= budget {
 		return false
 	}
@@ -419,9 +495,31 @@ func (e *Engine) reservePage(host string, budget int) bool {
 func (e *Engine) releasePage(host string) {
 	e.pagesMu.Lock()
 	defer e.pagesMu.Unlock()
+	e.touchPageLocked(host)
 	if e.pageCounts[host] > 0 {
 		e.pageCounts[host]--
 	}
+}
+
+// touchPageLocked records host as the most-recently-used entry in the
+// pageCounts LRU, creating it (at count 0) if new. Callers must hold
+// pagesMu. If host is new and the tracker is already at maxTrackedDomains,
+// the least-recently-touched host is evicted first (see the pagesMu doc
+// comment on Engine for the correctness tradeoff this implies).
+func (e *Engine) touchPageLocked(host string) {
+	if el, ok := e.pageElems[host]; ok {
+		e.pageOrder.MoveToFront(el)
+		return
+	}
+	if e.pageOrder.Len() >= maxTrackedDomains {
+		if oldest := e.pageOrder.Back(); oldest != nil {
+			evicted := oldest.Value.(string)
+			e.pageOrder.Remove(oldest)
+			delete(e.pageElems, evicted)
+			delete(e.pageCounts, evicted)
+		}
+	}
+	e.pageElems[host] = e.pageOrder.PushFront(host)
 }
 
 // maxPagesPerDomain returns the configured page budget per domain.

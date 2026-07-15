@@ -83,14 +83,32 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "endpoint": { "type": "string", "format": "uri", "minLength": 1 }
+            "endpoint": { "type": "string", "format": "uri", "minLength": 1 },
+            "count": { "type": "integer", "minimum": 1 }
           }
         },
         "tranco": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "listUrl": { "type": "string", "format": "uri", "minLength": 1 }
+            "listUrl": { "type": "string", "format": "uri", "minLength": 1 },
+            "top": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "github": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "query": { "type": "string", "minLength": 1 },
+            "count": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "mcp": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "registryUrl": { "type": "string", "format": "uri", "minLength": 1 },
+            "count": { "type": "integer", "minimum": 1 }
           }
         }
       }

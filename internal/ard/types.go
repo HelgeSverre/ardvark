@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"golang.org/x/net/idna"
 )
 
 // Catalog is the top-level ai-catalog.json document.
@@ -87,6 +89,17 @@ type URN struct {
 	Name      string
 }
 
+// String returns the canonical, normalized form of the URN: lowercased NID,
+// ASCII/punycode-normalized publisher, and namespace/name segments as
+// parsed. Two URNs that are case-insensitive-equivalent (and, for IDN
+// publishers, equivalent under IDNA normalization) produce identical
+// String() output, which is what identifier.unique compares on.
+func (u URN) String() string {
+	segments := append([]string{u.Publisher}, u.Namespace...)
+	segments = append(segments, u.Name)
+	return "urn:" + u.NID + ":" + strings.Join(segments, ":")
+}
+
 // urnNIDs are the accepted namespace identifiers. "air" is the identifier in
 // the ARD spec draft; "ai" appears on catalogs already published in the wild
 // (e.g. unlimit.website), so we accept both.
@@ -131,6 +144,17 @@ func ParseURN(s string) (URN, error) {
 	// uppercase publisher, so normalize rather than reject — a capitalized
 	// domain must not force the catalog to "invalid".
 	publisher := strings.ToLower(segments[0])
+
+	// IDN publishers may be published in Unicode (U-label) form (e.g.
+	// "café.example"). Normalize to ASCII/punycode (A-label) so downstream
+	// comparisons (schema validation, publisher_matches, dedup) are
+	// consistent regardless of which form a catalog uses. A publisher that
+	// fails IDNA conversion (not a valid IDN) is left as-is; validatePublisher
+	// below still catches the obviously-broken cases.
+	if asciiPublisher, err := idna.ToASCII(publisher); err == nil {
+		publisher = asciiPublisher
+	}
+
 	name := segments[len(segments)-1]
 	namespace := segments[1 : len(segments)-1]
 
@@ -144,6 +168,41 @@ func ParseURN(s string) (URN, error) {
 		Namespace: namespace,
 		Name:      name,
 	}, nil
+}
+
+// normalizeIdentifierPublisherASCII rewrites just the publisher segment of a
+// raw identifier string to its ASCII/punycode form, leaving everything else
+// (including the original "urn:AIR:"-style prefix casing, and any malformed
+// structure) untouched. Unlike ParseURN it doesn't validate or fully parse
+// the identifier — it's a best-effort surface-level transform used to make
+// Unicode (U-label) IDN publishers pass the vendored JSON Schema's
+// ASCII-only identifier pattern before validation, so a catalog isn't
+// wrongly marked invalid purely because its publisher domain is IDN. If s
+// doesn't look like a recognized ARD URN, or the publisher segment doesn't
+// convert cleanly, s is returned unchanged and schema validation reports
+// whatever it would have reported anyway.
+func normalizeIdentifierPublisherASCII(s string) string {
+	lower := strings.ToLower(s)
+	for _, candidate := range urnNIDs {
+		prefix := "urn:" + candidate + ":"
+		if !strings.HasPrefix(lower, prefix) {
+			continue
+		}
+		rest := s[len(prefix):]
+		publisher, remainder := rest, ""
+		if i := strings.Index(rest, ":"); i >= 0 {
+			publisher, remainder = rest[:i], rest[i:]
+		}
+		if publisher == "" {
+			return s
+		}
+		ascii, err := idna.ToASCII(strings.ToLower(publisher))
+		if err != nil || ascii == publisher {
+			return s
+		}
+		return s[:len(prefix)] + ascii + remainder
+	}
+	return s
 }
 
 // validatePublisher does a light sanity check that publisher looks like an

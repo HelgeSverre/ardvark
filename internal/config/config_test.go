@@ -100,6 +100,52 @@ func TestLoadBytes_InvalidCases(t *testing.T) {
 	}
 }
 
+func TestLoadBytes_SeedSourceConfigParses(t *testing.T) {
+	cfg, err := LoadBytes([]byte(`{
+		"seed": {
+			"crtsh":  {"count": 50},
+			"tranco": {"top": 200},
+			"github": {"query": "filename:foo.json", "count": 10},
+			"mcp":    {"registryUrl": "https://example.com/registry", "count": 5}
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("LoadBytes() unexpected error: %v", err)
+	}
+	if cfg.Seed.Crtsh.Count != 50 {
+		t.Errorf("Seed.Crtsh.Count = %d, want 50", cfg.Seed.Crtsh.Count)
+	}
+	if cfg.Seed.Tranco.Top != 200 {
+		t.Errorf("Seed.Tranco.Top = %d, want 200", cfg.Seed.Tranco.Top)
+	}
+	if cfg.Seed.GitHub.Query != "filename:foo.json" || cfg.Seed.GitHub.Count != 10 {
+		t.Errorf("Seed.GitHub = %+v, want query=filename:foo.json count=10", cfg.Seed.GitHub)
+	}
+	if cfg.Seed.MCPRegistry.RegistryURL != "https://example.com/registry" || cfg.Seed.MCPRegistry.Count != 5 {
+		t.Errorf("Seed.MCPRegistry = %+v, want registryUrl=https://example.com/registry count=5", cfg.Seed.MCPRegistry)
+	}
+	// Untouched sibling keys keep their defaults.
+	if cfg.Seed.CT.EntryCount != Defaults().Seed.CT.EntryCount {
+		t.Errorf("Seed.CT.EntryCount = %d, want default %d", cfg.Seed.CT.EntryCount, Defaults().Seed.CT.EntryCount)
+	}
+}
+
+func TestDefaults_SeedSourcesHaveOwnCounts(t *testing.T) {
+	d := Defaults()
+	if d.Seed.Crtsh.Count <= 0 {
+		t.Errorf("Seed.Crtsh.Count = %d, want positive default", d.Seed.Crtsh.Count)
+	}
+	if d.Seed.Tranco.Top <= 0 {
+		t.Errorf("Seed.Tranco.Top = %d, want positive default", d.Seed.Tranco.Top)
+	}
+	if d.Seed.GitHub.Count <= 0 || d.Seed.GitHub.Query == "" {
+		t.Errorf("Seed.GitHub = %+v, want positive count and non-empty query", d.Seed.GitHub)
+	}
+	if d.Seed.MCPRegistry.Count <= 0 || d.Seed.MCPRegistry.RegistryURL == "" {
+		t.Errorf("Seed.MCPRegistry = %+v, want positive count and non-empty registry URL", d.Seed.MCPRegistry)
+	}
+}
+
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {

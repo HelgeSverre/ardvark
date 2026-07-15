@@ -1,9 +1,11 @@
 // Package seed bootstraps the crawl frontier from external domain sources
-// when there is no seed list to start from. Every source implements the
-// Seeder interface and shares the same tail: sanitize domains (strip a
-// leading "*.", lowercase, drop IPs and invalid hostnames, dedupe), leaving
-// the caller (cmd/ardvark's seed subcommands) to upsert domains rows with
-// the appropriate discovery_source and enqueue host_probe frontier items.
+// when there is no seed list to start from: Certificate Transparency logs,
+// crt.sh, Tranco, GitHub code search, and the MCP server registry. Every
+// source implements the Seeder interface and shares the same tail:
+// sanitize domains (strip a leading "*.", lowercase, drop IPs and invalid
+// hostnames, dedupe), leaving the caller (cmd/ardvark's seed subcommands)
+// to upsert domains rows with the appropriate discovery_source and enqueue
+// host_probe frontier items.
 // See docs/superpowers/specs/2026-07-15-ardvark-crawler-design.md's
 // "Seeding" section for the design this package implements.
 package seed

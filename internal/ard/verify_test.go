@@ -187,6 +187,11 @@ func TestCheckPublisherMatches(t *testing.T) {
 		{"exact match", "example.com", "example.com", true},
 		{"case insensitive match", "Example.com", "example.com", true},
 		{"mismatch (aggregator)", "example.com", "aggregator.net", false},
+		{"apex publisher vs www serving domain", "example.com", "www.example.com", true},
+		{"www publisher vs apex serving domain", "www.example.com", "example.com", true},
+		{"different subdomains of the same registrable domain", "api.example.com", "www.example.com", true},
+		{"different registrable domains, both with subdomains, still warn", "www.example.com", "www.other.com", false},
+		{"unresolvable eTLD falls back to exact match: single-label host", "example.com", "localhost", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -381,6 +386,199 @@ func TestVerify_DuplicateIdentifiers(t *testing.T) {
 	}
 	if report.Verdict != VerdictInvalid {
 		t.Fatalf("Verdict = %q, want %q", report.Verdict, VerdictInvalid)
+	}
+}
+
+// identifier.unique must compare on the normalized parsed URN, not the raw
+// string, so case-insensitive-equivalent URNs are caught as duplicates.
+func TestVerify_DuplicateIdentifiers_CaseInsensitiveNormalization(t *testing.T) {
+	raw := `{
+		"specVersion": "1.0",
+		"entries": [
+			{
+				"identifier": "urn:air:Example.com:agents:a",
+				"displayName": "A",
+				"type": "application/a2a-agent-card+json",
+				"url": "https://example.com/a.json",
+				"representativeQueries": ["one", "two"]
+			},
+			{
+				"identifier": "URN:AIR:example.COM:agents:a",
+				"displayName": "A dup, different casing",
+				"type": "application/a2a-agent-card+json",
+				"url": "https://example.com/a2.json",
+				"representativeQueries": ["one", "two"]
+			}
+		]
+	}`
+	report := Verify([]byte(raw), "example.com")
+	c, ok := checkByID(report.Checks, "identifier.unique", "catalog")
+	if !ok {
+		t.Fatalf("expected identifier.unique check, got %+v", report.Checks)
+	}
+	if c.Passed {
+		t.Fatalf("identifier.unique check = %+v, want failed (case-insensitive duplicate)", c)
+	}
+}
+
+// A publisher domain differing only by case must still be treated as a
+// duplicate via checkIdentifierUnique directly (belt-and-suspenders for the
+// Verify-level test above).
+func TestCheckIdentifierUnique_CaseInsensitiveNormalization(t *testing.T) {
+	entries := []Entry{
+		{Identifier: "urn:air:Example.com:agents:a"},
+		{Identifier: "urn:AIR:example.com:AGENTS:a"}, // different namespace case: NOT a duplicate
+		{Identifier: "URN:air:example.COM:agents:a"}, // same as entry 1 modulo case: duplicate
+	}
+	c := checkIdentifierUnique(Catalog{Entries: entries})
+	if c.Passed {
+		t.Fatalf("checkIdentifierUnique = %+v, want failed", c)
+	}
+}
+
+// urn.publisher_matches must compare on registrable domain (eTLD+1), so a
+// catalog served from "www.example.com" whose entries declare publisher
+// "example.com" (or vice versa) does not warn.
+func TestVerify_PublisherMatches_WWWvsApex(t *testing.T) {
+	raw := `{
+		"specVersion": "1.0",
+		"entries": [{
+			"identifier": "urn:air:example.com:agents:a",
+			"displayName": "A",
+			"type": "application/a2a-agent-card+json",
+			"url": "https://www.example.com/a.json",
+			"representativeQueries": ["one", "two"]
+		}]
+	}`
+	report := Verify([]byte(raw), "www.example.com")
+	c, ok := checkByID(report.Checks, "urn.publisher_matches", "urn:air:example.com:agents:a")
+	if !ok {
+		t.Fatalf("expected urn.publisher_matches check, got %+v", report.Checks)
+	}
+	if !c.Passed {
+		t.Fatalf("urn.publisher_matches = %+v, want passed (www vs apex is the same registrable domain)", c)
+	}
+	if report.Verdict != VerdictValid {
+		t.Fatalf("Verdict = %q, want %q; checks: %+v", report.Verdict, VerdictValid, report.Checks)
+	}
+}
+
+// IDN publishers in Unicode (U-label) form must not be marked schema-invalid
+// purely because of encoding, and the parsed URN's ASCII-normalized
+// publisher must match a serving domain given in either Unicode or punycode
+// form.
+func TestVerify_IDNPublisherUnicodeForm(t *testing.T) {
+	raw := `{
+		"specVersion": "1.0",
+		"entries": [{
+			"identifier": "urn:air:café.example:agents:a",
+			"displayName": "A",
+			"type": "application/a2a-agent-card+json",
+			"url": "https://café.example/a.json",
+			"representativeQueries": ["one", "two"]
+		}]
+	}`
+
+	for _, servingDomain := range []string{"café.example", "xn--caf-dma.example"} {
+		t.Run("serving domain "+servingDomain, func(t *testing.T) {
+			report := Verify([]byte(raw), servingDomain)
+
+			if c, ok := checkByID(report.Checks, "schema.validation", ""); ok {
+				t.Fatalf("did not expect schema.validation failures for a Unicode-form IDN publisher, got %+v", c)
+			}
+			if c, ok := checkByID(report.Checks, "urn.format", "urn:air:café.example:agents:a"); ok && !c.Passed {
+				t.Fatalf("urn.format = %+v, want passed", c)
+			}
+			if c, ok := checkByID(report.Checks, "urn.publisher_matches", "urn:air:café.example:agents:a"); !ok || !c.Passed {
+				t.Fatalf("urn.publisher_matches = %+v, want passed", c)
+			}
+			if report.Verdict != VerdictValid {
+				t.Fatalf("Verdict = %q, want %q; checks: %+v", report.Verdict, VerdictValid, report.Checks)
+			}
+		})
+	}
+}
+
+// Once JSON Schema validation has already failed for a catalog, semantic
+// checks that duplicate a schema-expressible constraint (spec_version,
+// value_or_reference, urn.format) must not also emit a row for the same
+// defect, while checks that find genuinely additional problems (duplicate
+// identifiers, publisher mismatch, queries count, media type) still run.
+func TestVerify_SemanticChecksDoNotDoubleReportSchemaFailures(t *testing.T) {
+	raw := `{
+		"specVersion": "2.0",
+		"entries": [{
+			"identifier": "urn:air:example.com:agents:a",
+			"displayName": "A",
+			"type": "application/x-custom+json",
+			"url": "https://example.com/a.json"
+		}]
+	}`
+	report := Verify([]byte(raw), "aggregator.net")
+
+	if report.Verdict != VerdictInvalid {
+		t.Fatalf("Verdict = %q, want %q", report.Verdict, VerdictInvalid)
+	}
+	if _, ok := checkByID(report.Checks, "schema.validation", ""); !ok {
+		t.Fatalf("expected a schema.validation check for the bad specVersion, got %+v", report.Checks)
+	}
+	// catalog.spec_version, entry.value_or_reference, and urn.format
+	// duplicate what schema.validation already reported; they must be
+	// skipped once schema validation has failed.
+	if c, ok := checkByID(report.Checks, "catalog.spec_version", ""); ok {
+		t.Fatalf("catalog.spec_version should be skipped once schema validation fails, got %+v", c)
+	}
+	if c, ok := checkByID(report.Checks, "entry.value_or_reference", ""); ok {
+		t.Fatalf("entry.value_or_reference should be skipped once schema validation fails, got %+v", c)
+	}
+	if c, ok := checkByID(report.Checks, "urn.format", ""); ok {
+		t.Fatalf("urn.format should be skipped once schema validation fails, got %+v", c)
+	}
+	// identifier.unique, urn.publisher_matches, and entry.media_type find
+	// genuinely additional problems the schema can't express and must still
+	// run.
+	if _, ok := checkByID(report.Checks, "identifier.unique", "catalog"); !ok {
+		t.Fatalf("identifier.unique should still run even after a schema failure, got %+v", report.Checks)
+	}
+	if c, ok := checkByID(report.Checks, "urn.publisher_matches", "urn:air:example.com:agents:a"); !ok || c.Passed {
+		t.Fatalf("urn.publisher_matches should still run and warn, got %+v", c)
+	}
+	if c, ok := checkByID(report.Checks, "entry.media_type", "urn:air:example.com:agents:a"); !ok || c.Passed {
+		t.Fatalf("entry.media_type should still run and warn, got %+v", c)
+	}
+}
+
+// unlimit.website-style catalogs (the "ai" URN NID and the
+// "application/mcp-server+json" media type predating the spec's "-card"
+// suffix, both seen in the wild) must still verify valid after the
+// identifier.unique/publisher_matches/IDN/short-circuit changes above.
+func TestVerify_UnlimitWebsiteStyleCatalogStillValid(t *testing.T) {
+	raw := `{
+		"specVersion": "1.0",
+		"host": {"displayName": "Unlimit"},
+		"entries": [{
+			"identifier": "urn:ai:unlimit.website:tool:pagenode-cms",
+			"displayName": "PageNode CMS",
+			"type": "application/mcp-server+json",
+			"url": "https://unlimit.website/mcp/pagenode-cms.json",
+			"representativeQueries": ["create a page", "publish a draft"]
+		}]
+	}`
+	report := Verify([]byte(raw), "unlimit.website")
+	if report.Verdict != VerdictValid {
+		t.Fatalf("Verdict = %q, want %q; checks: %+v", report.Verdict, VerdictValid, report.Checks)
+	}
+	for _, c := range report.Checks {
+		if !c.Passed {
+			t.Fatalf("expected all checks to pass, got failing check: %+v", c)
+		}
+	}
+
+	// Same catalog, served from "www.unlimit.website": publisher_matches
+	// must not warn since it's the same registrable domain.
+	reportWWW := Verify([]byte(raw), "www.unlimit.website")
+	if reportWWW.Verdict != VerdictValid {
+		t.Fatalf("Verdict (www serving domain) = %q, want %q; checks: %+v", reportWWW.Verdict, VerdictValid, reportWWW.Checks)
 	}
 }
 

@@ -161,8 +161,12 @@ func TestOnProbe_HitFiresOnCatalogVerification(t *testing.T) {
 }
 
 func TestOnProbe_InvalidCatalogSummarizesFailingChecks(t *testing.T) {
-	// Three entries with malformed URNs: verdict invalid, and the failing
-	// error-severity check summary should read "urn.format ×3".
+	// Three entries with malformed URNs: verdict invalid. The malformed
+	// identifiers fail JSON Schema validation directly, and semantic
+	// checks are short-circuited once schema validation has already
+	// failed (see ard.Verify's doc comment) to avoid double-reporting the
+	// same defect as both "schema.validation" and "urn.format" — so the
+	// failing-check summary should read "schema.validation ×3".
 	const catalogJSON = `{
 		"specVersion": "1.0",
 		"host": {"displayName": "Broken"},
@@ -208,8 +212,8 @@ func TestOnProbe_InvalidCatalogSummarizesFailingChecks(t *testing.T) {
 	if ev.EntryCount != 3 {
 		t.Errorf("entry count = %d, want 3", ev.EntryCount)
 	}
-	if !strings.Contains(ev.Detail, "urn.format ×3") {
-		t.Errorf("detail = %q, want it to contain \"urn.format ×3\"", ev.Detail)
+	if !strings.Contains(ev.Detail, "schema.validation ×3") {
+		t.Errorf("detail = %q, want it to contain \"schema.validation ×3\"", ev.Detail)
 	}
 	// The catalog was fetched directly (no probe hit recorded the method).
 	if ev.Method != "" {

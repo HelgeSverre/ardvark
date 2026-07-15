@@ -50,13 +50,21 @@ review are already fixed; what remains is listed here.
 
 ## Release / ops
 
-- **Homebrew publishing pinned to goreleaser 2.15** to keep a cross-platform
+- ~~**Homebrew publishing pinned to goreleaser 2.15** to keep a cross-platform
   formula (`brews`); 2.16+ hard-deprecated it for macOS-only casks. Unpin by
   moving to a manual formula-generation workflow step (see how sibling repos
-  do it) so the release can track the latest goreleaser.
-- `goreleaser release` needs `HOMEBREW_TAP_TOKEN` and the `homebrew-tap`
+  do it) so the release can track the latest goreleaser.~~ Done: goreleaser
+  now publishes raw per-platform binaries (`ardvark-{os}-{arch}`, `archives:
+  format: binary` in `.goreleaser.yaml`) and is unpinned to `~> v2`; a new
+  `homebrew` job in `.github/workflows/release.yml` downloads the release
+  binaries, computes sha256s, and renders `Formula/ardvark.rb` in
+  `helgesverre/homebrew-tap` itself (macOS arm64/x86_64 + Linux arm64/x86_64).
+- ~~`goreleaser release` needs `HOMEBREW_TAP_TOKEN` and the `homebrew-tap`
   repo; both are configured. Consider gating the brew step so a fork without
-  the secret doesn't fail the whole release.
+  the secret doesn't fail the whole release.~~ Done: the `homebrew` job
+  checks for `secrets.HOMEBREW_TAP_TOKEN` first and skips cleanly (with a
+  `::notice::`) if it's absent, so forks without the secret don't fail the
+  release. It's also skipped entirely on prerelease tags (containing `-`).
 
 ## Housekeeping
 

@@ -1,7 +1,8 @@
 // Package config loads and validates the ardvark.json configuration file:
 // storage, logging, crawler politeness, ARD verification depth, registry
-// harvesting, and pluggable seed-source settings (CT logs, crt.sh, Tranco).
-// All keys are optional; missing values fall back to documented defaults.
+// harvesting, and pluggable seed-source settings (CT logs, crt.sh, Tranco,
+// GitHub code search, the MCP registry). All keys are optional; missing
+// values fall back to documented defaults.
 package config
 
 import (
@@ -69,9 +70,11 @@ type RegistryConfig struct {
 // SeedConfig groups settings for every pluggable seed source under
 // internal/seed (see the design doc's "Seeding" section).
 type SeedConfig struct {
-	CT     CTSeedConfig     `json:"ct"`
-	Crtsh  CrtshSeedConfig  `json:"crtsh"`
-	Tranco TrancoSeedConfig `json:"tranco"`
+	CT          CTSeedConfig          `json:"ct"`
+	Crtsh       CrtshSeedConfig       `json:"crtsh"`
+	Tranco      TrancoSeedConfig      `json:"tranco"`
+	GitHub      GitHubSeedConfig      `json:"github"`
+	MCPRegistry MCPRegistrySeedConfig `json:"mcp"`
 }
 
 // CTSeedConfig controls Certificate Transparency log seeding
@@ -86,12 +89,39 @@ type CTSeedConfig struct {
 // CrtshSeedConfig controls crt.sh seeding (`ardvark seed crtsh`).
 type CrtshSeedConfig struct {
 	Endpoint string `json:"endpoint"`
+	// Count is the default number of domains to enqueue, overridden by
+	// --count. Kept separate from seed.ct.entryCount so tuning one source's
+	// default doesn't silently change another's.
+	Count int `json:"count"`
 }
 
 // TrancoSeedConfig controls Tranco top-domains list seeding
 // (`ardvark seed tranco`).
 type TrancoSeedConfig struct {
 	ListURL string `json:"listUrl"`
+	// Top is the default number of top-ranked domains to enqueue,
+	// overridden by --top.
+	Top int `json:"top"`
+}
+
+// GitHubSeedConfig controls GitHub code-search seeding
+// (`ardvark seed github`).
+type GitHubSeedConfig struct {
+	// Query is the GitHub code-search query used to find catalog files.
+	// Defaults to filename:ai-catalog.json path:.well-known.
+	Query string `json:"query"`
+	// Count is the default number of domains to enqueue, overridden by
+	// --count.
+	Count int `json:"count"`
+}
+
+// MCPRegistrySeedConfig controls MCP registry seeding (`ardvark seed mcp`).
+type MCPRegistrySeedConfig struct {
+	// RegistryURL is the base URL of the MCP registry's server-listing API.
+	RegistryURL string `json:"registryUrl"`
+	// Count is the default number of domains to enqueue, overridden by
+	// --count.
+	Count int `json:"count"`
 }
 
 // Defaults returns a Config populated with the documented defaults from the
@@ -137,9 +167,19 @@ func Defaults() Config {
 			},
 			Crtsh: CrtshSeedConfig{
 				Endpoint: "https://crt.sh",
+				Count:    1000,
 			},
 			Tranco: TrancoSeedConfig{
 				ListURL: "https://tranco-list.eu/top-1m.csv.zip",
+				Top:     1000,
+			},
+			GitHub: GitHubSeedConfig{
+				Query: "filename:ai-catalog.json path:.well-known",
+				Count: 100,
+			},
+			MCPRegistry: MCPRegistrySeedConfig{
+				RegistryURL: "https://registry.modelcontextprotocol.io",
+				Count:       1000,
 			},
 		},
 	}

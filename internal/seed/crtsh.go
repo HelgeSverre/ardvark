@@ -14,6 +14,19 @@ import (
 // crtshDefaultEndpoint is crt.sh's public JSON search endpoint.
 const crtshDefaultEndpoint = "https://crt.sh"
 
+// DefaultCrtshMatches is a curated keyword set used when the caller supplies
+// no --match: crt.sh cannot serve a bare "q=%" wildcard (it either rejects
+// it or times out scanning the whole corpus), and even if it could, an
+// unfiltered stream is low-signal for an ARD-focused crawl. Each keyword is
+// queried in turn (crt.sh only accepts one identity pattern per request)
+// until enough domains are collected.
+var DefaultCrtshMatches = []string{"agent", "mcp", "ai-catalog"}
+
+// crtshMaxRecordsPerQuery bounds how many rows crt.sh's response is allowed
+// to contribute per keyword query, keeping a single broad keyword (e.g.
+// "ai") from dominating memory/results even on a very active keyword.
+const crtshMaxRecordsPerQuery = 100000
+
 // CrtshSeeder queries crt.sh's JSON API for recent certificates matching a
 // keyword and extracts candidate domain names from their common names and
 // SAN entries. It implements Seeder with Source() "crtsh". crt.sh has
@@ -27,8 +40,15 @@ type CrtshSeeder struct {
 	// Match narrows results to certificates whose identity mentions this
 	// keyword (e.g. "agent", "mcp"), via crt.sh's "%keyword%" identity
 	// search. Empty matches everything crt.sh returns for a bare wildcard
-	// query.
+	// query; prefer Matches (or leave both empty to fall back to
+	// DefaultCrtshMatches) over relying on the bare-wildcard behavior.
 	Match string
+
+	// Matches, if non-empty, overrides Match: each keyword is queried in
+	// turn (crt.sh serves one identity pattern per request) and results are
+	// merged until n domains are collected. This is how the curated
+	// DefaultCrtshMatches keyword set is applied.
+	Matches []string
 
 	// HTTPClient is used for all requests. Defaults to a client with a 30s
 	// timeout if nil.
@@ -66,17 +86,54 @@ type crtshRecord struct {
 }
 
 // Domains implements Seeder: it queries crt.sh's JSON search API for
-// certificates whose identity mentions Match (or every recent certificate
-// if Match is empty), extracts SAN/common-name domains from the response,
-// sanitizes and dedupes them, and returns up to n.
+// certificates whose identity mentions one of the configured keywords
+// (Matches, falling back to a single Match, falling back to
+// DefaultCrtshMatches), extracts SAN/common-name domains from the
+// response(s), sanitizes and dedupes them, and returns up to n. Keywords
+// are queried in order and stop early once n domains are collected.
 func (c *CrtshSeeder) Domains(ctx context.Context, n int) ([]string, error) {
 	if n <= 0 {
 		return nil, fmt.Errorf("seed: crtsh: n must be positive, got %d", n)
 	}
 
+	var names []string
+	for _, match := range c.matches() {
+		raw, err := c.queryOne(ctx, match)
+		if err != nil {
+			return nil, err
+		}
+		names = append(names, raw...)
+
+		if len(Sanitize(names)) >= n {
+			break
+		}
+	}
+
+	sanitized := Sanitize(names)
+	if len(sanitized) > n {
+		sanitized = sanitized[:n]
+	}
+	return sanitized, nil
+}
+
+// matches resolves the effective keyword list for a Domains call:
+// c.Matches if set, else a single-element slice from c.Match (which may be
+// the empty string, matching everything — only sensible for direct
+// programmatic/test use, since the CLI always supplies a keyword).
+func (c *CrtshSeeder) matches() []string {
+	if len(c.Matches) > 0 {
+		return c.Matches
+	}
+	return []string{c.Match}
+}
+
+// queryOne runs a single crt.sh identity search for match (may be empty for
+// a bare wildcard) and returns the raw, unsanitized SAN/common-name values
+// found in the response.
+func (c *CrtshSeeder) queryOne(ctx context.Context, match string) ([]string, error) {
 	query := "%"
-	if c.Match != "" {
-		query = "%" + c.Match + "%"
+	if match != "" {
+		query = "%" + match + "%"
 	}
 
 	endpoint, err := url.Parse(strings.TrimSuffix(c.endpoint(), "/") + "/")
@@ -115,6 +172,11 @@ func (c *CrtshSeeder) Domains(ctx context.Context, n int) ([]string, error) {
 	if err := json.Unmarshal(body, &records); err != nil {
 		return nil, fmt.Errorf("seed: crtsh: decoding response: %w", err)
 	}
+	// Bound how many rows a single broad keyword can contribute, regardless
+	// of how many crt.sh actually returns.
+	if len(records) > crtshMaxRecordsPerQuery {
+		records = records[:crtshMaxRecordsPerQuery]
+	}
 
 	var names []string
 	for _, rec := range records {
@@ -127,12 +189,7 @@ func (c *CrtshSeeder) Domains(ctx context.Context, n int) ([]string, error) {
 			}
 		}
 	}
-
-	sanitized := Sanitize(names)
-	if len(sanitized) > n {
-		sanitized = sanitized[:n]
-	}
-	return sanitized, nil
+	return names, nil
 }
 
 // looksLikeJSON reports whether body begins with a JSON array or object, after

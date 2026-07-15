@@ -600,6 +600,104 @@ func TestProcess_FailsPermanentlyOnUnknownKind(t *testing.T) {
 	}
 }
 
+// -- provenance map housekeeping ------------------------------------------
+
+// TestProcess_ReleasesProvenanceOnCompletion is the regression test for the
+// FOLLOWUPS.md housekeeping item: once a catalog_fetch/artifact_fetch item
+// finishes successfully (so it will never be dispatched again), its
+// in-memory provenance entry (parentCatalogByURL / catalogMethodByURL /
+// artifactEntryByURL) must be dropped rather than retained for the rest of
+// the crawl.
+func TestProcess_ReleasesProvenanceOnCompletion(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/catalog.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/ai-catalog+json")
+		w.Write([]byte(`{"specVersion":"1.0","host":{"displayName":"C"},"entries":[]}`))
+	})
+	mux.HandleFunc("/artifact.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok":true}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	host := strings.TrimPrefix(srv.URL, "http://")
+	catalogURL := srv.URL + "/catalog.json"
+	artifactURL := srv.URL + "/artifact.json"
+
+	eng.setParentCatalog(catalogURL, 99)
+	eng.setCatalogMethod(catalogURL, "well_known")
+	eng.setArtifactEntry(artifactURL, 42)
+
+	catalogItem := store.FrontierItem{
+		Kind: store.KindCatalogFetch, URL: catalogURL, Host: host,
+		DedupKey: dedupKey(store.KindCatalogFetch, catalogURL), Status: store.FrontierStatusInFlight,
+	}
+	if err := st.DB.Create(&catalogItem).Error; err != nil {
+		t.Fatalf("seed catalog_fetch item: %v", err)
+	}
+	artifactItem := store.FrontierItem{
+		Kind: store.KindArtifactFetch, URL: artifactURL, Host: host,
+		DedupKey: dedupKey(store.KindArtifactFetch, artifactURL), Status: store.FrontierStatusInFlight,
+	}
+	if err := st.DB.Create(&artifactItem).Error; err != nil {
+		t.Fatalf("seed artifact_fetch item: %v", err)
+	}
+
+	eng.process(context.Background(), catalogItem)
+	eng.process(context.Background(), artifactItem)
+
+	eng.provMu.Lock()
+	defer eng.provMu.Unlock()
+	if _, ok := eng.parentCatalogByURL[catalogURL]; ok {
+		t.Error("expected parentCatalogByURL entry to be released after the catalog_fetch item completed")
+	}
+	if _, ok := eng.catalogMethodByURL[catalogURL]; ok {
+		t.Error("expected catalogMethodByURL entry to be released after the catalog_fetch item completed")
+	}
+	if _, ok := eng.artifactEntryByURL[artifactURL]; ok {
+		t.Error("expected artifactEntryByURL entry to be released after the artifact_fetch item completed")
+	}
+}
+
+// TestProcess_RetainsProvenanceAcrossTransientRetry ensures a transient
+// failure (retries remaining) does NOT release the provenance entry: the
+// next retry of the same item still needs it.
+func TestProcess_RetainsProvenanceAcrossTransientRetry(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/flaky.json", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	artifactURL := srv.URL + "/flaky.json"
+	eng.setArtifactEntry(artifactURL, 7)
+
+	item := store.FrontierItem{
+		Kind: store.KindArtifactFetch, URL: artifactURL,
+		DedupKey: dedupKey(store.KindArtifactFetch, artifactURL), Status: store.FrontierStatusInFlight,
+	}
+	if err := st.DB.Create(&item).Error; err != nil {
+		t.Fatalf("seed item: %v", err)
+	}
+
+	// MaxAttempts is 2 in newTestEngine's Options, so the first failure
+	// still has a retry left.
+	eng.process(context.Background(), item)
+
+	var reloaded store.FrontierItem
+	st.DB.First(&reloaded, item.ID)
+	if reloaded.Status != store.FrontierStatusPending {
+		t.Fatalf("expected item still pending (retry remaining), got %q", reloaded.Status)
+	}
+
+	if got := eng.artifactEntry(artifactURL); got != 7 {
+		t.Errorf("expected artifactEntryByURL to survive a retryable failure, got %d", got)
+	}
+}
+
 // -- end-to-end via Run() ------------------------------------------------
 
 func TestRun_DrainsSeedURLThroughPageFetch(t *testing.T) {
@@ -649,6 +747,82 @@ func TestRun_GracefulShutdownOnCancel(t *testing.T) {
 
 	if err := eng.Run(ctx); err != nil {
 		t.Fatalf("expected graceful nil return on cancelled context, got %v", err)
+	}
+}
+
+// TestRun_ForceCatalogCycleTerminates is the regression test for the
+// FOLLOWUPS.md item "--force turns any catalog reference cycle into a
+// non-terminating loop": two catalogs, A and B, each url-reference the
+// other via a nested `application/ai-catalog+json` entry. Under --force,
+// the content-hash "unchanged, skip re-save" shortcut in processCatalog is
+// bypassed, so the only thing that can stop A->B->A->B->... is the
+// maxCatalogDepth guard combined with the frontier's re-enqueue-adopts-
+// deeper-depth fix (see frontier.Enqueue's doc comment and
+// TestEnqueueResetAdoptsDeeperDepth). Run must still terminate (the
+// context timeout must never fire) and the number of catalog_fetch items
+// actually processed must be bounded by maxCatalogDepth, not unbounded.
+func TestRun_ForceCatalogCycleTerminates(t *testing.T) {
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+
+	mux.HandleFunc("/a.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/ai-catalog+json")
+		w.Write([]byte(`{"specVersion":"1.0","host":{"displayName":"A"},"entries":[
+			{"identifier":"urn:air:example.com:catalogs:b","displayName":"B","type":"application/ai-catalog+json","url":"` + srv.URL + `/b.json"}
+		]}`))
+	})
+	mux.HandleFunc("/b.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/ai-catalog+json")
+		w.Write([]byte(`{"specVersion":"1.0","host":{"displayName":"B"},"entries":[
+			{"identifier":"urn:air:example.com:catalogs:a","displayName":"A","type":"application/ai-catalog+json","url":"` + srv.URL + `/a.json"}
+		]}`))
+	})
+	srv = httptest.NewServer(mux)
+	defer srv.Close()
+
+	// httptest.NewServer must exist before the handlers above can close
+	// over srv.URL; re-register now that srv is set (Go closures capture
+	// the variable, not its value at registration time, so the handlers
+	// above already see the right URL once srv is assigned).
+
+	cfg := testCrawlerConfig()
+	cfg.ARD.MaxCatalogDepth = 3
+	eng, st := newTestEngine(t, cfg)
+	eng.opts.Force = true
+
+	host := strings.TrimPrefix(srv.URL, "http://")
+	if _, err := eng.frontier.Enqueue(&store.FrontierItem{
+		Kind:     store.KindCatalogFetch,
+		URL:      srv.URL + "/a.json",
+		Host:     host,
+		Depth:    0,
+		DedupKey: dedupKey(store.KindCatalogFetch, srv.URL+"/a.json"),
+	}); err != nil {
+		t.Fatalf("seed catalog_fetch: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := eng.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("Run did not terminate before the context timeout: the A<->B catalog cycle looped forever")
+	}
+
+	var pending int64
+	st.DB.Model(&store.FrontierItem{}).Where("status = ?", store.FrontierStatusPending).Count(&pending)
+	if pending != 0 {
+		t.Errorf("expected the frontier to be fully drained, got %d pending", pending)
+	}
+
+	// Bounded: at most maxCatalogDepth+1 catalog_fetch items should ever
+	// have been created (depths 0..maxCatalogDepth), not one per cycle
+	// iteration forever.
+	var catalogFetchCount int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ?", store.KindCatalogFetch).Count(&catalogFetchCount)
+	if catalogFetchCount > int64(cfg.ARD.MaxCatalogDepth)+1 {
+		t.Errorf("expected at most %d catalog_fetch items (bounded by maxCatalogDepth), got %d", cfg.ARD.MaxCatalogDepth+1, catalogFetchCount)
 	}
 }
 

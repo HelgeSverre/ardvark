@@ -24,13 +24,17 @@ builds:
     ldflags:
       - -s -w -X main.version={{ .Version }}
 
+# Raw per-platform binaries (no tar.gz/zip) rather than goreleaser's `brews`
+# formula generation: 2.16+ hard-deprecated `brews` in favour of macOS-only
+# `homebrew_casks`, which would drop Linux `brew install` support. Publishing
+# uncompressed binaries named ardvark-{os}-{arch} keeps the release/.github
+# workflow's Homebrew-formula step trivial: it downloads the exact asset,
+# sha256s it, and points the formula's `url` straight at it — no archive to
+# unpack. See .github/workflows/release.yml's `homebrew` job.
 archives:
-  - formats: [tar.gz]
-    format_overrides:
-      - goos: windows
-        formats: [zip]
+  - formats: [binary]
     name_template: >-
-      {{ .ProjectName }}-{{ .Version }}-{{ .Os }}-{{ .Arch }}
+      {{ .ProjectName }}-{{ .Os }}-{{ .Arch }}
 
 checksum:
   name_template: checksums.txt
@@ -42,23 +46,6 @@ changelog:
       - "^docs:"
       - "^test:"
       - "^chore:"
-
-# Publish/update the Homebrew formula in helgesverre/homebrew-tap.
-# Requires a HOMEBREW_TAP_TOKEN secret with contents:write on the tap repo.
-brews:
-  - name: ardvark
-    repository:
-      owner: helgesverre
-      name: homebrew-tap
-      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
-    directory: Formula
-    homepage: https://ardvark.no
-    description: "Crawler and indexer for ARD (Agentic Resource Discovery) ai-catalog.json documents"
-    license: MIT
-    install: |
-      bin.install "ardvark"
-    test: |
-      assert_match "ardvark", shell_output("#{bin}/ardvark --version")
 
 release:
   github:

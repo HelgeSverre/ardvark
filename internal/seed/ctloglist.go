@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -51,6 +52,12 @@ func (l ctLogRef) coversNow(now time.Time) bool {
 	return !now.Before(l.TemporalInterval.StartInclusive) && now.Before(l.TemporalInterval.EndExclusive)
 }
 
+// ctFreshCertWindow bounds how far into the future a shard's start may be
+// for it to still be considered "about to receive freshly issued certs" —
+// roughly the CA/Browser Forum's maximum TLS certificate validity (398
+// days), rounded up. See selectOperatorShards for why this matters.
+const ctFreshCertWindow = 400 * 24 * time.Hour
+
 // ResolveCTLogs fetches the CT log list and returns the base URLs of usable
 // logs whose temporal shard covers now, restricted to the given operator
 // tokens. A token matches case-insensitively against the operator name or the
@@ -91,19 +98,91 @@ func ResolveCTLogs(ctx context.Context, httpClient *http.Client, logListURL stri
 	all := wantAllOperators(operators)
 	var urls []string
 	for _, op := range list.Operators {
+		var matched []ctLogRef
 		for _, log := range op.Logs {
-			if !log.usable() || !log.coversNow(now) {
+			if !log.usable() {
 				continue
 			}
 			if all || operatorMatches(operators, op.Name, log.Description) {
-				urls = append(urls, log.URL)
+				matched = append(matched, log)
+			}
+		}
+		urls = append(urls, selectOperatorShards(matched, now)...)
+	}
+	if len(urls) == 0 {
+		return nil, noMatchError(operators, list, now, logListURL)
+	}
+	return urls, nil
+}
+
+// selectOperatorShards picks the base URLs to read from among one
+// operator's usable, already-token-matched logs. CT log shards are temporal
+// and partition by certificate NotAfter (expiration), not issuance time, so
+// the shard whose interval contains "now" (coversNow) is filling with certs
+// that expire soon — a cert issued today with a full-length (~13 month)
+// validity period can already land in the *next* shard, whose window hasn't
+// started yet from a wall-clock perspective. To still catch those
+// freshly-issued certs, also include the usable shard whose interval starts
+// soonest after now, as long as that start is within ctFreshCertWindow (a
+// shard starting a year and a half from now isn't about certs issued
+// today). This stays conservative: at most one "current" and one "next"
+// shard per operator, never the whole future log list.
+func selectOperatorShards(logs []ctLogRef, now time.Time) []string {
+	var urls []string
+	var nearestFuture *ctLogRef
+	var nearestStart time.Time
+
+	for i := range logs {
+		log := logs[i]
+		if log.coversNow(now) {
+			urls = append(urls, log.URL)
+			continue
+		}
+		if log.TemporalInterval == nil {
+			continue
+		}
+		start := log.TemporalInterval.StartInclusive
+		if !start.After(now) || start.After(now.Add(ctFreshCertWindow)) {
+			continue
+		}
+		if nearestFuture == nil || start.Before(nearestStart) {
+			l := log
+			nearestFuture = &l
+			nearestStart = start
+		}
+	}
+
+	if nearestFuture != nil {
+		urls = append(urls, nearestFuture.URL)
+	}
+	return urls
+}
+
+// noMatchError builds a friendly, actionable error when no usable current
+// log matched the requested operator tokens (e.g. a retired operator like
+// "oak" being requested after its logs go read-only): it lists which
+// operators the caller can pick from right now, drawn from the same fetched
+// log list, instead of just failing silently.
+func noMatchError(operators []string, list ctLogList, now time.Time, logListURL string) error {
+	usableOps := make(map[string]struct{})
+	for _, op := range list.Operators {
+		for _, log := range op.Logs {
+			if log.usable() && (log.coversNow(now) || log.TemporalInterval == nil) {
+				usableOps[op.Name] = struct{}{}
+				break
 			}
 		}
 	}
-	if len(urls) == 0 {
-		return nil, fmt.Errorf("seed: ct: no usable current logs matched %v in %s", operators, logListURL)
+	names := make([]string, 0, len(usableOps))
+	for name := range usableOps {
+		names = append(names, name)
 	}
-	return urls, nil
+	sort.Strings(names)
+
+	if len(names) == 0 {
+		return fmt.Errorf("seed: ct: no usable current logs matched %v in %s, and no operator currently has a usable current log either", operators, logListURL)
+	}
+	return fmt.Errorf("seed: ct: no usable current logs matched %v in %s (retired or unrecognized operator?); operators with a usable log right now: %s", operators, logListURL, strings.Join(names, ", "))
 }
 
 func wantAllOperators(operators []string) bool {

@@ -10,6 +10,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
+	"golang.org/x/net/idna"
+	"golang.org/x/net/publicsuffix"
 )
 
 // Severity levels for verification checks.
@@ -166,15 +168,81 @@ func Verify(raw []byte, servingDomain string) Report {
 		return report
 	}
 
-	report.Checks = append(report.Checks, validateSchema(raw)...)
+	schemaChecks := validateSchema(raw)
+	report.Checks = append(report.Checks, schemaChecks...)
 
+	// Semantic checks re-derive several of the same failures JSON Schema
+	// already caught (missing/malformed identifier, bad specVersion, ...),
+	// which would double-report the same underlying defect as two rows. Once
+	// schema validation has failed, skip semantic checks whose entire
+	// purpose is expressible by the schema (spec_version, value_or_reference,
+	// urn.format via a missing/malformed identifier) and only keep the
+	// checks that find genuinely additional problems the schema cannot
+	// express (duplicate identifiers, publisher/domain mismatch, query
+	// count, media type). See checkSchemaFailed docs for why we don't just
+	// skip semantic checks outright: they still catch real, distinct issues
+	// even on an otherwise-invalid catalog.
 	var catalog Catalog
 	if err := json.Unmarshal(raw, &catalog); err == nil {
-		report.Checks = append(report.Checks, semanticChecks(catalog, servingDomain)...)
+		report.Checks = append(report.Checks, semanticChecks(catalog, servingDomain, schemaFailed(schemaChecks))...)
 	}
 
 	report.Verdict = rollUp(report.Checks)
 	return report
+}
+
+// schemaFailed reports whether any JSON Schema validation check failed.
+func schemaFailed(checks []Check) bool {
+	for _, c := range checks {
+		if !c.Passed {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeIdentifiersForSchema returns raw with each entries[i].identifier
+// publisher segment normalized to ASCII/punycode, for JSON Schema validation
+// purposes only. The vendored schema's identifier pattern is ASCII-only
+// ("[a-zA-Z0-9.-]+" for the publisher segment), so a catalog with a
+// Unicode-form (U-label) IDN publisher — which ParseURN accepts fine — would
+// otherwise fail schema.validation purely on encoding, not on any real
+// defect. If raw doesn't parse as a document with an "entries" array, or
+// nothing needs normalizing, raw is returned unchanged.
+func normalizeIdentifiersForSchema(raw []byte) []byte {
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return raw
+	}
+	entries, ok := doc["entries"].([]any)
+	if !ok {
+		return raw
+	}
+
+	changed := false
+	for _, entryAny := range entries {
+		entry, ok := entryAny.(map[string]any)
+		if !ok {
+			continue
+		}
+		id, ok := entry["identifier"].(string)
+		if !ok {
+			continue
+		}
+		if normalized := normalizeIdentifierPublisherASCII(id); normalized != id {
+			entry["identifier"] = normalized
+			changed = true
+		}
+	}
+	if !changed {
+		return raw
+	}
+
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return raw
+	}
+	return out
 }
 
 // validateSchema runs JSON Schema validation and turns each leaf failure
@@ -192,7 +260,7 @@ func validateSchema(raw []byte) []Check {
 		}}
 	}
 
-	instance, err := jsonschema.UnmarshalJSON(bytes.NewReader(raw))
+	instance, err := jsonschema.UnmarshalJSON(bytes.NewReader(normalizeIdentifiersForSchema(raw)))
 	if err != nil {
 		return []Check{{
 			CheckID:  "schema.parse",
@@ -285,20 +353,33 @@ func schemaSubject(instanceLocation string, raw []byte) string {
 }
 
 // semanticChecks runs the seven spec-defined semantic checks that JSON
-// Schema cannot express.
-func semanticChecks(c Catalog, servingDomain string) []Check {
+// Schema cannot express. schemaFailed indicates JSON Schema validation
+// already failed for this document: in that case, checks whose entire
+// purpose duplicates a constraint the schema itself already enforces
+// (catalog.spec_version, entry.value_or_reference, urn.format) are skipped
+// so the same defect isn't reported twice. Checks that find genuinely
+// additional problems the schema cannot express (duplicate identifiers,
+// publisher/domain mismatch, representativeQueries count, unrecognized
+// media type) still run regardless.
+func semanticChecks(c Catalog, servingDomain string, schemaFailed bool) []Check {
 	checks := []Check{
-		checkSpecVersion(c),
 		checkIdentifierUnique(c),
+	}
+	if !schemaFailed {
+		checks = append(checks, checkSpecVersion(c))
 	}
 
 	for _, e := range c.Entries {
 		subject := entrySubject(e)
 
-		checks = append(checks, checkValueOrReference(e, subject))
+		if !schemaFailed {
+			checks = append(checks, checkValueOrReference(e, subject))
+		}
 
 		urn, urnErr := ParseURN(e.Identifier)
-		checks = append(checks, checkURNFormat(urnErr, subject))
+		if !schemaFailed {
+			checks = append(checks, checkURNFormat(urnErr, subject))
+		}
 		if urnErr == nil {
 			checks = append(checks, checkPublisherMatches(urn, servingDomain, subject))
 		}
@@ -340,13 +421,21 @@ func checkSpecVersion(c Catalog) Check {
 }
 
 // checkIdentifierUnique: identifier.unique (error) — no duplicate URNs
-// within a catalog.
+// within a catalog. Comparison is on the normalized parsed URN (lowercased
+// NID/publisher, ASCII-normalized publisher) rather than the raw string, so
+// e.g. "urn:air:Example.com:a" and "urn:AIR:example.com:a" are caught as the
+// same identifier. Entries whose identifier fails to parse fall back to raw
+// string comparison so malformed URNs are still deduped against each other.
 func checkIdentifierUnique(c Catalog) Check {
 	seen := make(map[string]int, len(c.Entries))
 	var dups []string
 	for _, e := range c.Entries {
-		seen[e.Identifier]++
-		if seen[e.Identifier] == 2 {
+		key := e.Identifier
+		if u, err := ParseURN(e.Identifier); err == nil {
+			key = u.String()
+		}
+		seen[key]++
+		if seen[key] == 2 {
 			dups = append(dups, e.Identifier)
 		}
 	}
@@ -407,9 +496,12 @@ func checkURNFormat(urnErr error, subject string) Check {
 }
 
 // checkPublisherMatches: urn.publisher_matches (warning) — URN publisher
-// domain vs the serving domain.
+// domain vs the serving domain, compared on registrable domain (eTLD+1)
+// rather than exact host equality, so a catalog served from "www.example.com"
+// with publisher "example.com" (or vice versa), or from a different
+// subdomain of the same registrable domain, does not warn.
 func checkPublisherMatches(u URN, servingDomain, subject string) Check {
-	passed := strings.EqualFold(u.Publisher, servingDomain)
+	passed := registrableDomainEqual(u.Publisher, servingDomain)
 	msg := fmt.Sprintf("URN publisher %q matches serving domain %q", u.Publisher, servingDomain)
 	if !passed {
 		msg = fmt.Sprintf("URN publisher %q does not match serving domain %q (may be legitimate for aggregators)", u.Publisher, servingDomain)
@@ -422,6 +514,37 @@ func checkPublisherMatches(u URN, servingDomain, subject string) Check {
 		SpecRef:  specRef,
 		Subject:  subject,
 	}
+}
+
+// registrableDomainEqual reports whether a and b share the same registrable
+// domain (eTLD+1, e.g. "example.com" for both "www.example.com" and
+// "api.example.com"). Both inputs are ASCII/punycode-normalized first (via
+// idna, falling back to the original string on conversion failure) so a
+// Unicode-form IDN host compares equal to its punycode form. It falls back
+// to exact case-insensitive host comparison when either input isn't a
+// domain publicsuffix recognizes (e.g. a bare single-label host, an IP
+// address, or an unlisted TLD), so behavior degrades to the old exact-match
+// semantics rather than silently passing.
+func registrableDomainEqual(a, b string) bool {
+	a, b = asciiDomain(a), asciiDomain(b)
+	if strings.EqualFold(a, b) {
+		return true
+	}
+	aReg, aErr := publicsuffix.EffectiveTLDPlusOne(strings.ToLower(a))
+	bReg, bErr := publicsuffix.EffectiveTLDPlusOne(strings.ToLower(b))
+	if aErr != nil || bErr != nil {
+		return false
+	}
+	return strings.EqualFold(aReg, bReg)
+}
+
+// asciiDomain best-effort converts a possibly-Unicode (U-label) domain to
+// its ASCII/punycode (A-label) form; on failure it returns s unchanged.
+func asciiDomain(s string) string {
+	if ascii, err := idna.ToASCII(strings.ToLower(s)); err == nil {
+		return ascii
+	}
+	return s
 }
 
 // checkQueriesCount: queries.count (warning) — 2-5 representativeQueries

@@ -23,15 +23,146 @@ jobs:
       - name: Run tests
         run: go test ./...
 
-      # Pinned to 2.15.x: it's the last goreleaser that generates a
-      # traditional cross-platform Homebrew formula via `brews`. 2.16+ hard-
-      # deprecated it in favour of macOS-only casks, which would drop Linux
-      # `brew install` support. Revisit with a manual formula step to unpin.
       - uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
-          version: "~> v2.15.0"
+          version: "~> v2"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+  # Publish/update the Homebrew formula in helgesverre/homebrew-tap.
+  # Requires a HOMEBREW_TAP_TOKEN secret: a PAT (or fine-grained token) with
+  # contents:write on helgesverre/homebrew-tap. Skipped automatically if the
+  # secret is absent (e.g. on forks). Prerelease tags (containing "-") are
+  # skipped so the formula only ever tracks stable releases.
+  #
+  # This replaces goreleaser's deprecated `brews` block (2.16+ dropped
+  # cross-platform brews support in favour of macOS-only homebrew_casks).
+  # goreleaser publishes raw per-platform binaries named
+  # ardvark-{os}-{arch}[.exe] (see .goreleaser.yaml); this job downloads
+  # them straight from the GitHub release, hashes them, and renders a
+  # cross-platform formula.
+  homebrew:
+    name: Update Homebrew Formula
+    needs: goreleaser
+    if: ${{ !contains(github.ref, '-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for tap token
+        id: gate
+        run: |
+          if [ -n "${{ secrets.HOMEBREW_TAP_TOKEN }}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::HOMEBREW_TAP_TOKEN not set; skipping Homebrew formula update."
+          fi
+
+      - name: Get version
+        if: steps.gate.outputs.enabled == 'true'
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Download release binaries
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.get_version.outputs.VERSION }}
+        run: |
+          mkdir -p artifacts
+          cd artifacts
+          for asset in ardvark-darwin-amd64 ardvark-darwin-arm64 ardvark-linux-amd64 ardvark-linux-arm64; do
+            gh release download "$VERSION" \
+              --repo helgesverre/ardvark \
+              --pattern "$asset" \
+              --output "$asset"
+          done
+          ls -la
+
+      - name: Compute checksums
+        if: steps.gate.outputs.enabled == 'true'
+        id: sha
+        run: |
+          cd artifacts
+          {
+            echo "macos_arm64=$(sha256sum ardvark-darwin-arm64 | cut -d' ' -f1)"
+            echo "macos_amd64=$(sha256sum ardvark-darwin-amd64 | cut -d' ' -f1)"
+            echo "linux_arm64=$(sha256sum ardvark-linux-arm64 | cut -d' ' -f1)"
+            echo "linux_amd64=$(sha256sum ardvark-linux-amd64 | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout tap
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: helgesverre/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Render formula
+        if: steps.gate.outputs.enabled == 'true'
+        env:
+          VERSION: ${{ steps.get_version.outputs.VERSION }}
+          MACOS_ARM64: ${{ steps.sha.outputs.macos_arm64 }}
+          MACOS_AMD64: ${{ steps.sha.outputs.macos_amd64 }}
+          LINUX_ARM64: ${{ steps.sha.outputs.linux_arm64 }}
+          LINUX_AMD64: ${{ steps.sha.outputs.linux_amd64 }}
+        run: |
+          VERSION_NUMBER="${VERSION#v}"
+          mkdir -p tap/Formula
+          cat > tap/Formula/ardvark.rb <<EOF
+          class Ardvark < Formula
+            desc "Crawler and indexer for ARD (Agentic Resource Discovery) ai-catalog.json documents"
+            homepage "https://ardvark.no"
+            version "${VERSION_NUMBER}"
+            license "MIT"
+
+            if OS.mac?
+              if Hardware::CPU.arm?
+                url "https://github.com/helgesverre/ardvark/releases/download/${VERSION}/ardvark-darwin-arm64"
+                sha256 "${MACOS_ARM64}"
+              end
+              if Hardware::CPU.intel?
+                url "https://github.com/helgesverre/ardvark/releases/download/${VERSION}/ardvark-darwin-amd64"
+                sha256 "${MACOS_AMD64}"
+              end
+            end
+            if OS.linux?
+              if Hardware::CPU.arm?
+                url "https://github.com/helgesverre/ardvark/releases/download/${VERSION}/ardvark-linux-arm64"
+                sha256 "${LINUX_ARM64}"
+              end
+              if Hardware::CPU.intel?
+                url "https://github.com/helgesverre/ardvark/releases/download/${VERSION}/ardvark-linux-amd64"
+                sha256 "${LINUX_AMD64}"
+              end
+            end
+
+            def install
+              os = OS.mac? ? "darwin" : "linux"
+              arch = Hardware::CPU.arm? ? "arm64" : "amd64"
+              bin.install "ardvark-#{os}-#{arch}" => "ardvark"
+            end
+
+            test do
+              assert_match "ardvark", shell_output("#{bin}/ardvark --version")
+            end
+          end
+          EOF
+          echo "Rendered formula:"
+          cat tap/Formula/ardvark.rb
+
+      - name: Commit and push formula
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/ardvark.rb
+          if git diff --cached --quiet; then
+            echo "Formula already up to date; nothing to commit."
+          else
+            git commit -m "ardvark ${{ steps.get_version.outputs.VERSION }}"
+            git push
+          fi

@@ -34,6 +34,8 @@ const (
 	DiscoverySourceCTLog            = "ct_log"
 	DiscoverySourceCrtsh            = "crtsh"
 	DiscoverySourceTranco           = "tranco"
+	DiscoverySourceGitHub           = "github"
+	DiscoverySourceMCPRegistry      = "mcp_registry"
 )
 
 // Domain ARD status.

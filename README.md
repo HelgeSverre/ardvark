@@ -73,8 +73,10 @@ ardvark export --format jsonl --out resources.jsonl
 | `ardvark crawl [url\|domain]... [--list file] [--force]` | Seed the frontier and run the crawler until the queue is empty. Resumes pending work from earlier runs. |
 | `ardvark probe <host>...` | Probe specific hosts for ARD documents, no crawling. |
 | `ardvark seed ct [--count N] [--log oak\|argon\|all\|URL]` | Harvest domains from the newest Certificate Transparency log entries. Logs resolve live from the CT log list (Oak by default), so shard URLs never go stale. |
-| `ardvark seed crtsh [--count N] [--match keyword]` | Harvest domains from crt.sh, optionally narrowed to certificate identities mentioning `--match` (e.g. `agent`, `mcp`). |
+| `ardvark seed crtsh [--count N] [--match keyword]` | Harvest domains from crt.sh, narrowed to certificate identities mentioning `--match` (e.g. `agent`, `mcp`); without `--match`, queries a curated agent/mcp/ai keyword set instead of an unfiltered wildcard, which crt.sh can't serve. |
 | `ardvark seed tranco [--top N] [--url URL]` | Queue the top N domains from the Tranco list — the established web CT seeding misses. |
+| `ardvark seed github [--count N] [--query q]` | Search GitHub code search for well-known ARD catalog files and queue the owning repositories' domains. Highest-precision source — a hit is a real deployed catalog. Requires `GITHUB_TOKEN`. |
+| `ardvark seed mcp [--count N] [--registry URL]` | Harvest domains from the official MCP server registry: each server's remote endpoint host plus a domain decoded from its reverse-DNS-style name. |
 | `ardvark verify <path\|url>` | Verify one catalog — local file or remote URL — and print the check report. Exits 1 if invalid. `--stored` re-verifies everything in the database. |
 | `ardvark export [--format jsonl\|csv] [--out file]` | Dump discovered resources with their verification status. |
 | `ardvark stats` | Summarize the dataset: hosts probed, catalogs by verdict, entries by type. |
@@ -103,8 +105,10 @@ ardvark runs with sensible defaults and no config file. To change anything, drop
   "registry": { "harvest": true, "maxReferralDepth": 2, "pageLimit": 20 },
   "seed": {
     "ct":     { "logListUrl": "https://www.gstatic.com/ct/log_list/v3/log_list.json", "logs": ["oak"], "entryCount": 1000 },
-    "crtsh":  { "endpoint": "https://crt.sh" },
-    "tranco": { "listUrl": "https://tranco-list.eu/top-1m.csv.zip" }
+    "crtsh":  { "endpoint": "https://crt.sh", "count": 1000 },
+    "tranco": { "listUrl": "https://tranco-list.eu/top-1m.csv.zip", "top": 1000 },
+    "github": { "query": "filename:ai-catalog.json path:.well-known", "count": 100 },
+    "mcp":    { "registryUrl": "https://registry.modelcontextprotocol.io", "count": 1000 }
   }
 }
 ```
@@ -121,6 +125,12 @@ ardvark runs with sensible defaults and no config file. To change anything, drop
 | `crawler.refreshAfterHours` | `168` | Skip hosts probed within this window |
 | `ard.maxCatalogDepth` | `3` | Nested-catalog recursion bound |
 | `registry.maxReferralDepth` | `2` | Registry referral-following bound |
+| `seed.crtsh.count` | `1000` | Default `seed crtsh` domain count (own key, not shared with `seed.ct.entryCount`) |
+| `seed.tranco.top` | `1000` | Default `seed tranco` domain count |
+| `seed.github.query` | `filename:ai-catalog.json path:.well-known` | GitHub code-search query for `seed github` |
+| `seed.github.count` | `100` | Default `seed github` domain count |
+| `seed.mcp.registryUrl` | `https://registry.modelcontextprotocol.io` | MCP registry API base URL for `seed mcp` |
+| `seed.mcp.count` | `1000` | Default `seed mcp` domain count |
 
 ## What gets stored
 
