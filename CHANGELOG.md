@@ -6,8 +6,17 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-16
+
 ### Added
 
+- **`ardvark info`** — installation metadata: version, resolved config path,
+  storage backend with absolute sqlite location and size, and event log —
+  without opening the database. Also exposed as the `ardvark_info` MCP tool.
+- **Config resolution** — `--config` flag, then `./ardvark.json`, then the
+  user config dir (`~/.config/ardvark/ardvark.json`, `%AppData%\ardvark`);
+  relative `storage.dsn` and `log.file` resolve against the config file's
+  directory.
 - **`ardvark mcp`** — a stdio MCP (Model Context Protocol) server embedded in
   the binary, exposing `ardvark_probe`, `ardvark_verify`, `ardvark_crawl`,
   `ardvark_seed`, `ardvark_stats`, and `ardvark_export` as tools. Each tool
@@ -43,6 +52,15 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Markdown skill form) is now recognized by the `entry.media_type` check;
   `application/ai-skill+json` remains recognized as a form seen on
   published catalogs.
+
+### Fixed
+
+- **MySQL/MariaDB/Postgres portability**, found by live testing against all
+  three: binary artifacts (skill tarballs) are stored in a byte column
+  instead of text (Postgres and MySQL rejected non-UTF-8; MySQL capped at
+  64 KB), large JSON columns use `LONGTEXT` on MySQL, `ardvark stats` no
+  longer aliases a column as the reserved word `key`, and the export scan
+  tolerates NULL text columns via portable `COALESCE`.
 
 ## [0.2.0] - 2026-07-15
 
@@ -117,6 +135,7 @@ First release.
   with live per-host result rows and a JSON config validated with friendly
   error messages.
 
-[Unreleased]: https://github.com/helgesverre/ardvark/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/helgesverre/ardvark/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/helgesverre/ardvark/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/helgesverre/ardvark/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/helgesverre/ardvark/releases/tag/v0.1.0
