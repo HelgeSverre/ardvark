@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ardvark — crawler &amp; indexer for the agentic web</title>
+  <meta name="description" content="ardvark crawls the web for ARD ai-catalog.json documents, verifies them against the spec, and indexes every discovered agent, MCP server, and skill into SQLite, MySQL, or Postgres.">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="ardvark — crawler &amp; indexer for the agentic web">
+  <meta property="og:description" content="Crawls the web for ARD ai-catalog.json documents, verifies them against the spec, and indexes every discovered agent, MCP server, and skill.">
+  <!-- Update to an absolute URL when the site has a domain -->
+  <meta property="og:image" content="og.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" type="image/svg+xml" href="logo.svg">
+  <link rel="stylesheet" href="brand.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav>
+  <div class="nav-inner">
+    <img src="logo.svg" alt="">
+    <span class="nav-brand">ardvark</span>
+    <span class="nav-pill">v0.1</span>
+    <span class="nav-spacer"></span>
+    <a href="#quickstart">Quickstart</a>
+    <a href="https://agenticresourcediscovery.org">ARD spec</a>
+    <a href="https://github.com/helgesverre/ardvark">GitHub</a>
+  </div>
+</nav>
+
+<header class="hero wrap">
+  <div>
+    <h1>The agentic web is publishing catalogs.<br><em>Somebody has to dig them up.</em></h1>
+    <p class="sub">Sites are starting to advertise their AI agents, MCP servers, and skills in <code>/.well-known/ai-catalog.json</code>. ardvark crawls for those catalogs, verifies them against the ARD spec, and indexes every resource into a database you can build on.</p>
+    <div class="install">
+      <span class="prompt">$</span>
+      <code id="install-cmd">brew install helgesverre/tap/ardvark</code>
+      <button class="copy" data-copy="brew install helgesverre/tap/ardvark">copy</button>
+    </div>
+    <p class="reqs">macOS · Linux · Windows — single binary, no runtime</p>
+    <div class="ctas">
+      <a class="btn btn-primary" href="#quickstart">Get started</a>
+      <a class="btn btn-ghost" href="https://github.com/helgesverre/ardvark">Source</a>
+    </div>
+  </div>
+  <div class="hero-mascot">
+    <img src="logo.svg" alt="ardvark mascot — a line-drawn aardvark">
+  </div>
+</header>
+
+<div class="demo wrap">
+  <div class="term">
+    <div class="term-bar"><span></span><span></span><span></span><span class="term-title">ardvark crawl</span></div>
+    <pre><span class="c-p">$</span> ardvark seed ct --count 1000
+<span class="c-m">seeded 847 unique domains from oak.ct.letsencrypt.org (153 duplicates skipped)</span>
+<span class="c-p">$</span> ardvark crawl
+<span class="c-ok">  hit</span>   acme.com            well-known    catalog valid          <span class="c-m">14 entries</span>
+<span class="c-warn">  hit</span>   tools.example.dev   robots_agentmap  valid_with_warnings <span class="c-m">queries.count</span>
+<span class="c-m">  miss</span>  blog.someone.net    well-known    404
+<span class="c-err">  hit</span>   broken.startup.ai   well-known    invalid                <span class="c-m">urn.format ×3</span>
+<span class="c-m">  ...</span>
+<span class="c-m">run complete: 847 hosts probed · 3 catalogs · 2 registries harvested · 41 resources indexed</span></pre>
+  </div>
+  <div class="demo-legend">
+    <span><b>Every probe recorded</b> — hits, misses, and broken catalogs alike</span>
+    <span><b>Per-check verdicts</b> — schema + 7 semantic rules, stored per catalog</span>
+    <span><b>Resumable</b> — kill it anytime; the queue lives in the database</span>
+  </div>
+</div>
+
+<section class="alt">
+  <div class="wrap">
+    <h2>What it does</h2>
+    <p class="section-sub">A registry-grade crawler for the ARD ecosystem, in one binary.</p>
+    <div class="grid">
+      <div class="card">
+        <span class="num">01</span>
+        <h3>Finds catalogs three ways</h3>
+        <p><code>/.well-known/ai-catalog.json</code>, <code>Agentmap:</code> directives in robots.txt, and <code>&lt;link rel="ai-catalog"&gt;</code> tags on crawled pages.</p>
+      </div>
+      <div class="card">
+        <span class="num">02</span>
+        <h3>Resolves everything</h3>
+        <p>Recurses into nested catalogs, fetches the agent cards and MCP server cards entries point at, and harvests discovered registries — referrals included.</p>
+      </div>
+      <div class="card">
+        <span class="num">03</span>
+        <h3>Verifies against spec</h3>
+        <p>Official JSON Schema plus semantic checks: URN grammar, url-xor-data, query counts. Each check stored pass/fail — a report card per catalog.</p>
+      </div>
+      <div class="card">
+        <span class="num">04</span>
+        <h3>Seeds itself from CT logs</h3>
+        <p><code>ardvark seed ct</code> pulls freshly-issued certificates from Certificate Transparency logs — new deployments are where adopters show up first.</p>
+      </div>
+      <div class="card">
+        <span class="num">05</span>
+        <h3>Stores anywhere</h3>
+        <p>SQLite out of the box, MySQL or Postgres with one config key. Raw documents kept verbatim, plus a JSONL event log of every discovery.</p>
+      </div>
+      <div class="card">
+        <span class="num">06</span>
+        <h3>Crawls politely</h3>
+        <p>Per-host rate limiting, robots.txt compliance, size and redirect caps, exponential backoff. One host having a bad day never sinks a run.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="quickstart">
+  <div class="wrap">
+    <h2>Quickstart</h2>
+    <p class="section-sub">From zero to an indexed dataset in three commands.</p>
+    <div class="steps">
+      <div class="step">
+        <div class="step-label">
+          <span class="num">1</span>
+          <h3>Install</h3>
+          <p>Homebrew, go install, or a release binary.</p>
+        </div>
+        <div class="codeblock">
+          <pre>brew install helgesverre/tap/ardvark</pre>
+          <button class="copy" data-copy="brew install helgesverre/tap/ardvark">copy</button>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-label">
+          <span class="num">2</span>
+          <h3>Crawl</h3>
+          <p>Seed with a URL, a list, or CT-log domains.</p>
+        </div>
+        <div class="codeblock">
+          <pre>ardvark crawl https://example.com
+<span class="c-m"># or probe hosts directly, no spidering:</span>
+ardvark probe huggingface.co github.com</pre>
+          <button class="copy" data-copy="ardvark crawl https://example.com">copy</button>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-label">
+          <span class="num">3</span>
+          <h3>Use the data</h3>
+          <p>Everything lands in SQLite + JSONL, ready to query.</p>
+        </div>
+        <div class="codeblock">
+          <pre>ardvark stats
+ardvark export --format jsonl --out resources.jsonl</pre>
+          <button class="copy" data-copy="ardvark export --format jsonl --out resources.jsonl">copy</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap cta-banner">
+    <img src="logo.svg" alt="">
+    <h2>Start digging.</h2>
+    <div class="ctas" style="justify-content:center">
+      <a class="btn btn-primary" href="https://github.com/helgesverre/ardvark">ardvark on GitHub</a>
+      <a class="btn btn-ghost" href="https://agenticresourcediscovery.org">Read the ARD spec</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap footer-inner">
+    <span>MIT licensed</span>
+    <span class="spacer"></span>
+    <a href="https://github.com/helgesverre/ardvark">GitHub</a>
+    <a href="https://helgesverre.com">Helge Sverre</a>
+  </div>
+</footer>
+
+<script>
+document.querySelectorAll('.copy').forEach(function (btn) {
+  btn.addEventListener('click', function () {
+    navigator.clipboard.writeText(btn.dataset.copy).then(function () {
+      btn.textContent = 'copied';
+      btn.classList.add('ok');
+      setTimeout(function () {
+        btn.textContent = 'copy';
+        btn.classList.remove('ok');
+      }, 1500);
+    });
+  });
+});
+</script>
+
+</body>
+</html>

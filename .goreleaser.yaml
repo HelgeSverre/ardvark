@@ -1,0 +1,67 @@
+version: 2
+
+project_name: ardvark
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - main: ./cmd/ardvark
+    binary: ardvark
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: >-
+      {{ .ProjectName }}-{{ .Version }}-{{ .Os }}-{{ .Arch }}
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+# Publish/update the Homebrew formula in helgesverre/homebrew-tap.
+# Requires a HOMEBREW_TAP_TOKEN secret with contents:write on the tap repo.
+brews:
+  - name: ardvark
+    repository:
+      owner: helgesverre
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: https://github.com/helgesverre/ardvark
+    description: "Crawler and indexer for ARD (Agentic Resource Discovery) ai-catalog.json documents"
+    license: MIT
+    install: |
+      bin.install "ardvark"
+    test: |
+      assert_match "ardvark", shell_output("#{bin}/ardvark --version")
+
+release:
+  github:
+    owner: helgesverre
+    name: ardvark
+  draft: false

@@ -56,6 +56,8 @@ A CLI (`ardvark`) with subcommands:
 | `crawl`   | Seed the frontier (URL, `--list file`, bare domains) and drain it with a worker pool. Resumes pending work from prior runs. |
 | `probe`   | Probe specific host(s) for ARD documents without HTML spidering. |
 | `seed ct` | Pull the most recent N entries from Certificate Transparency logs (default: Let's Encrypt Oak), extract SAN domains, and enqueue them as `host_probe` frontier items. |
+| `seed crtsh` | Query crt.sh's JSON API for recent certificates (optionally `--match <keyword>`), extract domains, enqueue probes. Higher-signal, less code than raw CT scraping. |
+| `seed tranco` | Download the Tranco top-domains list and enqueue the top N. Covers the established web that CT-log seeding misses. |
 | `verify`  | Re-run verification against stored catalogs (e.g. after a spec/schema update), or verify a local/remote catalog ad hoc. |
 | `export`  | Dump resources from the DB as JSONL/CSV for downstream use. |
 | `stats`   | Summarize the dataset (hosts probed, catalogs found/valid, entries by type…). |
@@ -104,10 +106,12 @@ internal/harvest/     HTML parsing: anchors → hosts, link-rel hints
 internal/probe/       well-known + robots Agentmap probing
 internal/ard/         spec types, JSON Schema + semantic verification
 internal/registry/    ARD registry /search client, pagination, referrals
-internal/ctseed/      Certificate Transparency log client: get-sth,
-                      get-entries, SAN extraction, domain sanitization
+internal/seed/        pluggable seed sources behind a Seeder interface:
+                      ct (CT logs), crtsh (crt.sh API), tranco (top list);
+                      each yields sanitized domains to enqueue as host_probe
 internal/store/       storage interface + GORM implementation
 internal/eventlog/    slog JSONL crawl-event log
+internal/ui/          styled CLI output (aligned rows, palette, check reports)
 ```
 
 Each package communicates through interfaces so units are independently
@@ -133,7 +137,7 @@ time: hosts probed within the freshness window and URLs already fetched
 | ORM / storage | `gorm.io/gorm` with `glebarez/sqlite` (pure-Go, no CGO), `gorm.io/driver/mysql`, `gorm.io/driver/postgres` | One model layer, dialect swapped via config; the "easily swappable" requirement. |
 | JSON Schema | `santhosh-tekuri/jsonschema/v6` | Best Draft 2020-12 support in Go; structured errors with instance/keyword locations. Used for both ARD validation and config validation. |
 | Logging | stdlib `log/slog` | JSON handler → JSONL file; text handler → stderr. No dependency. |
-| CT log client | `google/certificate-transparency-go` | RFC 6962 client + MerkleTreeLeaf/X.509 parsing for `seed ct`; hand-rolling TLS-encoded leaf parsing is not worth it. |
+| CT log client | `google/certificate-transparency-go` | RFC 6962 client + MerkleTreeLeaf/X.509 parsing for `seed ct`; hand-rolling TLS-encoded leaf parsing is not worth it. Also parses the Google log-list JSON for dynamic shard resolution. |
 
 The official `ai-catalog.schema.json` is vendored into the repo, pinned to a
 spec version, with provenance noted (source URL + commit).
@@ -156,7 +160,7 @@ re-crawling.
 
 - **domains** — id, host (unique), first_seen_at, last_probed_at,
   discovery_source (`seed | anchor | url_list | catalog_ref |
-  registry_referral | ct_log`), ard_status (`unprobed | not_found | found_invalid |
+  registry_referral | ct_log | crtsh | tranco`), ard_status (`unprobed | not_found | found_invalid |
   found_valid`).
 - **probes** — id, domain_id, method (`well_known | robots_agentmap |
   link_tag`), url, http_status, content_type, outcome (`hit | miss | error`),
@@ -246,30 +250,69 @@ the binary. Validation failures produce precise, human-friendly messages
   },
   "ard":     { "maxCatalogDepth": 3, "fetchArtifacts": true },
   "registry":{ "harvest": true, "maxReferralDepth": 2, "pageLimit": 20 },
-  "ctSeed":  {
-    "logUrl": "https://oak.ct.letsencrypt.org/2026h2/",
-    "entryCount": 1000
+  "seed": {
+    "ct": {
+      "logListUrl": "https://www.gstatic.com/ct/log_list/v3/log_list.json",
+      "logs": ["oak"],
+      "entryCount": 1000
+    },
+    "crtsh": { "endpoint": "https://crt.sh" },
+    "tranco": { "listUrl": "https://tranco-list.eu/top-1m.csv.zip" }
   }
 }
 ```
 
-## CT log seeding (`ardvark seed ct`)
+## Seeding
 
-Bootstraps the frontier when you have no seed list:
+Seeding bootstraps the frontier when you have no seed list. All sources
+implement one interface and share the same tail: sanitize domains (strip a
+leading `*.`, lowercase, drop IPs and non-public suffixes, dedupe against
+`domains`), insert `domains` rows with the appropriate `discovery_source`,
+and enqueue `host_probe` items. Frontier dedup keys make every seeder
+idempotent across runs.
 
-1. `GET <logUrl>ct/v1/get-sth` → current tree size.
-2. `GET <logUrl>ct/v1/get-entries?start=<size-N>&end=<size-1>` in chunks
+```go
+type Seeder interface {
+    // Domains streams sanitized hostnames until n collected or the source
+    // is exhausted; ctx cancellation stops it.
+    Domains(ctx context.Context, n int) ([]string, error)
+    Source() string // discovery_source tag, e.g. "ct_log", "crtsh", "tranco"
+}
+```
+
+### CT logs (`ardvark seed ct`) — `discovery_source = ct_log`
+
+CT log shards are **temporally sharded and rotate every ~6 months**
+(`oak2026h1`, `oak2026h2`, …) with old shards going read-only, so shard URLs
+are resolved dynamically rather than hardcoded:
+
+1. Fetch the Google CT **log list** (`seed.ct.logListUrl`) — the same list
+   Chrome/Firefox use. Select `usable` logs whose `temporal_interval` covers
+   now, filtered to the operators in `seed.ct.logs` (default `["oak"]`;
+   `"all"` uses every usable log).
+2. For each selected log: `GET <log>/ct/v1/get-sth` → tree size, then
+   `GET <log>/ct/v1/get-entries?start=<size-N>&end=<size-1>` in chunks
    (logs cap entries per response; paginate until N collected).
 3. Parse each leaf (X.509 or precert) via `certificate-transparency-go`,
    collect SAN DNS names.
-4. Sanitize: strip a leading `*.` (probe the apex instead), lowercase,
-   drop IP addresses and non-public suffixes, dedupe against `domains`.
-5. Insert as `domains` rows with `discovery_source = ct_log` and enqueue
-   `host_probe` frontier items.
 
-The log URL and entry count are configurable (`ctSeed`), with
-`--count` / `--log` flag overrides. Multiple invocations are naturally
-idempotent thanks to frontier dedup keys.
+Let's Encrypt Oak is the default because DV-certificate volume surfaces the
+indie deployments and new projects where early ARD adoption appears; adding
+Google Argon / Cloudflare Nimbus mostly adds enterprise-cert volume, not hit
+rate. `--count` and `--log` override config.
+
+### crt.sh (`ardvark seed crtsh`) — `discovery_source = crtsh`
+
+Query crt.sh's JSON API (`?q=<pattern>&output=json`) for recent certificates;
+`--match <keyword>` narrows to certs whose identity mentions the keyword
+(e.g. `agent`, `mcp`). Higher-signal and far less code than scraping raw CT
+entries — the response is already parsed and deduped. Best low-effort seeder.
+
+### Tranco (`ardvark seed tranco`) — `discovery_source = tranco`
+
+Download the [Tranco](https://tranco-list.eu) top-domains list and enqueue the
+top `--top N`. Covers the established web that CT-log seeding (which only sees
+freshly-issued certs) misses. Complementary to `seed ct`, not a replacement.
 
 ## Error handling & politeness
 
@@ -318,4 +361,5 @@ registry harvested) is emitted once through `slog`:
 | Verification depth | JSON Schema + semantic rules; trust crypto out of scope |
 | Config | JSON file, schema-validated with good error messages |
 | Name | ardvark |
-| Bootstrap seeding | `seed ct` command pulling latest N entries from Let's Encrypt Oak CT log (added 2026-07-15) |
+| Bootstrap seeding | Pluggable `Seeder` sources: `seed ct` (dynamic CT log-list resolution, Oak default), `seed crtsh`, `seed tranco` (added 2026-07-15) |
+| CLI output | All command output routed through `internal/ui` for a consistent styled look matching the website terminal demo (added 2026-07-15) |

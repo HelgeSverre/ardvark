@@ -1,0 +1,18 @@
+# Binaries & release artifacts
+bin/
+dist/
+ardvark
+
+# Crawl output
+*.db
+*.db-journal
+*.jsonl
+
+# Local config
+ardvark.json
+
+# Go
+coverage.out
+
+# OS
+.DS_Store
