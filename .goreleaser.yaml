@@ -52,7 +52,7 @@ brews:
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     directory: Formula
-    homepage: https://github.com/helgesverre/ardvark
+    homepage: https://ardvark.no
     description: "Crawler and indexer for ARD (Agentic Resource Discovery) ai-catalog.json documents"
     license: MIT
     install: |

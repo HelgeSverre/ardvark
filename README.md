@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="mascots/ardvark-line.svg" alt="ardvark mascot" width="220">
+  <img src="mascots/ardvark-classic.svg" alt="ardvark mascot" width="220">
 </p>
 
 <h1 align="center">ardvark</h1>
@@ -8,6 +8,8 @@
   Crawls the web for <a href="https://agenticresourcediscovery.org">ARD</a> <code>ai-catalog.json</code> documents,
   verifies them against the spec, and indexes every discovered agentic resource.
 </p>
+
+<p align="center"><a href="https://ardvark.no">ardvark.no</a></p>
 
 ---
 
@@ -91,7 +93,7 @@ ardvark runs with sensible defaults and no config file. To change anything, drop
     "perHostRequestsPerSecond": 1,
     "requestTimeoutSeconds": 15,
     "maxBodyBytes": 5242880,
-    "userAgent": "ardvark/0.1 (+https://github.com/helgesverre/ardvark)",
+    "userAgent": "ardvark/0.1 (+https://ardvark.no)",
     "respectRobotsTxt": true,
     "refreshAfterHours": 168
   },
