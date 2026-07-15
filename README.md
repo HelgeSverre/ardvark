@@ -97,7 +97,7 @@ ardvark export --format jsonl --out resources.jsonl
 
 ## Configuration
 
-ardvark runs with sensible defaults and no config file. To change anything, drop an `ardvark.json` in the working directory, in your user config dir (`~/.config/ardvark/ardvark.json` on Linux/macOS — `$XDG_CONFIG_HOME` respected — or `%AppData%\ardvark\ardvark.json` on Windows), or pass `--config path`. Explicit `--config` wins, then the working directory, then the user config dir. The file is schema-validated — a typo'd key or bad value gets a precise error, not silent misbehavior.
+ardvark runs with sensible defaults and no config file. To change anything, drop an `ardvark.json` in the working directory, in your user config dir (`~/.config/ardvark/ardvark.json` on Linux/macOS — `$XDG_CONFIG_HOME` respected — or `%AppData%\ardvark\ardvark.json` on Windows), or pass `--config path`. Explicit `--config` wins, then the working directory, then the user config dir. Relative file paths in a config (`storage.dsn` for sqlite, `log.file`) resolve against the config file's directory, not the process's working directory — so a user-dir config keeps its database and event log in `~/.config/ardvark/` unless it says otherwise; with no config file at all, the defaults land in the working directory. The file is schema-validated — a typo'd key or bad value gets a precise error, not silent misbehavior.
 
 ```json
 {
@@ -139,8 +139,8 @@ ardvark runs with sensible defaults and no config file. To change anything, drop
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `storage.driver` | `sqlite` | `sqlite`, `mysql`, or `postgres` |
-| `storage.dsn` | `ardvark.db` | File path (sqlite) or DSN (mysql/postgres) |
-| `log.file` | `ardvark.jsonl` | JSONL event log path |
+| `storage.dsn` | `ardvark.db` | File path (sqlite; relative resolves against the config file's directory) or DSN (mysql/postgres) |
+| `log.file` | `ardvark.jsonl` | JSONL event log path (relative resolves against the config file's directory) |
 | `crawler.concurrency` | `8` | Parallel workers |
 | `crawler.maxDepth` | `2` | Anchor-following depth from seeds |
 | `crawler.maxPagesPerDomain` | `50` | Page budget per domain |

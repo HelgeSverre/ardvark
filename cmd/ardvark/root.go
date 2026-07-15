@@ -13,7 +13,8 @@ import (
 	"github.com/helgesverre/ardvark/internal/ui"
 )
 
-// configPath is bound to the root --config persistent flag.
+// configPath is bound to the root --config persistent flag. Empty means "not
+// given": commands then search the standard locations via resolvedConfigPath.
 var configPath string
 
 // colorMode is bound to the root --color persistent flag: auto (TTY/NO_COLOR
@@ -45,7 +46,8 @@ var rootCmd = &cobra.Command{
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringVar(&configPath, "config", "./ardvark.json", "path to ardvark.json config file")
+	rootCmd.PersistentFlags().StringVar(&configPath, "config", "",
+		"path to ardvark.json config file (default: ./ardvark.json, then the user config dir — ~/.config/ardvark/ardvark.json on Unix/macOS, %AppData%\\ardvark\\ardvark.json on Windows)")
 	rootCmd.PersistentFlags().StringVar(&colorMode, "color", "auto", "colorize output: auto, always, or never")
 }
 
@@ -58,12 +60,19 @@ func Execute() error {
 	return nil
 }
 
-// openApp loads and validates ardvark.json from the --config path (a missing
-// file is not an error: config.Load returns pure defaults) and opens the
-// configured database, running AutoMigrate. The caller owns the store and
+// resolvedConfigPath returns the config file every command loads: the
+// explicit --config path when given, otherwise the first existing standard
+// location (./ardvark.json, then the user config dir).
+func resolvedConfigPath() string {
+	return config.ResolvePath(configPath)
+}
+
+// openApp loads and validates ardvark.json from the resolved config path (a
+// missing file is not an error: config.Load returns pure defaults) and opens
+// the configured database, running AutoMigrate. The caller owns the store and
 // must defer st.Close().
 func openApp() (config.Config, *store.Store, error) {
-	cfg, err := config.Load(configPath)
+	cfg, err := config.Load(resolvedConfigPath())
 	if err != nil {
 		return config.Config{}, nil, err
 	}

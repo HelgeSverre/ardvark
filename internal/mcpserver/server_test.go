@@ -186,7 +186,41 @@ func TestRun_StdinEOFIsCleanShutdown(t *testing.T) {
 	}
 }
 
-// An MCP client connecting over an in-memory transport must see all six
+// The ardvark_info handler must report the server's version and the resolved
+// config and database locations without opening the database.
+func TestInfoHandler(t *testing.T) {
+	s, dsn := newTestServer(t)
+
+	_, rep, err := s.info(t.Context(), nil, nil)
+	if err != nil {
+		t.Fatalf("info handler: %v", err)
+	}
+	if rep.Version != "test" {
+		t.Errorf("Version = %q, want %q", rep.Version, "test")
+	}
+	if !rep.Config.Exists {
+		t.Errorf("Config.Exists = false, want true (config at %s)", rep.Config.Path)
+	}
+	if rep.Config.Path != s.configPath {
+		t.Errorf("Config.Path = %q, want %q", rep.Config.Path, s.configPath)
+	}
+	if rep.Storage.Driver != "sqlite" {
+		t.Errorf("Storage.Driver = %q, want sqlite", rep.Storage.Driver)
+	}
+	if rep.Storage.Path != dsn {
+		t.Errorf("Storage.Path = %q, want %q", rep.Storage.Path, dsn)
+	}
+	// newTestServer never opens the store, so the database file must not
+	// exist yet — and info must not have created it.
+	if rep.Storage.Exists {
+		t.Error("Storage.Exists = true, want false (info must not create the database)")
+	}
+	if _, err := os.Stat(dsn); !os.IsNotExist(err) {
+		t.Errorf("database file exists after info call (stat err = %v)", err)
+	}
+}
+
+// An MCP client connecting over an in-memory transport must see all seven
 // ardvark tools with descriptions.
 func TestToolsList(t *testing.T) {
 	s, _ := newTestServer(t)
@@ -220,7 +254,7 @@ func TestToolsList(t *testing.T) {
 	}
 	for _, want := range []string{
 		"ardvark_probe", "ardvark_verify", "ardvark_crawl",
-		"ardvark_seed", "ardvark_stats", "ardvark_export",
+		"ardvark_seed", "ardvark_stats", "ardvark_info", "ardvark_export",
 	} {
 		if !got[want] {
 			t.Errorf("tools/list missing %s (got %v)", want, res.Tools)
