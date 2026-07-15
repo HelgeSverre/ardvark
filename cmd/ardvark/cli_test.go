@@ -218,7 +218,7 @@ func TestSummarizeRun(t *testing.T) {
 		t.Fatalf("SaveCatalog: %v", err)
 	}
 
-	pagesFetched, hostsProbed, catalogsFound, catalogsValid, errCount, err := summarizeRun(st, run.ID, run.StartedAt.Add(-time.Minute))
+	pagesFetched, hostsProbed, catalogsFound, catalogsValid, errCount, err := summarizeRun(st, run.StartedAt.Add(-time.Minute))
 	if err != nil {
 		t.Fatalf("summarizeRun() error = %v", err)
 	}

@@ -113,7 +113,7 @@ func runCrawl(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	pagesFetched, hostsProbed, catalogsFound, catalogsValid, errCount, err := summarizeRun(st, run.ID, run.StartedAt)
+	pagesFetched, hostsProbed, catalogsFound, catalogsValid, errCount, err := summarizeRun(st, run.StartedAt)
 	if err != nil {
 		return err
 	}
@@ -215,18 +215,22 @@ func seedOne(eng *crawler.Engine, seed string) (bool, error) {
 // window is used — accurate for a single crawl run, an approximation if
 // runs overlap). Errors are frontier items that exhausted their retry
 // budget.
-func summarizeRun(st *store.Store, runID uint, startedAt time.Time) (pagesFetched, hostsProbed, catalogsFound, catalogsValid, errCount int, err error) {
+func summarizeRun(st *store.Store, startedAt time.Time) (pagesFetched, hostsProbed, catalogsFound, catalogsValid, errCount int, err error) {
 	var n int64
 
+	// Count frontier work by when it completed, not by run_id: items seeded
+	// by a separate `seed` command (or a prior run) carry that run's id but
+	// are drained by this crawl, so time-window attribution is what reflects
+	// what this run actually did.
 	if err = st.DB.Model(&store.FrontierItem{}).
-		Where("run_id = ? AND kind = ? AND status = ?", runID, store.KindPageFetch, store.FrontierStatusDone).
+		Where("kind = ? AND status = ? AND updated_at >= ?", store.KindPageFetch, store.FrontierStatusDone, startedAt).
 		Count(&n).Error; err != nil {
 		return
 	}
 	pagesFetched = int(n)
 
 	if err = st.DB.Model(&store.FrontierItem{}).
-		Where("run_id = ? AND kind = ? AND status = ?", runID, store.KindHostProbe, store.FrontierStatusDone).
+		Where("kind = ? AND status = ? AND updated_at >= ?", store.KindHostProbe, store.FrontierStatusDone, startedAt).
 		Count(&n).Error; err != nil {
 		return
 	}
@@ -249,7 +253,7 @@ func summarizeRun(st *store.Store, runID uint, startedAt time.Time) (pagesFetche
 	catalogsValid = int(n)
 
 	if err = st.DB.Model(&store.FrontierItem{}).
-		Where("run_id = ? AND status = ?", runID, store.FrontierStatusFailed).
+		Where("status = ? AND updated_at >= ?", store.FrontierStatusFailed, startedAt).
 		Count(&n).Error; err != nil {
 		return
 	}

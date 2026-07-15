@@ -7,6 +7,7 @@
 package probe
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -82,6 +83,20 @@ func probeWellKnown(ctx context.Context, client *fetch.Client, host string) Resu
 		return classifyFetchErr(MethodWellKnown, wellKnownURL, err)
 	}
 
+	// A 200 alone isn't an ARD document: parked domains and SPA catch-alls
+	// serve a generic HTML page at every path. Require a JSON-ish response so
+	// those don't pollute the catalog table as "invalid" false positives.
+	if !looksLikeJSON(fetched.ContentType, fetched.Body) {
+		return Result{
+			Method:      MethodWellKnown,
+			URL:         fetched.URL,
+			HTTPStatus:  fetched.Status,
+			ContentType: fetched.ContentType,
+			Outcome:     OutcomeMiss,
+			ErrorDetail: "non-JSON response",
+		}
+	}
+
 	return Result{
 		Method:      MethodWellKnown,
 		URL:         fetched.URL,
@@ -90,6 +105,18 @@ func probeWellKnown(ctx context.Context, client *fetch.Client, host string) Resu
 		Outcome:     OutcomeHit,
 		CatalogURLs: []string{fetched.URL},
 	}
+}
+
+// looksLikeJSON reports whether a well-known response is plausibly a JSON
+// document, by content type or by the body's first non-space byte. It stays
+// lenient on content type (servers often mislabel .json) but rejects the HTML
+// that parked domains and SPA catch-alls return.
+func looksLikeJSON(contentType string, body []byte) bool {
+	if strings.Contains(strings.ToLower(contentType), "json") {
+		return true
+	}
+	trimmed := bytes.TrimLeft(body, " \t\r\n")
+	return len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[')
 }
 
 // probeRobotsAgentmap fetches host's robots.txt (via the client's cached
