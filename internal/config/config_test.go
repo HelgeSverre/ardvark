@@ -51,8 +51,10 @@ func TestLoad_ValidConfig(t *testing.T) {
 }
 
 func TestDefaults_LeaseSeconds(t *testing.T) {
-	if got := Defaults().Crawler.LeaseSeconds; got != 300 {
-		t.Errorf("Defaults().Crawler.LeaseSeconds = %d, want 300", got)
+	// 600s covers the slowest legitimate handler (registry_harvest
+	// pagination + retry backoff); see frontier.defaultLeaseSeconds.
+	if got := Defaults().Crawler.LeaseSeconds; got != 600 {
+		t.Errorf("Defaults().Crawler.LeaseSeconds = %d, want 600", got)
 	}
 }
 

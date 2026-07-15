@@ -345,6 +345,15 @@ func (e *Engine) process(ctx context.Context, item store.FrontierItem) {
 	err := e.handleItem(ctx, item)
 	if err == nil {
 		if cerr := e.frontier.Complete(item.ID); cerr != nil {
+			if errors.Is(cerr, frontier.ErrLeaseLost) {
+				// Our lease expired mid-handler and a peer reclaimed and
+				// re-dequeued the item (see frontier.ErrLeaseLost). Completing
+				// it now would clobber the new owner; the peer will redo (and
+				// re-persist) the work, so our local result is safely
+				// discarded. Expected under contention, not an error.
+				e.logger.Warn("crawler: item lease expired and was reclaimed by another worker; discarding local result", "item_id", item.ID, "kind", item.Kind, "url", item.URL, "host", item.Host)
+				return
+			}
 			e.logger.Error("crawler: failed to mark item complete", "item_id", item.ID, "kind", item.Kind, "error", cerr)
 			return
 		}
@@ -357,6 +366,10 @@ func (e *Engine) process(ctx context.Context, item store.FrontierItem) {
 	// it permanently failed and silently losing the work.
 	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 		if rerr := e.frontier.Requeue(item.ID); rerr != nil {
+			if errors.Is(rerr, frontier.ErrLeaseLost) {
+				e.logger.Warn("crawler: item lease expired and was reclaimed by another worker; discarding local result", "item_id", item.ID, "kind", item.Kind, "url", item.URL, "host", item.Host)
+				return
+			}
 			e.logger.Error("crawler: failed to requeue interrupted item", "item_id", item.ID, "error", rerr)
 		}
 		return
@@ -372,6 +385,12 @@ func (e *Engine) process(ctx context.Context, item store.FrontierItem) {
 	}
 
 	if _, ferr := e.frontier.Fail(item.ID, err, max); ferr != nil {
+		if errors.Is(ferr, frontier.ErrLeaseLost) {
+			// See the Complete branch above: the item is a peer's now, so our
+			// failure record would be stale. Discard it and move on.
+			e.logger.Warn("crawler: item lease expired and was reclaimed by another worker; discarding local result", "item_id", item.ID, "kind", item.Kind, "url", item.URL, "host", item.Host)
+			return
+		}
 		e.logger.Error("crawler: failed to record item failure", "item_id", item.ID, "kind", item.Kind, "error", ferr)
 		return
 	}

@@ -21,17 +21,50 @@ import (
 // defaultLeaseSeconds is the in_flight lease duration used when neither
 // New's caller nor config.Config.Crawler.LeaseSeconds specifies one. See
 // store.FrontierItem.LeasedUntil's doc comment for what the lease is for.
-const defaultLeaseSeconds = 300
+//
+// It must exceed the worst-case time a single item can legitimately stay
+// in_flight, or a peer's ReclaimExpired would return still-being-worked
+// items to pending and cause duplicate fetch work. The ownership guards on
+// Complete/Fail/Requeue (see ErrLeaseLost) make such a reclaim *safe* — no
+// data corruption — but it still wastes a full re-fetch, so the default is
+// derived to cover the slowest handler:
+//
+//	registry_harvest pagination: registry.PageLimit (20) requests, each
+//	  bounded by crawler.RequestTimeoutSeconds (15s)         = 300s
+//	engine transient-failure backoff sleep (backoffDuration cap) = +30s
+//	                                                    subtotal  330s
+//
+// held while the item is in_flight (the backoff sleep in engine.process
+// happens before Fail releases the lease). 600s rounds that up with a
+// comfortable margin for clock skew and slow-but-not-timed-out responses,
+// while staying short enough that a genuinely dead worker's items are
+// reclaimed within ~10 minutes. Keep this in sync with config.Defaults'
+// Crawler.LeaseSeconds.
+const defaultLeaseSeconds = 600
+
+// ErrLeaseLost is returned by Complete, Fail, and Requeue when the targeted
+// row still exists but is no longer owned by this Frontier's worker: our
+// in_flight lease expired, a peer's ReclaimExpired returned the row to
+// pending, and another worker re-dequeued it. Unlike store.ErrNotFound
+// (the row vanished entirely — a logic bug), ErrLeaseLost is an expected
+// outcome under distributed contention: the caller must discard its now
+// stale local result rather than clobber the new owner's claim. See the
+// Frontier type's doc comment.
+var ErrLeaseLost = errors.New("frontier: lease lost to another worker")
 
 // Frontier is a persistent, dedup'd work queue backed by the
 // frontier_items table.
 //
-// Mutators addressed by item id (Complete, Requeue, Fail) return an error
-// wrapping store.ErrNotFound when the id matches no row: an in-flight item
-// vanishing mid-crawl indicates a logic bug, never a normal outcome.
-// ReclaimInFlight and ReclaimExpired are bulk sweeps for which zero matched
-// rows is normal (a clean start, or one with no expired leases, has nothing
-// to reclaim).
+// Mutators addressed by item id (Complete, Requeue, Fail) only ever touch a
+// row this worker still owns (status in_flight AND worker_id == this
+// Frontier's), so a slow handler that outlived its lease can never clobber a
+// claim a peer has since taken. A zero-row UPDATE is therefore classified
+// (see ownershipLost): store.ErrNotFound when the row is truly gone (an
+// in-flight item vanishing mid-crawl indicates a logic bug, never a normal
+// outcome) versus ErrLeaseLost when the row still exists but is no longer
+// ours (expected under distributed contention). ReclaimInFlight and
+// ReclaimExpired are bulk sweeps for which zero matched rows is normal (a
+// clean start, or one with no expired leases, has nothing to reclaim).
 type Frontier struct {
 	db            *gorm.DB
 	leaseDuration time.Duration
@@ -316,11 +349,39 @@ func lockingSupported(tx *gorm.DB) bool {
 	return name == "mysql" || name == "postgres"
 }
 
+// ownershipLost classifies why an ownership-guarded UPDATE
+// ("id = ? AND status = 'in_flight' AND worker_id = <this worker>") matched
+// zero rows, by re-reading the row: store.ErrNotFound if it is gone entirely
+// (a logic bug — an in_flight item should never vanish), otherwise
+// ErrLeaseLost (the row still exists but our lease expired and a peer
+// reclaimed/re-dequeued it). The re-read is racy in the abstract — the row's
+// state can change again after we look — but only two outcomes matter to the
+// caller and both are handled identically per class: a missing row is always
+// a bug to surface, and any not-ours state (pending after reclaim, in_flight
+// under a new worker, done/failed) is a lost lease to shrug off. A rare query
+// error is returned as-is for the caller to wrap.
+func (f *Frontier) ownershipLost(id uint) error {
+	var existing store.FrontierItem
+	if err := f.db.Select("id").First(&existing, id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return store.ErrNotFound
+		}
+		return err
+	}
+	return ErrLeaseLost
+}
+
 // Requeue returns an item to pending without touching its attempt counter.
 // Used when work is interrupted (context cancelled) rather than failed, so a
 // resumed run picks it up again cleanly.
+//
+// Only a row this worker still owns (in_flight under our worker_id) is
+// touched: if our lease expired and a peer already re-dequeued the row, a
+// blind requeue would flip a legitimately held item back to pending. Returns
+// ErrLeaseLost in that case, or store.ErrNotFound if the row is gone.
 func (f *Frontier) Requeue(id uint) error {
-	res := f.db.Model(&store.FrontierItem{}).Where("id = ?", id).
+	res := f.db.Model(&store.FrontierItem{}).
+		Where("id = ? AND status = ? AND worker_id = ?", id, store.FrontierStatusInFlight, f.workerID).
 		Updates(map[string]any{
 			"status":       store.FrontierStatusPending,
 			"leased_until": nil,
@@ -330,7 +391,7 @@ func (f *Frontier) Requeue(id uint) error {
 		return fmt.Errorf("frontier: requeue %d: %w", id, res.Error)
 	}
 	if res.RowsAffected == 0 {
-		return fmt.Errorf("frontier: requeue %d: %w", id, store.ErrNotFound)
+		return fmt.Errorf("frontier: requeue %d: %w", id, f.ownershipLost(id))
 	}
 	return nil
 }
@@ -380,8 +441,15 @@ func (f *Frontier) ReclaimExpired() (int64, error) {
 }
 
 // Complete marks a frontier item as done, releasing its lease.
+//
+// Only a row this worker still owns (in_flight under our worker_id) is
+// touched: if our lease expired and a peer re-dequeued the item, completing
+// it here would clobber the new owner's claim and mark work "done" that the
+// peer is still doing (and whose SaveEntries would then run twice). Returns
+// ErrLeaseLost in that case, or store.ErrNotFound if the row is gone.
 func (f *Frontier) Complete(id uint) error {
-	res := f.db.Model(&store.FrontierItem{}).Where("id = ?", id).
+	res := f.db.Model(&store.FrontierItem{}).
+		Where("id = ? AND status = ? AND worker_id = ?", id, store.FrontierStatusInFlight, f.workerID).
 		Updates(map[string]any{
 			"status":       store.FrontierStatusDone,
 			"leased_until": nil,
@@ -391,7 +459,7 @@ func (f *Frontier) Complete(id uint) error {
 		return fmt.Errorf("frontier: complete %d: %w", id, res.Error)
 	}
 	if res.RowsAffected == 0 {
-		return fmt.Errorf("frontier: complete %d: %w", id, store.ErrNotFound)
+		return fmt.Errorf("frontier: complete %d: %w", id, f.ownershipLost(id))
 	}
 	return nil
 }
@@ -404,6 +472,13 @@ func (f *Frontier) Complete(id uint) error {
 // permanent flag reports which of the two happened, so callers do not have
 // to mirror the attempts arithmetic to know whether the item will ever be
 // dispatched again.
+//
+// The read (to compute the next attempt count) and the write are both
+// scoped to a row this worker still owns. The attempts increment must only
+// land while we hold the lease: if it expired and a peer re-dequeued the
+// item, the guarded UPDATE matches zero rows, so this call neither burns an
+// attempt nor overwrites the peer's fresh state — it returns ErrLeaseLost
+// (or store.ErrNotFound if the row is gone) with permanent=false.
 func (f *Frontier) Fail(id uint, cause error, maxAttempts int) (permanent bool, err error) {
 	var item store.FrontierItem
 	if err := f.db.First(&item, id).Error; err != nil {
@@ -424,18 +499,23 @@ func (f *Frontier) Fail(id uint, cause error, maxAttempts int) (permanent bool, 
 		errMsg = cause.Error()
 	}
 
-	res := f.db.Model(&store.FrontierItem{}).Where("id = ?", id).Updates(map[string]any{
-		"attempts":     attempts,
-		"last_error":   errMsg,
-		"status":       status,
-		"leased_until": nil,
-		"worker_id":    "",
-	})
+	res := f.db.Model(&store.FrontierItem{}).
+		Where("id = ? AND status = ? AND worker_id = ?", id, store.FrontierStatusInFlight, f.workerID).
+		Updates(map[string]any{
+			"attempts":     attempts,
+			"last_error":   errMsg,
+			"status":       status,
+			"leased_until": nil,
+			"worker_id":    "",
+		})
 	if res.Error != nil {
 		return false, fmt.Errorf("frontier: fail %d: %w", id, res.Error)
 	}
 	if res.RowsAffected == 0 {
-		return false, fmt.Errorf("frontier: fail %d: %w", id, store.ErrNotFound)
+		// The row we read a moment ago is no longer ours to fail: either it
+		// vanished (ErrNotFound) or our lease was lost (ErrLeaseLost). Do not
+		// count the attempt.
+		return false, fmt.Errorf("frontier: fail %d: %w", id, f.ownershipLost(id))
 	}
 	return status == store.FrontierStatusFailed, nil
 }

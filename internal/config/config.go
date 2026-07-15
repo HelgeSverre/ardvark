@@ -64,9 +64,13 @@ type CrawlerConfig struct {
 	// abandoned and returns it to pending. This only matters for
 	// distributed crawling (mysql/postgres, multiple worker processes): a
 	// worker that dies mid-item can no longer requeue it itself, so the
-	// lease is what lets another worker eventually pick it back up. 0 (or
-	// unset) means "use the frontier package's own default" rather than
-	// "no lease" — see frontier.defaultLeaseSeconds.
+	// lease is what lets another worker eventually pick it back up. It must
+	// outlast the slowest legitimate handler (registry_harvest pagination
+	// plus retry backoff — see frontier.defaultLeaseSeconds for the
+	// derivation of the 600s default) so a live worker's item is not
+	// reclaimed out from under it. 0 (or unset) means "use the frontier
+	// package's own default" rather than "no lease" — see
+	// frontier.defaultLeaseSeconds.
 	LeaseSeconds int `json:"leaseSeconds"`
 	// Worker configures this process's slice of a distributed crawl. See
 	// WorkerConfig.
@@ -219,7 +223,7 @@ func Defaults() Config {
 			UserAgent:                "ardvark/0.1 (+https://github.com/helgesverre/ardvark)",
 			RespectRobotsTxt:         true,
 			RefreshAfterHours:        168,
-			LeaseSeconds:             300,
+			LeaseSeconds:             600,
 			Worker:                   WorkerConfig{Index: 0, Count: 1},
 		},
 		ARD: ARDConfig{

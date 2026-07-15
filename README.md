@@ -114,7 +114,7 @@ ardvark runs with sensible defaults and no config file. To change anything, drop
     "userAgent": "ardvark/0.1 (+https://github.com/helgesverre/ardvark)",
     "respectRobotsTxt": true,
     "refreshAfterHours": 168,
-    "leaseSeconds": 300
+    "leaseSeconds": 600
   },
   "ard":      { "maxCatalogDepth": 3, "fetchArtifacts": true },
   "registry": { "harvest": true, "maxReferralDepth": 2, "pageLimit": 20 },
@@ -148,7 +148,7 @@ ardvark runs with sensible defaults and no config file. To change anything, drop
 | `crawler.maxPagesPerDomain` | `50` | Page budget per domain |
 | `crawler.perHostRequestsPerSecond` | `1` | Politeness rate limit |
 | `crawler.refreshAfterHours` | `168` | Skip hosts probed within this window |
-| `crawler.leaseSeconds` | `300` | How long a claimed work item can stay in progress before it's treated as stalled and reclaimed |
+| `crawler.leaseSeconds` | `600` | How long a claimed work item can stay in progress before it's treated as stalled and reclaimed (must outlast the slowest handler; see below) |
 | `ard.maxCatalogDepth` | `3` | Nested-catalog recursion bound |
 | `registry.maxReferralDepth` | `2` | Registry referral-following bound |
 | `seed.crtsh.count` | `1000` | Default `seed crtsh` domain count (own key, not shared with `seed.ct.entryCount`) |

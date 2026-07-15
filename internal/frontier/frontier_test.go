@@ -153,8 +153,13 @@ func TestFailRetriesThenFails(t *testing.T) {
 	const maxAttempts = 3
 	cause := errors.New("timeout")
 
-	// Attempts 1 and 2: re-queued as pending.
+	// Attempts 1 and 2: re-queued as pending. Fail only acts on an item this
+	// worker holds in_flight, so re-dequeue before each attempt exactly as
+	// the crawl loop does (Dequeue → handler error → Fail).
 	for i := 1; i <= maxAttempts-1; i++ {
+		if _, err := f.Dequeue(1); err != nil {
+			t.Fatalf("Dequeue (attempt %d): %v", i, err)
+		}
 		permanent, err := f.Fail(item.ID, cause, maxAttempts)
 		if err != nil {
 			t.Fatalf("Fail (attempt %d): %v", i, err)
@@ -178,6 +183,9 @@ func TestFailRetriesThenFails(t *testing.T) {
 	}
 
 	// Final attempt reaches maxAttempts: permanently failed.
+	if _, err := f.Dequeue(1); err != nil {
+		t.Fatalf("Dequeue (final): %v", err)
+	}
 	permanent, err := f.Fail(item.ID, cause, maxAttempts)
 	if err != nil {
 		t.Fatalf("Fail (final): %v", err)
@@ -278,6 +286,9 @@ func TestEnqueueResetAdoptsDeeperDepth(t *testing.T) {
 	if _, err := f.Enqueue(item); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
+	if _, err := f.Dequeue(1); err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
 	if err := f.Complete(item.ID); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
@@ -318,6 +329,9 @@ func TestEnqueueResetAdoptsNewProvenance(t *testing.T) {
 	}
 	if _, err := f.Enqueue(item); err != nil {
 		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := f.Dequeue(1); err != nil {
+		t.Fatalf("Dequeue: %v", err)
 	}
 	if err := f.Complete(item.ID); err != nil {
 		t.Fatalf("Complete: %v", err)
@@ -612,6 +626,119 @@ func TestReclaimExpiredOnlyExpired(t *testing.T) {
 	}
 }
 
+// -- Lost-lease ownership guards ----------------------------------------
+
+// loseLease reproduces the distributed-contention scenario the ownership
+// guards defend against: frontier A dequeues an item (taking the lease), the
+// lease is forced expired, then frontier B (a different worker, distinct
+// worker_id) reclaims and re-dequeues it. Afterwards the row is legitimately
+// owned by B, so any mutator A calls on it must be a no-op returning
+// ErrLeaseLost — never a clobber of B's fresh claim.
+func loseLease(t *testing.T) (a *Frontier, id uint) {
+	t.Helper()
+	s, err := store.Open("sqlite", "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	a = New(s.DB, WithWorkerID("worker-a"))
+	b := New(s.DB, WithWorkerID("worker-b"))
+
+	item := &store.FrontierItem{Kind: store.KindPageFetch, URL: "https://lost.example/", DedupKey: "pf:lost"}
+	if _, err := a.Enqueue(item); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	got, err := a.Dequeue(1)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("A Dequeue: err=%v got=%d", err, len(got))
+	}
+	id = got[0].ID
+
+	// Force A's lease into the past so B's ReclaimExpired is entitled to it.
+	past := time.Now().Add(-time.Hour)
+	if err := a.db.Model(&store.FrontierItem{}).Where("id = ?", id).
+		Update("leased_until", &past).Error; err != nil {
+		t.Fatalf("forcing expired lease: %v", err)
+	}
+	if n, err := b.ReclaimExpired(); err != nil || n != 1 {
+		t.Fatalf("B ReclaimExpired: n=%d err=%v", n, err)
+	}
+	got, err = b.Dequeue(1)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("B Dequeue: err=%v got=%d", err, len(got))
+	}
+	if got[0].ID != id {
+		t.Fatalf("B dequeued %d, want the reclaimed item %d", got[0].ID, id)
+	}
+	if got[0].WorkerID != "worker-b" {
+		t.Fatalf("reclaimed item worker_id = %q, want worker-b", got[0].WorkerID)
+	}
+	return a, id
+}
+
+// assertOwnedBy asserts the row is in the given status under the given
+// worker_id — i.e. a lost-lease mutator left the new owner's claim intact.
+func assertOwnedBy(t *testing.T, f *Frontier, id uint, status, worker string) {
+	t.Helper()
+	var it store.FrontierItem
+	if err := f.db.First(&it, id).Error; err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if it.Status != status {
+		t.Fatalf("status = %q, want %q", it.Status, status)
+	}
+	if it.WorkerID != worker {
+		t.Fatalf("worker_id = %q, want %q", it.WorkerID, worker)
+	}
+}
+
+// A Complete from a worker whose lease was lost must not mark the item done
+// (that would clobber the new owner's in-flight claim and double-run its
+// SaveEntries); it returns ErrLeaseLost and changes nothing.
+func TestCompleteLostLeaseIsNoOp(t *testing.T) {
+	a, id := loseLease(t)
+	if err := a.Complete(id); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("Complete after lease loss = %v, want ErrLeaseLost", err)
+	}
+	if errors.Is(a.Complete(id), store.ErrNotFound) {
+		t.Fatal("lost lease must be distinguishable from ErrNotFound")
+	}
+	assertOwnedBy(t, a, id, store.FrontierStatusInFlight, "worker-b")
+}
+
+// A Requeue from a worker whose lease was lost must not flip the item back to
+// pending under the new owner; it returns ErrLeaseLost and changes nothing.
+func TestRequeueLostLeaseIsNoOp(t *testing.T) {
+	a, id := loseLease(t)
+	if err := a.Requeue(id); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("Requeue after lease loss = %v, want ErrLeaseLost", err)
+	}
+	assertOwnedBy(t, a, id, store.FrontierStatusInFlight, "worker-b")
+}
+
+// A Fail from a worker whose lease was lost must neither record the failure
+// nor burn an attempt against the new owner's fresh claim; it returns
+// ErrLeaseLost with permanent=false and leaves attempts at 0.
+func TestFailLostLeaseDoesNotIncrementAttempts(t *testing.T) {
+	a, id := loseLease(t)
+	permanent, err := a.Fail(id, errors.New("boom"), 3)
+	if !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("Fail after lease loss = %v, want ErrLeaseLost", err)
+	}
+	if permanent {
+		t.Fatal("expected permanent=false on a lost lease")
+	}
+	var it store.FrontierItem
+	if err := a.db.First(&it, id).Error; err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if it.Attempts != 0 {
+		t.Fatalf("attempts = %d, want 0 (a lost lease must not count an attempt)", it.Attempts)
+	}
+	assertOwnedBy(t, a, id, store.FrontierStatusInFlight, "worker-b")
+}
+
 // -- Counts --------------------------------------------------------------
 
 func TestCounts(t *testing.T) {
@@ -654,6 +781,9 @@ func TestEnqueueReenqueueRaceGuard(t *testing.T) {
 	item := &store.FrontierItem{Kind: store.KindHostProbe, Host: "race.example", DedupKey: "hp:race"}
 	if _, err := f.Enqueue(item); err != nil {
 		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := f.Dequeue(1); err != nil {
+		t.Fatalf("Dequeue: %v", err)
 	}
 	if err := f.Complete(item.ID); err != nil {
 		t.Fatalf("Complete: %v", err)

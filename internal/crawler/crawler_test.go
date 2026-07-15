@@ -567,32 +567,52 @@ func TestProcess_CompletesSuccessfulItem(t *testing.T) {
 	eng, st := newTestEngine(t, testCrawlerConfig())
 	entryID := uint(1)
 
-	item := store.FrontierItem{Kind: store.KindArtifactFetch, URL: srv.URL + "/ok.json", DedupKey: "x", Status: store.FrontierStatusInFlight, ArtifactEntryID: &entryID}
-	if err := st.DB.Create(&item).Error; err != nil {
-		t.Fatalf("seed item: %v", err)
-	}
+	// Enqueue+dequeue through the engine's own frontier so the in_flight row
+	// carries that frontier's worker_id: Complete's ownership guard only
+	// touches rows this worker still holds the lease on.
+	item := store.FrontierItem{Kind: store.KindArtifactFetch, URL: srv.URL + "/ok.json", DedupKey: "x", ArtifactEntryID: &entryID}
+	got := seedInFlight(t, eng, &item)
 
-	eng.process(context.Background(), item)
+	eng.process(context.Background(), got)
 
 	var reloaded store.FrontierItem
-	st.DB.First(&reloaded, item.ID)
+	st.DB.First(&reloaded, got.ID)
 	if reloaded.Status != store.FrontierStatusDone {
 		t.Errorf("expected status done, got %q", reloaded.Status)
 	}
 }
 
+// seedInFlight enqueues item into eng's frontier and dequeues it back,
+// returning the dequeued copy (now in_flight, stamped with eng's worker_id).
+// process()'s Complete/Fail/Requeue ownership guards require the frontier to
+// own the item's lease, which a bare st.DB.Create with Status=in_flight does
+// not establish (worker_id would be empty) — so tests exercising process()
+// must claim the item the same way Run's dispatcher does.
+func seedInFlight(t *testing.T, eng *Engine, item *store.FrontierItem) store.FrontierItem {
+	t.Helper()
+	if _, err := eng.frontier.Enqueue(item); err != nil {
+		t.Fatalf("seedInFlight enqueue: %v", err)
+	}
+	got, err := eng.frontier.Dequeue(1)
+	if err != nil {
+		t.Fatalf("seedInFlight dequeue: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("seedInFlight: expected 1 dequeued item, got %d", len(got))
+	}
+	return got[0]
+}
+
 func TestProcess_FailsPermanentlyOnUnknownKind(t *testing.T) {
 	eng, st := newTestEngine(t, testCrawlerConfig())
 
-	item := store.FrontierItem{Kind: "bogus", DedupKey: "y", Status: store.FrontierStatusInFlight}
-	if err := st.DB.Create(&item).Error; err != nil {
-		t.Fatalf("seed item: %v", err)
-	}
+	item := store.FrontierItem{Kind: "bogus", DedupKey: "y"}
+	got := seedInFlight(t, eng, &item)
 
-	eng.process(context.Background(), item)
+	eng.process(context.Background(), got)
 
 	var reloaded store.FrontierItem
-	st.DB.First(&reloaded, item.ID)
+	st.DB.First(&reloaded, got.ID)
 	if reloaded.Status != store.FrontierStatusFailed {
 		t.Errorf("expected status failed for a permanent, non-transient error, got %q", reloaded.Status)
 	}
@@ -621,24 +641,83 @@ func TestProcess_PersistsProvenanceAcrossRetry(t *testing.T) {
 
 	item := store.FrontierItem{
 		Kind: store.KindArtifactFetch, URL: artifactURL,
-		DedupKey: dedupKey(store.KindArtifactFetch, artifactURL), Status: store.FrontierStatusInFlight,
+		DedupKey:        dedupKey(store.KindArtifactFetch, artifactURL),
 		ArtifactEntryID: &entryID,
 	}
-	if err := st.DB.Create(&item).Error; err != nil {
-		t.Fatalf("seed item: %v", err)
-	}
+	got := seedInFlight(t, eng, &item)
 
 	// MaxAttempts is 2 in newTestEngine's Options, so the first failure
 	// still has a retry left.
-	eng.process(context.Background(), item)
+	eng.process(context.Background(), got)
 
 	var reloaded store.FrontierItem
-	st.DB.First(&reloaded, item.ID)
+	st.DB.First(&reloaded, got.ID)
 	if reloaded.Status != store.FrontierStatusPending {
 		t.Fatalf("expected item still pending (retry remaining), got %q", reloaded.Status)
 	}
 	if reloaded.ArtifactEntryID == nil || *reloaded.ArtifactEntryID != 7 {
 		t.Errorf("expected artifact_entry_id to survive a retryable failure, got %v", reloaded.ArtifactEntryID)
+	}
+}
+
+// TestProcess_DiscardsResultOnLostLease verifies process() treats a lost
+// lease as a non-fatal outcome. When this worker's handler outlives its
+// lease and a peer reclaims and re-dequeues the item, Complete fails with
+// frontier.ErrLeaseLost; process must log-and-continue rather than error,
+// and must leave the peer's fresh in_flight claim untouched (no double
+// "done", no clobbered worker_id).
+func TestProcess_DiscardsResultOnLostLease(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ok.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := testCrawlerConfig()
+	st := newTestStore(t)
+	fc := fetch.New(cfg.Crawler)
+
+	frA := frontier.New(st.DB, frontier.WithWorkerID("worker-a"))
+	frB := frontier.New(st.DB, frontier.WithWorkerID("worker-b"))
+	engA := New(cfg, st, frA, fc, discardLogger(), Options{MaxAttempts: 2})
+
+	entryID := uint(1)
+	item := &store.FrontierItem{Kind: store.KindArtifactFetch, URL: srv.URL + "/ok.json", DedupKey: "lost", ArtifactEntryID: &entryID}
+	if _, err := frA.Enqueue(item); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	gotA, err := frA.Dequeue(1)
+	if err != nil || len(gotA) != 1 {
+		t.Fatalf("A Dequeue: err=%v got=%d", err, len(gotA))
+	}
+
+	// Peer B steals the lease: force-expire it, reclaim it, re-dequeue it.
+	past := time.Now().Add(-time.Hour)
+	if err := st.DB.Model(&store.FrontierItem{}).Where("id = ?", gotA[0].ID).
+		Update("leased_until", &past).Error; err != nil {
+		t.Fatalf("force expire: %v", err)
+	}
+	if n, err := frB.ReclaimExpired(); err != nil || n != 1 {
+		t.Fatalf("B ReclaimExpired: n=%d err=%v", n, err)
+	}
+	if _, err := frB.Dequeue(1); err != nil {
+		t.Fatalf("B Dequeue: %v", err)
+	}
+
+	// A processes its now-stale item. The handler succeeds, but Complete is a
+	// no-op because A no longer holds the lease.
+	engA.process(context.Background(), gotA[0])
+
+	var reloaded store.FrontierItem
+	if err := st.DB.First(&reloaded, gotA[0].ID).Error; err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.Status != store.FrontierStatusInFlight {
+		t.Errorf("status = %q, want in_flight (peer B still owns it, A must not mark it done)", reloaded.Status)
+	}
+	if reloaded.WorkerID != "worker-b" {
+		t.Errorf("worker_id = %q, want worker-b (A must not clobber B's claim)", reloaded.WorkerID)
 	}
 }
 
