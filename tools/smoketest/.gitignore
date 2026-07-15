@@ -1,0 +1,4 @@
+# Disposable, regenerated on every run — never commit.
+certs/
+logs/
+bin/
