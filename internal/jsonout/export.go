@@ -40,12 +40,17 @@ type ExportResult struct {
 // exportQuery is the flattened catalog_entries/catalogs/domains join in
 // stable entry order. Plain SQL against database/sql rather than a GORM
 // Scan: exports run over millions of rows, and per-row reflection costs
-// about 2s per million rows on top of this query.
+// about 2s per million rows on top of this query. Standard SQL only (no
+// quoting dialects, no reserved-word identifiers) so it runs unchanged on
+// sqlite, MySQL/MariaDB, and Postgres; COALESCE guards the plain-string
+// Scan targets against NULLs in imported or hand-edited data (ardvark's own
+// writers only ever store empty strings).
 const exportQuery = `SELECT domains.host, catalogs.source_url, catalogs.verification_status,
-	catalog_entries.urn, catalog_entries.urn_publisher, catalog_entries.display_name,
-	catalog_entries.media_type, catalog_entries.ref_url, catalog_entries.description,
-	catalog_entries.version, catalog_entries.source, catalog_entries.tags,
-	catalog_entries.representative_queries
+	COALESCE(catalog_entries.urn, ''), COALESCE(catalog_entries.urn_publisher, ''),
+	COALESCE(catalog_entries.display_name, ''), COALESCE(catalog_entries.media_type, ''),
+	COALESCE(catalog_entries.ref_url, ''), COALESCE(catalog_entries.description, ''),
+	COALESCE(catalog_entries.version, ''), COALESCE(catalog_entries.source, ''),
+	COALESCE(catalog_entries.tags, ''), COALESCE(catalog_entries.representative_queries, '')
 	FROM catalog_entries
 	JOIN catalogs ON catalogs.id = catalog_entries.catalog_id
 	JOIN domains ON domains.id = catalogs.domain_id
