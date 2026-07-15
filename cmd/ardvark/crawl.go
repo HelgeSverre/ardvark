@@ -28,7 +28,12 @@ var crawlCmd = &cobra.Command{
 	Short: "Seed the frontier and drain it with the crawl engine",
 	Long: "crawl seeds the persistent frontier from the given URLs and/or bare domains " +
 		"(and/or a --list file), then runs the crawler until the frontier is empty. " +
-		"Pending work from prior runs is resumed automatically.",
+		"Pending work from prior runs is resumed automatically. When a worker fleet is " +
+		"configured (crawler.worker.count > 1), this process only dequeues its own " +
+		"shard (crawler.worker.index) but still waits for the whole frontier to drain " +
+		"before exiting, so a lone crawl run will seed every shard yet sit idle waiting " +
+		"for peers on the shards it does not own — run \"ardvark work\" for the other " +
+		"worker indices to drain them.",
 	RunE: runCrawl,
 }
 

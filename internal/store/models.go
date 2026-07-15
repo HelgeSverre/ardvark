@@ -209,6 +209,13 @@ type FrontierItem struct {
 	// row whose lease has passed back to pending, so a worker process that
 	// dies mid-item does not strand that item forever — this is what makes
 	// multiple worker processes sharing one mysql/postgres database safe.
+	// Expiry is judged by comparing this timestamp (written by the leasing
+	// worker's clock) against the reclaimer's own clock, which may be a
+	// different worker process entirely — so distributed deployments must
+	// keep worker clocks reasonably synchronized (e.g. NTP). Clock skew
+	// approaching the configured lease duration can cause premature
+	// reclaim: a worker still legitimately processing an item may have its
+	// lease stolen out from under it by a reclaimer whose clock runs ahead.
 	// Cleared (nil) whenever an item leaves in_flight (Complete/Fail/Requeue).
 	LeasedUntil *time.Time `gorm:"index"`
 	// WorkerID identifies which worker process currently holds the lease

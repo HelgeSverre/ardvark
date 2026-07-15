@@ -331,8 +331,13 @@ func (e *Engine) Run(ctx context.Context) error {
 }
 
 // isSQLiteDriver reports whether driver names ardvark's sqlite storage
-// backend ("sqlite" or "sqlite3"), including the config.Defaults() default
-// of an empty driver string being treated as sqlite by store.Open.
+// backend ("sqlite" or "sqlite3"). An empty driver string is also treated
+// as sqlite here — this is not something store.Open does (it errors on ""
+// rather than defaulting to sqlite); it is this function's own conservative
+// default, chosen because the sqlite branch's unconditional reclaim is the
+// safe failure mode if the driver were ever unset. In practice "" never
+// reaches here: config.Defaults() always fills in a non-empty driver before
+// the store is opened.
 func isSQLiteDriver(driver string) bool {
 	return driver == "" || driver == "sqlite" || driver == "sqlite3"
 }

@@ -77,7 +77,7 @@ ardvark export --format jsonl --out resources.jsonl
 
 | Command | What it does |
 |---------|--------------|
-| `ardvark crawl [url\|domain]... [--list file] [--force]` | Seed the frontier and run the crawler until the queue is empty. Resumes pending work from earlier runs. |
+| `ardvark crawl [url\|domain]... [--list file] [--force]` | Seed the frontier and run the crawler until the queue is empty. Resumes pending work from earlier runs. With a worker fleet configured, this process only drains its own shard, so pair it with `ardvark work` for the other worker indices. |
 | `ardvark work [--worker i/n] [--force]` | Drain the shared frontier without seeding it. Multiple `work` processes can point at the same mysql/postgres database, each taking a disjoint `--worker` share of hosts (0-based index / total count) so they crawl cooperatively; sqlite is single-process only. Exits cleanly if the frontier is empty. |
 | `ardvark probe <host>...` | Probe specific hosts for ARD documents, no crawling. |
 | `ardvark seed ct [--count N] [--log oak\|argon\|all\|URL]` | Harvest domains from the newest Certificate Transparency log entries. Logs resolve live from the CT log list (Oak by default), so shard URLs never go stale. |
