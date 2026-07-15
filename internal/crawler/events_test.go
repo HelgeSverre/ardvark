@@ -147,9 +147,6 @@ func TestOnProbe_HitFiresOnCatalogVerification(t *testing.T) {
 	if hit.Verdict != ard.VerdictValidWithWarnings {
 		t.Errorf("verdict = %q, want %q", hit.Verdict, ard.VerdictValidWithWarnings)
 	}
-	if hit.EntryCount != 1 {
-		t.Errorf("entry count = %d, want 1", hit.EntryCount)
-	}
 	if !strings.Contains(hit.Detail, "urn.publisher_matches") {
 		t.Errorf("detail = %q, want it to name the failing check urn.publisher_matches", hit.Detail)
 	}
@@ -208,9 +205,6 @@ func TestOnProbe_InvalidCatalogSummarizesFailingChecks(t *testing.T) {
 	}
 	if ev.Verdict != ard.VerdictInvalid {
 		t.Errorf("verdict = %q, want %q", ev.Verdict, ard.VerdictInvalid)
-	}
-	if ev.EntryCount != 3 {
-		t.Errorf("entry count = %d, want 3", ev.EntryCount)
 	}
 	if !strings.Contains(ev.Detail, "schema.validation ×3") {
 		t.Errorf("detail = %q, want it to contain \"schema.validation ×3\"", ev.Detail)

@@ -62,15 +62,7 @@ func (e *Engine) handlePageFetch(ctx context.Context, item store.FrontierItem) e
 			e.logger.Warn("crawler: failed to upsert domain from anchor", "host", host, "error", err)
 			continue
 		}
-		if _, err := e.frontier.Enqueue(&store.FrontierItem{
-			RunID:    e.opts.RunID,
-			Kind:     store.KindHostProbe,
-			Host:     host,
-			Depth:    0,
-			DedupKey: dedupKey(store.KindHostProbe, host),
-		}); err != nil {
-			e.logger.Warn("crawler: failed to enqueue host_probe", "host", host, "error", err)
-		}
+		e.enqueue(store.KindHostProbe, "", host, 0)
 	}
 
 	for _, hintURL := range result.AICatalogHints {
@@ -93,16 +85,7 @@ func (e *Engine) handlePageFetch(ctx context.Context, item store.FrontierItem) e
 			e.logger.Warn("crawler: failed to record link_tag probe", "url", hintURL, "error", err)
 		}
 		e.setCatalogMethod(hintURL, store.ProbeMethodLinkTag)
-		if _, err := e.frontier.Enqueue(&store.FrontierItem{
-			RunID:    e.opts.RunID,
-			Kind:     store.KindCatalogFetch,
-			URL:      hintURL,
-			Host:     hintHost,
-			Depth:    0,
-			DedupKey: dedupKey(store.KindCatalogFetch, hintURL),
-		}); err != nil {
-			e.logger.Warn("crawler: failed to enqueue catalog_fetch from link hint", "url", hintURL, "error", err)
-		}
+		e.enqueue(store.KindCatalogFetch, hintURL, hintHost, 0)
 	}
 
 	if item.Depth < e.maxDepth() {
@@ -115,17 +98,9 @@ func (e *Engine) handlePageFetch(ctx context.Context, item store.FrontierItem) e
 			if !e.reservePage(linkHost, budget) {
 				continue
 			}
-			added, err := e.frontier.Enqueue(&store.FrontierItem{
-				RunID:    e.opts.RunID,
-				Kind:     store.KindPageFetch,
-				URL:      link,
-				Host:     linkHost,
-				Depth:    item.Depth + 1,
-				DedupKey: dedupKey(store.KindPageFetch, link),
-			})
+			added, err := e.enqueue(store.KindPageFetch, link, linkHost, item.Depth+1)
 			if err != nil {
 				e.releasePage(linkHost)
-				e.logger.Warn("crawler: failed to enqueue page_fetch", "url", link, "error", err)
 				continue
 			}
 			if !added {
@@ -150,7 +125,11 @@ func (e *Engine) handlePageFetch(ctx context.Context, item store.FrontierItem) e
 func (e *Engine) handleHostProbe(ctx context.Context, item store.FrontierItem) error {
 	if !e.opts.Force {
 		recently, err := e.store.RecentlyProbed(item.Host, e.refreshWindow())
-		if err == nil && recently {
+		if err != nil {
+			// Fail open: the freshness check is an optimization, so a broken
+			// lookup must not block the probe — but it shouldn't be silent.
+			e.logger.Warn("crawler: recently-probed check failed", "host", item.Host, "error", err)
+		} else if recently {
 			e.logger.Debug("crawler: skipping recently-probed host", "host", item.Host)
 			return nil
 		}
@@ -184,16 +163,7 @@ func (e *Engine) handleHostProbe(ctx context.Context, item store.FrontierItem) e
 		hadHit = true
 		for _, catalogURL := range r.CatalogURLs {
 			e.setCatalogMethod(catalogURL, r.Method)
-			if _, err := e.frontier.Enqueue(&store.FrontierItem{
-				RunID:    e.opts.RunID,
-				Kind:     store.KindCatalogFetch,
-				URL:      catalogURL,
-				Host:     item.Host,
-				Depth:    0,
-				DedupKey: dedupKey(store.KindCatalogFetch, catalogURL),
-			}); err != nil {
-				e.logger.Warn("crawler: failed to enqueue catalog_fetch", "url", catalogURL, "error", err)
-			}
+			e.enqueue(store.KindCatalogFetch, catalogURL, item.Host, 0)
 		}
 	}
 
@@ -296,24 +266,26 @@ func (e *Engine) processCatalog(ctx context.Context, raw []byte, contentHash, ho
 		return nil
 	}
 
-	for i, en := range parsed.Entries {
+	e.enqueueEntryFollowups(ctx, cat, parsed.Entries, host, sourceURL, depth)
+	return nil
+}
+
+// enqueueEntryFollowups fans out follow-on work for each entry of a just-
+// persisted catalog: catalog_fetch for url-referenced nested catalogs, a
+// direct recursive processCatalog call for data-embedded ones,
+// registry_harvest for registry entries, and artifact_fetch for everything
+// else. Kept separate from processCatalog so persistence and fan-out policy
+// don't intertwine.
+func (e *Engine) enqueueEntryFollowups(ctx context.Context, cat *store.Catalog, entries []ard.Entry, host, sourceURL string, depth int) {
+	for i, en := range entries {
 		entryID := cat.Entries[i].ID
 
 		switch {
 		case en.Type == mediaTypeAICatalog && en.URL != "":
 			e.setParentCatalog(en.URL, cat.ID)
-			if _, err := e.frontier.Enqueue(&store.FrontierItem{
-				RunID:    e.opts.RunID,
-				Kind:     store.KindCatalogFetch,
-				URL:      en.URL,
-				Host:     host,
-				Depth:    depth + 1,
-				DedupKey: dedupKey(store.KindCatalogFetch, en.URL),
-			}); err != nil {
-				e.logger.Warn("crawler: failed to enqueue nested catalog_fetch", "url", en.URL, "error", err)
-			}
+			e.enqueue(store.KindCatalogFetch, en.URL, host, depth+1)
 
-		case en.Type == mediaTypeAICatalog && len(en.Data) > 0 && string(en.Data) != "null":
+		case en.Type == mediaTypeAICatalog && hasEmbeddedData(en.Data):
 			sum := sha256.Sum256(en.Data)
 			nestedSource := sourceURL + "#" + en.Identifier
 			catID := cat.ID
@@ -332,33 +304,20 @@ func (e *Engine) processCatalog(ctx context.Context, raw []byte, contentHash, ho
 				continue
 			}
 			e.setRegistryContext(en.URL, entryID, cat.ID, regRow.ID)
-			if _, err := e.frontier.Enqueue(&store.FrontierItem{
-				RunID:    e.opts.RunID,
-				Kind:     store.KindRegistryHarvest,
-				URL:      en.URL,
-				Host:     host,
-				Depth:    0,
-				DedupKey: dedupKey(store.KindRegistryHarvest, en.URL),
-			}); err != nil {
-				e.logger.Warn("crawler: failed to enqueue registry_harvest", "url", en.URL, "error", err)
-			}
+			e.enqueue(store.KindRegistryHarvest, en.URL, host, 0)
 
 		case en.URL != "" && e.cfg.ARD.FetchArtifacts:
 			e.setArtifactEntry(en.URL, entryID)
-			if _, err := e.frontier.Enqueue(&store.FrontierItem{
-				RunID:    e.opts.RunID,
-				Kind:     store.KindArtifactFetch,
-				URL:      en.URL,
-				Host:     host,
-				Depth:    0,
-				DedupKey: dedupKey(store.KindArtifactFetch, en.URL),
-			}); err != nil {
-				e.logger.Warn("crawler: failed to enqueue artifact_fetch", "url", en.URL, "error", err)
-			}
+			e.enqueue(store.KindArtifactFetch, en.URL, host, 0)
 		}
 	}
+}
 
-	return nil
+// hasEmbeddedData reports whether raw carries a real JSON value: an absent
+// field and an explicit JSON null (which encoding/json leaves as the raw
+// bytes "null") are both "no data" for ARD purposes.
+func hasEmbeddedData(raw json.RawMessage) bool {
+	return len(raw) > 0 && string(raw) != "null"
 }
 
 // buildEntryRows converts parsed ARD entries into store.CatalogEntry rows
@@ -391,7 +350,7 @@ func buildEntryRow(en ard.Entry, source string, sourceRegistryID *uint) store.Ca
 		DisplayName:           en.DisplayName,
 		MediaType:             en.Type,
 		RefURL:                en.URL,
-		HasEmbeddedData:       len(en.Data) > 0 && string(en.Data) != "null",
+		HasEmbeddedData:       hasEmbeddedData(en.Data),
 		Description:           en.Description,
 		Version:               en.Version,
 		EntryUpdatedAt:        en.UpdatedAt,
@@ -420,7 +379,7 @@ func jsonOrEmpty(v any) string {
 		}
 	}
 	b, err := json.Marshal(v)
-	if err != nil || string(b) == "null" {
+	if err != nil || !hasEmbeddedData(b) {
 		return ""
 	}
 	return string(b)
@@ -551,7 +510,7 @@ func (e *Engine) handleRegistryHarvest(ctx context.Context, item store.FrontierI
 			row.CatalogID = regCtx.catalogID
 			rows[i] = row
 		}
-		if err := e.store.DB.Create(&rows).Error; err != nil {
+		if err := e.store.SaveEntries(rows); err != nil {
 			return err
 		}
 	}
@@ -575,28 +534,17 @@ func (e *Engine) handleRegistryHarvest(ctx context.Context, item store.FrontierI
 			continue
 		}
 		e.setRegistryContext(ref.URL, regCtx.entryID, regCtx.catalogID, refRow.ID)
-		if _, err := e.frontier.Enqueue(&store.FrontierItem{
-			RunID:    e.opts.RunID,
-			Kind:     store.KindRegistryHarvest,
-			URL:      ref.URL,
-			Host:     item.Host,
-			Depth:    nextDepth,
-			DedupKey: dedupKey(store.KindRegistryHarvest, ref.URL),
-		}); err != nil {
-			e.logger.Warn("crawler: failed to enqueue referral registry_harvest", "url", ref.URL, "error", err)
-		}
+		e.enqueue(store.KindRegistryHarvest, ref.URL, item.Host, nextDepth)
 	}
 
 	return nil
 }
 
-// updateRegistryStatus updates a registries row's harvest_status and
-// last_harvested_at directly via the store's exported *gorm.DB, since
-// internal/store does not expose a dedicated update method for this.
+// updateRegistryStatus records the outcome of a harvest attempt on the
+// registries row; failures are warn-logged rather than propagated since the
+// harvested data itself has already been handled.
 func (e *Engine) updateRegistryStatus(regRowID uint, status string) {
-	now := time.Now()
-	if err := e.store.DB.Model(&store.Registry{}).Where("id = ?", regRowID).
-		Updates(map[string]any{"harvest_status": status, "last_harvested_at": &now}).Error; err != nil {
+	if err := e.store.UpdateRegistryStatus(regRowID, status, time.Now()); err != nil {
 		e.logger.Warn("crawler: failed to update registry status", "registry_id", regRowID, "error", err)
 	}
 }

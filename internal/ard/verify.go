@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -12,6 +13,8 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	"golang.org/x/net/idna"
 	"golang.org/x/net/publicsuffix"
+
+	"github.com/helgesverre/ardvark/internal/httpx"
 )
 
 // Severity levels for verification checks.
@@ -19,6 +22,10 @@ const (
 	SeverityError   = "error"
 	SeverityWarning = "warning"
 )
+
+// SubjectCatalog is the Check.Subject value for catalog-level checks (as
+// opposed to checks scoped to a single entry's URN).
+const SubjectCatalog = "catalog"
 
 // Verdicts produced by the roll-up of a Report's checks.
 const (
@@ -88,20 +95,35 @@ func compiledCatalogSchema() (*jsonschema.Schema, error) {
 	return catalogSchema, catalogSchemaErr
 }
 
-// knownEntryMediaTypes are the ARD media types recognized by entry.type as
-// of specVersion 1.0. The spec explicitly says unrecognized types should
-// not be strictly enforced, hence this check is a warning.
-var knownEntryMediaTypes = map[string]bool{
-	"application/a2a-agent-card+json":  true,
-	"application/mcp-server-card+json": true,
-	"application/ai-catalog+json":      true,
-	"application/ai-registry+json":     true,
-	"application/ai-skill+json":        true,
+// ARD entry media types, as of specVersion 1.0. mediaTypeAICatalog and
+// mediaTypeAIRegistry are also the two "pointer" types isPointerMediaType
+// checks against, so they're named consts rather than inline strings to keep
+// that map and that check from drifting apart.
+const (
+	mediaTypeA2AAgentCard  = "application/a2a-agent-card+json"
+	mediaTypeMCPServerCard = "application/mcp-server-card+json"
+	mediaTypeAICatalog     = "application/ai-catalog+json"
+	mediaTypeAIRegistry    = "application/ai-registry+json"
+	mediaTypeAISkillCard   = "application/ai-skill+json"
 	// Forms seen on catalogs published in the wild (e.g. unlimit.website),
 	// predating the "-card" suffix in the spec draft.
-	"application/mcp-server+json": true,
-	"application/a2a-agent+json":  true,
-	"application/ai-skill":        true,
+	mediaTypeMCPServer = "application/mcp-server+json"
+	mediaTypeA2AAgent  = "application/a2a-agent+json"
+	mediaTypeAISkill   = "application/ai-skill"
+)
+
+// knownEntryMediaTypes are the ARD media types recognized by entry.type. The
+// spec explicitly says unrecognized types should not be strictly enforced,
+// hence this check is a warning.
+var knownEntryMediaTypes = map[string]bool{
+	mediaTypeA2AAgentCard:  true,
+	mediaTypeMCPServerCard: true,
+	mediaTypeAICatalog:     true,
+	mediaTypeAIRegistry:    true,
+	mediaTypeAISkillCard:   true,
+	mediaTypeMCPServer:     true,
+	mediaTypeA2AAgent:      true,
+	mediaTypeAISkill:       true,
 }
 
 // TransportChecks runs the verification pipeline's step-1 transport checks
@@ -111,28 +133,38 @@ var knownEntryMediaTypes = map[string]bool{
 // responsibility rather than Verify's, per Verify's doc comment, since they
 // depend on HTTP transport metadata Verify does not have.
 func TransportChecks(contentType string, body []byte, maxBodyBytes int64) []Check {
-	contentTypeOK := strings.Contains(strings.ToLower(contentType), "json")
-	contentTypeMsg := fmt.Sprintf("Content-Type %q indicates JSON", contentType)
-	if !contentTypeOK {
-		contentTypeMsg = fmt.Sprintf("Content-Type %q does not indicate JSON", contentType)
-	}
-
+	contentTypeOK := httpx.IsJSONContentType(contentType)
 	sizeOK := maxBodyBytes <= 0 || int64(len(body)) <= maxBodyBytes
-	sizeMsg := fmt.Sprintf("body size %d bytes is within the %d byte cap", len(body), maxBodyBytes)
-	if !sizeOK {
-		sizeMsg = fmt.Sprintf("body size %d bytes exceeds the %d byte cap", len(body), maxBodyBytes)
-	}
-
 	utf8OK := utf8.Valid(body)
-	utf8Msg := "body is valid UTF-8"
-	if !utf8OK {
-		utf8Msg = "body is not valid UTF-8"
-	}
 
 	return []Check{
-		{CheckID: "transport.content_type", Severity: SeverityWarning, Passed: contentTypeOK, Message: contentTypeMsg, SpecRef: specRef, Subject: "catalog"},
-		{CheckID: "transport.size", Severity: SeverityWarning, Passed: sizeOK, Message: sizeMsg, SpecRef: specRef, Subject: "catalog"},
-		{CheckID: "transport.utf8", Severity: SeverityWarning, Passed: utf8OK, Message: utf8Msg, SpecRef: specRef, Subject: "catalog"},
+		newCheck("transport.content_type", SeverityWarning, SubjectCatalog, contentTypeOK,
+			fmt.Sprintf("Content-Type %q indicates JSON", contentType),
+			fmt.Sprintf("Content-Type %q does not indicate JSON", contentType)),
+		newCheck("transport.size", SeverityWarning, SubjectCatalog, sizeOK,
+			fmt.Sprintf("body size %d bytes is within the %d byte cap", len(body), maxBodyBytes),
+			fmt.Sprintf("body size %d bytes exceeds the %d byte cap", len(body), maxBodyBytes)),
+		newCheck("transport.utf8", SeverityWarning, SubjectCatalog, utf8OK,
+			"body is valid UTF-8", "body is not valid UTF-8"),
+	}
+}
+
+// newCheck builds a Check from its pass/fail outcome, picking passMsg or
+// failMsg accordingly. Checks whose Message needs more than a binary
+// pass/fail choice (e.g. schema.validation's per-leaf detail) construct
+// Check directly instead.
+func newCheck(id, severity, subject string, passed bool, passMsg, failMsg string) Check {
+	msg := passMsg
+	if !passed {
+		msg = failMsg
+	}
+	return Check{
+		CheckID:  id,
+		Severity: severity,
+		Passed:   passed,
+		Message:  msg,
+		SpecRef:  specRef,
+		Subject:  subject,
 	}
 }
 
@@ -162,7 +194,7 @@ func Verify(raw []byte, servingDomain string) Report {
 			Passed:   false,
 			Message:  fmt.Sprintf("catalog is not valid JSON: %v", err),
 			SpecRef:  specRef,
-			Subject:  "catalog",
+			Subject:  SubjectCatalog,
 		}}
 		report.Verdict = VerdictInvalid
 		return report
@@ -256,7 +288,7 @@ func validateSchema(raw []byte) []Check {
 			Passed:   false,
 			Message:  fmt.Sprintf("internal error compiling vendored schema: %v", err),
 			SpecRef:  specRef,
-			Subject:  "catalog",
+			Subject:  SubjectCatalog,
 		}}
 	}
 
@@ -268,7 +300,7 @@ func validateSchema(raw []byte) []Check {
 			Passed:   false,
 			Message:  fmt.Sprintf("catalog is not valid JSON: %v", err),
 			SpecRef:  specRef,
-			Subject:  "catalog",
+			Subject:  SubjectCatalog,
 		}}
 	}
 
@@ -285,7 +317,7 @@ func validateSchema(raw []byte) []Check {
 			Passed:   false,
 			Message:  verr.Error(),
 			SpecRef:  specRef,
-			Subject:  "catalog",
+			Subject:  SubjectCatalog,
 		}}
 	}
 
@@ -323,16 +355,16 @@ func validateSchema(raw []byte) []Check {
 func schemaSubject(instanceLocation string, raw []byte) string {
 	const prefix = "/entries/"
 	if !strings.HasPrefix(instanceLocation, prefix) {
-		return "catalog"
+		return SubjectCatalog
 	}
 	rest := strings.TrimPrefix(instanceLocation, prefix)
 	idxStr := rest
 	if i := strings.Index(rest, "/"); i >= 0 {
 		idxStr = rest[:i]
 	}
-	var idx int
-	if _, err := fmt.Sscanf(idxStr, "%d", &idx); err != nil {
-		return "catalog"
+	idx, err := strconv.Atoi(idxStr)
+	if err != nil {
+		return SubjectCatalog
 	}
 
 	var doc struct {
@@ -341,15 +373,15 @@ func schemaSubject(instanceLocation string, raw []byte) string {
 		} `json:"entries"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
-		return "catalog"
+		return SubjectCatalog
 	}
 	if idx < 0 || idx >= len(doc.Entries) {
-		return "catalog"
+		return SubjectCatalog
 	}
 	if id := doc.Entries[idx].Identifier; id != "" {
 		return id
 	}
-	return "catalog"
+	return SubjectCatalog
 }
 
 // semanticChecks runs the seven spec-defined semantic checks that JSON
@@ -400,24 +432,15 @@ func entrySubject(e Entry) string {
 	if e.Identifier != "" {
 		return e.Identifier
 	}
-	return "catalog"
+	return SubjectCatalog
 }
 
 // checkSpecVersion: catalog.spec_version (error) — specVersion must be "1.0".
 func checkSpecVersion(c Catalog) Check {
 	passed := c.SpecVersion == "1.0"
-	msg := fmt.Sprintf("specVersion is %q", c.SpecVersion)
-	if !passed {
-		msg = fmt.Sprintf("specVersion must be \"1.0\", got %q", c.SpecVersion)
-	}
-	return Check{
-		CheckID:  "catalog.spec_version",
-		Severity: SeverityError,
-		Passed:   passed,
-		Message:  msg,
-		SpecRef:  specRef,
-		Subject:  "catalog",
-	}
+	return newCheck("catalog.spec_version", SeverityError, SubjectCatalog, passed,
+		fmt.Sprintf("specVersion is %q", c.SpecVersion),
+		fmt.Sprintf("specVersion must be \"1.0\", got %q", c.SpecVersion))
 }
 
 // checkIdentifierUnique: identifier.unique (error) — no duplicate URNs
@@ -450,7 +473,7 @@ func checkIdentifierUnique(c Catalog) Check {
 		Passed:   passed,
 		Message:  msg,
 		SpecRef:  specRef,
-		Subject:  "catalog",
+		Subject:  SubjectCatalog,
 	}
 }
 
@@ -502,18 +525,9 @@ func checkURNFormat(urnErr error, subject string) Check {
 // subdomain of the same registrable domain, does not warn.
 func checkPublisherMatches(u URN, servingDomain, subject string) Check {
 	passed := registrableDomainEqual(u.Publisher, servingDomain)
-	msg := fmt.Sprintf("URN publisher %q matches serving domain %q", u.Publisher, servingDomain)
-	if !passed {
-		msg = fmt.Sprintf("URN publisher %q does not match serving domain %q (may be legitimate for aggregators)", u.Publisher, servingDomain)
-	}
-	return Check{
-		CheckID:  "urn.publisher_matches",
-		Severity: SeverityWarning,
-		Passed:   passed,
-		Message:  msg,
-		SpecRef:  specRef,
-		Subject:  subject,
-	}
+	return newCheck("urn.publisher_matches", SeverityWarning, subject, passed,
+		fmt.Sprintf("URN publisher %q matches serving domain %q", u.Publisher, servingDomain),
+		fmt.Sprintf("URN publisher %q does not match serving domain %q (may be legitimate for aggregators)", u.Publisher, servingDomain))
 }
 
 // registrableDomainEqual reports whether a and b share the same registrable
@@ -547,14 +561,14 @@ func asciiDomain(s string) string {
 	return s
 }
 
-// checkQueriesCount: queries.count (warning) — 2-5 representativeQueries
-// recommended.
 // isPointerMediaType reports whether an entry type is a container or endpoint
 // pointer (a nested catalog or a registry) rather than a callable capability.
 func isPointerMediaType(mediaType string) bool {
-	return mediaType == "application/ai-catalog+json" || mediaType == "application/ai-registry+json"
+	return mediaType == mediaTypeAICatalog || mediaType == mediaTypeAIRegistry
 }
 
+// checkQueriesCount: queries.count (warning) — 2-5 representativeQueries
+// recommended.
 func checkQueriesCount(e Entry, subject string) Check {
 	n := len(e.RepresentativeQueries)
 	passed := n >= 2 && n <= 5
@@ -571,18 +585,9 @@ func checkQueriesCount(e Entry, subject string) Check {
 // checkMediaType: entry.media_type (warning) — unrecognized ARD media type.
 func checkMediaType(e Entry, subject string) Check {
 	passed := knownEntryMediaTypes[e.Type]
-	msg := fmt.Sprintf("type %q is a recognized ARD media type", e.Type)
-	if !passed {
-		msg = fmt.Sprintf("type %q is not a recognized ARD media type (spec does not enforce this strictly)", e.Type)
-	}
-	return Check{
-		CheckID:  "entry.media_type",
-		Severity: SeverityWarning,
-		Passed:   passed,
-		Message:  msg,
-		SpecRef:  specRef,
-		Subject:  subject,
-	}
+	return newCheck("entry.media_type", SeverityWarning, subject, passed,
+		fmt.Sprintf("type %q is a recognized ARD media type", e.Type),
+		fmt.Sprintf("type %q is not a recognized ARD media type (spec does not enforce this strictly)", e.Type))
 }
 
 // rollUp derives the overall verdict: any failed error-severity check wins

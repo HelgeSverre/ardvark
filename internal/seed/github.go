@@ -2,14 +2,14 @@ package seed
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
-	"time"
+
+	"github.com/helgesverre/ardvark/internal/store"
 )
 
 // githubDefaultSearchEndpoint is GitHub's code-search REST API.
@@ -63,7 +63,7 @@ func NewGitHubSeeder(query string) *GitHubSeeder {
 }
 
 // Source implements Seeder.
-func (g *GitHubSeeder) Source() string { return "github" }
+func (g *GitHubSeeder) Source() string { return store.DiscoverySourceGitHub }
 
 func (g *GitHubSeeder) query() string {
 	if g.Query != "" {
@@ -87,10 +87,7 @@ func (g *GitHubSeeder) token() string {
 }
 
 func (g *GitHubSeeder) httpClient() *http.Client {
-	if g.HTTPClient != nil {
-		return g.HTTPClient
-	}
-	return &http.Client{Timeout: 30 * time.Second}
+	return newHTTPClient(g.HTTPClient, defaultHTTPTimeout)
 }
 
 type githubSearchResponse struct {
@@ -118,27 +115,25 @@ func (g *GitHubSeeder) Domains(ctx context.Context, n int) ([]string, error) {
 		return nil, fmt.Errorf("seed: github: GITHUB_TOKEN is not set (GitHub's code search API requires authentication; set it to a personal access token)")
 	}
 
-	var names []string
+	collector := newDomainCollector(n)
 	for page := 1; page <= githubMaxPages; page++ {
 		items, err := g.searchPage(ctx, token, page)
 		if err != nil {
 			return nil, err
 		}
+		var names []string
 		for _, item := range items {
 			if d := domainFromRepository(item.Repository); d != "" {
 				names = append(names, d)
 			}
 		}
-		if len(Sanitize(names)) >= n || len(items) < githubPerPage {
+		collector.add(names)
+		if collector.full() || len(items) < githubPerPage {
 			break
 		}
 	}
 
-	sanitized := Sanitize(names)
-	if len(sanitized) > n {
-		sanitized = sanitized[:n]
-	}
-	return sanitized, nil
+	return collector.domains(), nil
 }
 
 // searchPage fetches one page of code-search results.
@@ -149,8 +144,8 @@ func (g *GitHubSeeder) searchPage(ctx context.Context, token string, page int) (
 	}
 	q := endpoint.Query()
 	q.Set("q", g.query())
-	q.Set("per_page", fmt.Sprintf("%d", githubPerPage))
-	q.Set("page", fmt.Sprintf("%d", page))
+	q.Set("per_page", strconv.Itoa(githubPerPage))
+	q.Set("page", strconv.Itoa(page))
 	endpoint.RawQuery = q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
@@ -161,23 +156,9 @@ func (g *GitHubSeeder) searchPage(ctx context.Context, token string, page int) (
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 
-	resp, err := g.httpClient().Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("seed: github: request to %s: %w", endpoint.String(), err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
-	if err != nil {
-		return nil, fmt.Errorf("seed: github: reading response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("seed: github: %s returned status %d: %s", endpoint.String(), resp.StatusCode, string(body))
-	}
-
 	var parsed githubSearchResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return nil, fmt.Errorf("seed: github: decoding response: %w", err)
+	if err := fetchJSON(g.httpClient(), req, 16<<20, includeStatusErrBody, &parsed); err != nil {
+		return nil, fmt.Errorf("seed: github: %w", err)
 	}
 	return parsed.Items, nil
 }

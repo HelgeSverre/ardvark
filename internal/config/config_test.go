@@ -100,6 +100,24 @@ func TestLoadBytes_InvalidCases(t *testing.T) {
 	}
 }
 
+func TestLoadBytes_ZeroFractionFloatsDecodeIntoIntFields(t *testing.T) {
+	// JSON Schema "integer" accepts zero-fraction floats, so files written
+	// as 2.0 or 1e3 pass validation and must load.
+	cfg, err := LoadBytes([]byte(`{
+		"crawler": {"maxDepth": 2.0},
+		"seed": {"ct": {"entryCount": 1e3}}
+	}`))
+	if err != nil {
+		t.Fatalf("LoadBytes() unexpected error: %v", err)
+	}
+	if cfg.Crawler.MaxDepth != 2 {
+		t.Errorf("Crawler.MaxDepth = %d, want 2", cfg.Crawler.MaxDepth)
+	}
+	if cfg.Seed.CT.EntryCount != 1000 {
+		t.Errorf("Seed.CT.EntryCount = %d, want 1000", cfg.Seed.CT.EntryCount)
+	}
+}
+
 func TestLoadBytes_SeedSourceConfigParses(t *testing.T) {
 	cfg, err := LoadBytes([]byte(`{
 		"seed": {

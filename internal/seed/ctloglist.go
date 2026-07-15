@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -68,31 +67,15 @@ func ResolveCTLogs(ctx context.Context, httpClient *http.Client, logListURL stri
 	if logListURL == "" {
 		logListURL = DefaultCTLogListURL
 	}
-	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 30 * time.Second}
-	}
+	httpClient = newHTTPClient(httpClient, defaultHTTPTimeout)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, logListURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("seed: ct: fetching log list %s: %w", logListURL, err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if err != nil {
-		return nil, fmt.Errorf("seed: ct: reading log list: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("seed: ct: log list %s returned status %d", logListURL, resp.StatusCode)
-	}
-
 	var list ctLogList
-	if err := json.Unmarshal(body, &list); err != nil {
-		return nil, fmt.Errorf("seed: ct: decoding log list: %w", err)
+	if err := fetchJSON(httpClient, req, 8<<20, omitStatusErrBody, &list); err != nil {
+		return nil, fmt.Errorf("seed: ct: fetching log list %s: %w", logListURL, err)
 	}
 
 	all := wantAllOperators(operators)

@@ -107,7 +107,7 @@ func printReport(p *ui.Printer, label string, report ard.Report) {
 	p.Header(label)
 	for _, c := range report.Checks {
 		detail := c.Message
-		if c.Subject != "" && c.Subject != "catalog" {
+		if c.Subject != "" && c.Subject != ard.SubjectCatalog {
 			detail = c.Subject + " — " + c.Message
 		}
 		p.Check(c.Passed, c.Severity == ard.SeverityWarning, c.CheckID, detail)
@@ -119,11 +119,7 @@ func printReport(p *ui.Printer, label string, report ard.Report) {
 // stored in the database, updating each catalog's verification_status and
 // replacing its verification_checks rows with the fresh results.
 func runVerifyStored(cmd *cobra.Command) error {
-	cfg, err := loadConfig()
-	if err != nil {
-		return err
-	}
-	st, err := openStore(cfg)
+	_, st, err := openApp()
 	if err != nil {
 		return err
 	}
@@ -138,9 +134,9 @@ func runVerifyStored(cmd *cobra.Command) error {
 
 	var invalidCount int
 	for _, cat := range catalogs {
-		var domain store.Domain
-		if err := st.DB.First(&domain, cat.DomainID).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
+		domain, err := st.DomainByID(cat.DomainID)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
 				continue
 			}
 			return fmt.Errorf("verify --stored: loading domain %d: %w", cat.DomainID, err)
@@ -157,7 +153,7 @@ func runVerifyStored(cmd *cobra.Command) error {
 		}
 	}
 
-	p.Summary("verify --stored complete: ",
+	p.Summary("verify --stored complete",
 		fmt.Sprintf("%d catalogs re-verified", len(catalogs)),
 		fmt.Sprintf("%d invalid", invalidCount),
 	)
@@ -208,7 +204,7 @@ func reverifyCatalog(st *store.Store, cat store.Catalog, report ard.Report) erro
 				SpecRef:     c.SpecRef,
 				CheckedAt:   now,
 			}
-			if c.Subject != "" && c.Subject != "catalog" {
+			if c.Subject != "" && c.Subject != ard.SubjectCatalog {
 				if entryID, ok := entryIDByURN[c.Subject]; ok {
 					row.SubjectType = store.SubjectTypeEntry
 					row.SubjectID = entryID

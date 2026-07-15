@@ -2,15 +2,15 @@ package seed
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	ct "github.com/google/certificate-transparency-go"
+	"github.com/helgesverre/ardvark/internal/store"
 )
 
 // ctDefaultEntriesPerPage is the chunk size requested per get-entries call.
@@ -56,7 +56,7 @@ func NewCTSeederFromLogList(ctx context.Context, httpClient *http.Client, logLis
 }
 
 // Source implements Seeder.
-func (c *CTSeeder) Source() string { return "ct_log" }
+func (c *CTSeeder) Source() string { return store.DiscoverySourceCTLog }
 
 type ctGetSTHResponse struct {
 	TreeSize int64 `json:"tree_size"`
@@ -67,10 +67,7 @@ type ctGetEntriesResponse struct {
 }
 
 func (c *CTSeeder) httpClient() *http.Client {
-	if c.HTTPClient != nil {
-		return c.HTTPClient
-	}
-	return &http.Client{Timeout: 30 * time.Second}
+	return newHTTPClient(c.HTTPClient, defaultHTTPTimeout)
 }
 
 func (c *CTSeeder) entriesPerPage() int {
@@ -100,21 +97,8 @@ func (c *CTSeeder) getJSON(ctx context.Context, endpoint string, out any) error 
 	if err != nil {
 		return err
 	}
-	resp, err := c.httpClient().Do(req)
-	if err != nil {
-		return fmt.Errorf("seed: ct: request to %s: %w", endpoint, err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
-	if err != nil {
-		return fmt.Errorf("seed: ct: reading response from %s: %w", endpoint, err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("seed: ct: %s returned status %d: %s", endpoint, resp.StatusCode, string(body))
-	}
-	if err := json.Unmarshal(body, out); err != nil {
-		return fmt.Errorf("seed: ct: decoding response from %s: %w", endpoint, err)
+	if err := fetchJSON(c.httpClient(), req, 32<<20, includeStatusErrBody, out); err != nil {
+		return fmt.Errorf("seed: ct: %w", err)
 	}
 	return nil
 }
@@ -141,8 +125,8 @@ func (c *CTSeeder) getSTH(ctx context.Context, logURL string) (int64, error) {
 // returned entry count.
 func (c *CTSeeder) getEntries(ctx context.Context, logURL string, start, end int64) ([]ct.LeafEntry, error) {
 	endpoint, err := c.endpoint(logURL, "ct/v1/get-entries", url.Values{
-		"start": {fmt.Sprintf("%d", start)},
-		"end":   {fmt.Sprintf("%d", end)},
+		"start": {strconv.FormatInt(start, 10)},
+		"end":   {strconv.FormatInt(end, 10)},
 	})
 	if err != nil {
 		return nil, err
@@ -179,7 +163,11 @@ func (c *CTSeeder) Domains(ctx context.Context, n int) ([]string, error) {
 		names = append(names, logNames...)
 	}
 
-	return Sanitize(names), nil
+	sanitized := Sanitize(names)
+	if len(sanitized) > n {
+		sanitized = sanitized[:n]
+	}
+	return sanitized, nil
 }
 
 // domainsFromLog harvests up to n raw (unsanitized) SAN/CN names from the

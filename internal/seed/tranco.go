@@ -9,7 +9,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
+
+	"github.com/helgesverre/ardvark/internal/store"
 )
 
 // trancoDefaultListURL is the default Tranco top-domains list, a zipped CSV
@@ -38,7 +39,7 @@ func NewTrancoSeeder(listURL string) *TrancoSeeder {
 }
 
 // Source implements Seeder.
-func (t *TrancoSeeder) Source() string { return "tranco" }
+func (t *TrancoSeeder) Source() string { return store.DiscoverySourceTranco }
 
 func (t *TrancoSeeder) listURL() string {
 	if t.ListURL != "" {
@@ -48,10 +49,7 @@ func (t *TrancoSeeder) listURL() string {
 }
 
 func (t *TrancoSeeder) httpClient() *http.Client {
-	if t.HTTPClient != nil {
-		return t.HTTPClient
-	}
-	return &http.Client{Timeout: 60 * time.Second}
+	return newHTTPClient(t.HTTPClient, trancoHTTPTimeout)
 }
 
 // Domains implements Seeder: it downloads the Tranco list (a zip archive

@@ -32,9 +32,6 @@ type ProbeEvent struct {
 	// "14 entries" for a valid catalog, the failing check IDs (e.g.
 	// "urn.format ×3") for a warned/invalid one, or "404" for a miss.
 	Detail string
-	// EntryCount is the number of entries in a verified catalog; zero
-	// otherwise.
-	EntryCount int
 }
 
 // emit invokes the OnProbe callback, if configured. Callbacks fire from
@@ -75,12 +72,11 @@ func catalogEvent(host, method string, report ard.Report, entryCount int) ProbeE
 		detail = failingChecksSummary(report.Checks, ard.SeverityError)
 	}
 	return ProbeEvent{
-		Host:       host,
-		Method:     method,
-		Outcome:    probe.OutcomeHit,
-		Verdict:    report.Verdict,
-		Detail:     detail,
-		EntryCount: entryCount,
+		Host:    host,
+		Method:  method,
+		Outcome: probe.OutcomeHit,
+		Verdict: report.Verdict,
+		Detail:  detail,
 	}
 }
 

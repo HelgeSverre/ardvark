@@ -19,6 +19,11 @@ import (
 
 var defaultPrinter = message.NewPrinter(language.English)
 
+// DefaultMaxBodyBytes is the default crawler.maxBodyBytes cap (5 MiB). It is
+// exported so the fetch layer's zero-value fallback can't drift from the
+// documented config default.
+const DefaultMaxBodyBytes int64 = 5 << 20
+
 // Config is the root ardvark.json shape.
 type Config struct {
 	Storage  StorageConfig  `json:"storage"`
@@ -142,7 +147,7 @@ func Defaults() Config {
 			MaxPagesPerDomain:        50,
 			PerHostRequestsPerSecond: 1,
 			RequestTimeoutSeconds:    15,
-			MaxBodyBytes:             5242880,
+			MaxBodyBytes:             DefaultMaxBodyBytes,
 			UserAgent:                "ardvark/0.1 (+https://github.com/helgesverre/ardvark)",
 			RespectRobotsTxt:         true,
 			RefreshAfterHours:        168,
@@ -191,8 +196,8 @@ func Defaults() Config {
 // error.
 //
 // Values present in the file override defaults; missing keys keep their
-// default values (defaults are applied by merging the raw file over a
-// defaults document before validation and decoding).
+// default values (the raw file is decoded over a Defaults() value, so
+// json.Unmarshal fills in only the fields the file specifies).
 func Load(path string) (Config, error) {
 	defaults := Defaults()
 
@@ -207,67 +212,36 @@ func Load(path string) (Config, error) {
 	return LoadBytes(raw)
 }
 
-// LoadBytes parses and validates raw JSON config bytes, merging over
+// LoadBytes parses and validates raw JSON config bytes, decoding over
 // defaults. Exposed separately from Load for testing without touching disk.
+// The schema has no required fields, so validating the raw file directly is
+// equivalent to validating it merged over defaults; json.Unmarshal into a
+// Defaults() value then overwrites only the fields the file specifies
+// (nested objects merge field-by-field, arrays and scalars replace).
 func LoadBytes(raw []byte) (Config, error) {
-	defaults := Defaults()
-
-	// Merge raw file content over a JSON representation of the defaults so
-	// any keys omitted in the file keep their default value.
-	defaultsJSON, err := json.Marshal(defaults)
-	if err != nil {
-		return Config{}, fmt.Errorf("config: marshalling defaults: %w", err)
-	}
-
-	var defaultsMap map[string]any
-	if err := json.Unmarshal(defaultsJSON, &defaultsMap); err != nil {
-		return Config{}, fmt.Errorf("config: unmarshalling defaults: %w", err)
-	}
-
-	var fileMap map[string]any
-	if err := json.Unmarshal(raw, &fileMap); err != nil {
-		return Config{}, fmt.Errorf("config: invalid JSON: %w", err)
-	}
-
-	merged := mergeMaps(defaultsMap, fileMap)
-
-	mergedJSON, err := json.Marshal(merged)
-	if err != nil {
-		return Config{}, fmt.Errorf("config: marshalling merged config: %w", err)
-	}
-
-	if err := Validate(mergedJSON); err != nil {
+	if err := Validate(raw); err != nil {
 		return Config{}, err
 	}
 
-	var cfg Config
-	if err := json.Unmarshal(mergedJSON, &cfg); err != nil {
-		return Config{}, fmt.Errorf("config: decoding merged config: %w", err)
+	// The schema's "integer" accepts zero-fraction floats (2.0, 1e3), which
+	// json.Unmarshal rejects for int fields. Round-tripping through any
+	// (float64) re-renders them in integer form, so files that pass
+	// validation also decode.
+	var doc any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return Config{}, fmt.Errorf("config: decoding config: %w", err)
+	}
+	normalized, err := json.Marshal(doc)
+	if err != nil {
+		return Config{}, fmt.Errorf("config: decoding config: %w", err)
+	}
+
+	cfg := Defaults()
+	if err := json.Unmarshal(normalized, &cfg); err != nil {
+		return Config{}, fmt.Errorf("config: decoding config: %w", err)
 	}
 
 	return cfg, nil
-}
-
-// mergeMaps recursively overlays override onto base, returning a new map.
-// Only JSON object values are merged recursively; arrays and scalars in
-// override fully replace the base value.
-func mergeMaps(base, override map[string]any) map[string]any {
-	result := make(map[string]any, len(base))
-	for k, v := range base {
-		result[k] = v
-	}
-	for k, v := range override {
-		if baseVal, ok := result[k]; ok {
-			baseMap, baseIsMap := baseVal.(map[string]any)
-			overrideMap, overrideIsMap := v.(map[string]any)
-			if baseIsMap && overrideIsMap {
-				result[k] = mergeMaps(baseMap, overrideMap)
-				continue
-			}
-		}
-		result[k] = v
-	}
-	return result
 }
 
 // Validate checks raw JSON config bytes against the embedded config schema,

@@ -12,9 +12,139 @@ package seed
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"strings"
+	"time"
+
+	"github.com/helgesverre/ardvark/internal/httpx"
 )
+
+// defaultHTTPTimeout is the client timeout used by every seeder that fetches
+// small/paginated JSON responses (CT log list, crt.sh, GitHub, MCP
+// registry).
+const defaultHTTPTimeout = 30 * time.Second
+
+// trancoHTTPTimeout is longer than defaultHTTPTimeout because the Tranco
+// list is a tens-of-megabytes single download, not a paginated API call.
+const trancoHTTPTimeout = 60 * time.Second
+
+// newHTTPClient returns client if non-nil, else a client with the given
+// timeout — the "default HTTP client" pattern every seeder's httpClient()
+// method follows.
+func newHTTPClient(client *http.Client, timeout time.Duration) *http.Client {
+	if client != nil {
+		return client
+	}
+	return &http.Client{Timeout: timeout}
+}
+
+// statusErrBody selects whether fetchJSON embeds the response body in a
+// non-200 error. API sources whose error bodies are small JSON diagnostics
+// (CT logs, GitHub, MCP registry) embed them because they carry the
+// actionable message; sources whose error pages are whole HTML documents
+// (crt.sh when rate-limited, the CT log-list CDN) stay body-free so a 503
+// doesn't spill megabytes of markup into CLI error/log output.
+type statusErrBody bool
+
+const (
+	includeStatusErrBody statusErrBody = true
+	omitStatusErrBody    statusErrBody = false
+)
+
+// fetchJSON runs req, reads up to limitBytes of the response body, and
+// decodes it as JSON into out. Callers build the request (method, URL,
+// headers); this handles the repeated Do -> read -> status check -> decode
+// tail shared by every seed source, including the guard against servers
+// that serve an HTML error/rate-limit page where JSON was expected. Errors
+// are unprefixed; wrap with the caller's own "seed: <source>: " prefix.
+func fetchJSON(client *http.Client, req *http.Request, limitBytes int64, errBody statusErrBody, out any) error {
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("request to %s: %w", req.URL, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limitBytes))
+	if err != nil {
+		return fmt.Errorf("reading response from %s: %w", req.URL, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		if errBody == includeStatusErrBody {
+			return fmt.Errorf("%s returned status %d: %s", req.URL, resp.StatusCode, string(body))
+		}
+		return fmt.Errorf("%s returned status %d", req.URL, resp.StatusCode)
+	}
+	contentType := resp.Header.Get("Content-Type")
+	if !httpx.LooksLikeJSON(contentType, body) {
+		return fmt.Errorf("%s returned %s, not JSON", req.URL, ctOrUnknown(contentType))
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return fmt.Errorf("decoding response from %s: %w", req.URL, err)
+	}
+	return nil
+}
+
+// ctOrUnknown renders a Content-Type header for an error message, stripping
+// parameters (e.g. "; charset=utf-8") and substituting a placeholder when
+// the header is absent.
+func ctOrUnknown(contentType string) string {
+	if contentType == "" {
+		return "an unknown content type"
+	}
+	if i := strings.IndexByte(contentType, ';'); i >= 0 {
+		contentType = contentType[:i]
+	}
+	return contentType
+}
+
+// domainCollector incrementally sanitizes and dedupes raw hostname-like
+// values (see Sanitize) up to a target count, without re-sanitizing
+// already-accepted names on every call — the loops in CrtshSeeder,
+// GitHubSeeder, and MCPRegistrySeeder page through a source until they have
+// n domains, and re-running Sanitize over the whole accumulated slice each
+// page is O(n^2) in the number of pages.
+type domainCollector struct {
+	seen  map[string]struct{}
+	names []string
+	limit int
+}
+
+func newDomainCollector(limit int) *domainCollector {
+	return &domainCollector{seen: make(map[string]struct{}), limit: limit}
+}
+
+// add sanitizes and dedupes each of raw, appending previously-unseen names
+// until limit is reached. It's a no-op once full.
+func (c *domainCollector) add(raw []string) {
+	for _, r := range raw {
+		if c.full() {
+			return
+		}
+		name, ok := sanitizeName(r)
+		if !ok {
+			continue
+		}
+		if _, dup := c.seen[name]; dup {
+			continue
+		}
+		c.seen[name] = struct{}{}
+		c.names = append(c.names, name)
+	}
+}
+
+// full reports whether limit names have been collected.
+func (c *domainCollector) full() bool {
+	return len(c.names) >= c.limit
+}
+
+// domains returns the collected names (never more than limit).
+func (c *domainCollector) domains() []string {
+	return c.names
+}
 
 // Seeder is implemented by every pluggable seed source (CT logs, crt.sh,
 // Tranco, …).
@@ -40,21 +170,8 @@ func Sanitize(names []string) []string {
 	out := make([]string, 0, len(names))
 
 	for _, raw := range names {
-		name := strings.TrimSpace(raw)
-		if name == "" {
-			continue
-		}
-		name = strings.TrimPrefix(name, "*.")
-		name = strings.ToLower(name)
-		name = strings.TrimSuffix(name, ".")
-
-		if !strings.Contains(name, ".") {
-			continue
-		}
-		if net.ParseIP(name) != nil {
-			continue
-		}
-		if !isValidHostname(name) {
+		name, ok := sanitizeName(raw)
+		if !ok {
 			continue
 		}
 		if _, dup := seen[name]; dup {
@@ -65,6 +182,29 @@ func Sanitize(names []string) []string {
 	}
 
 	return out
+}
+
+// sanitizeName applies Sanitize's per-name normalization/validation rules to
+// a single raw value, reporting ok=false if it should be dropped.
+func sanitizeName(raw string) (string, bool) {
+	name := strings.TrimSpace(raw)
+	if name == "" {
+		return "", false
+	}
+	name = strings.TrimPrefix(name, "*.")
+	name = strings.ToLower(name)
+	name = strings.TrimSuffix(name, ".")
+
+	if !strings.Contains(name, ".") {
+		return "", false
+	}
+	if net.ParseIP(name) != nil {
+		return "", false
+	}
+	if !isValidHostname(name) {
+		return "", false
+	}
+	return name, true
 }
 
 // isValidHostname reports whether s consists only of characters legal in a

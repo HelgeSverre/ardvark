@@ -8,16 +8,29 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/helgesverre/ardvark/internal/ard"
 )
 
 // DefaultSearchPath is appended to a registry's base URL to form the
-// /search endpoint, unless the base URL already includes a path.
+// /search endpoint, unless the base URL's path already ends with
+// DefaultSearchPath (a trailing slash on the base URL is ignored either
+// way), in which case the base URL is used as-is.
 const DefaultSearchPath = "/search"
+
+// federationNone is the SearchRequest.Federation value meaning "do not
+// federate this query to other registries".
+const federationNone = "none"
+
+// maxResponseBytes bounds how much of a /search response body is read,
+// guarding against a misbehaving or malicious registry streaming an
+// unbounded response.
+const maxResponseBytes = 10 << 20
 
 // Client queries an ARD registry's POST /search endpoint.
 type Client struct {
@@ -88,9 +101,7 @@ func (e *StatusError) Error() string {
 // requested feature, e.g. federation.
 func IsNotImplemented(err error) bool {
 	var serr *StatusError
-	if se, ok := err.(*StatusError); ok {
-		serr = se
-	} else {
+	if !errors.As(err, &serr) {
 		return false
 	}
 	return serr.StatusCode == http.StatusNotImplemented
@@ -99,7 +110,7 @@ func IsNotImplemented(err error) bool {
 // Search issues a single POST /search request and decodes the response.
 func (c *Client) Search(ctx context.Context, req SearchRequest) (*SearchResponse, error) {
 	if req.Federation == "" {
-		req.Federation = "none"
+		req.Federation = federationNone
 	}
 
 	body, err := json.Marshal(req)
@@ -120,7 +131,7 @@ func (c *Client) Search(ctx context.Context, req SearchRequest) (*SearchResponse
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		return nil, fmt.Errorf("registry: search: reading response: %w", err)
 	}
@@ -141,11 +152,12 @@ func (c *Client) Search(ctx context.Context, req SearchRequest) (*SearchResponse
 }
 
 // searchURL returns the resolved /search endpoint URL for the registry's
-// base URL.
+// base URL: a trailing slash is trimmed, and DefaultSearchPath is appended
+// unless the base URL's path already ends with it.
 func (c *Client) searchURL() string {
-	base := c.baseURL
-	if len(base) > 0 && base[len(base)-1] == '/' {
-		base = base[:len(base)-1]
+	base := strings.TrimSuffix(c.baseURL, "/")
+	if strings.HasSuffix(base, DefaultSearchPath) {
+		return base
 	}
 	return base + DefaultSearchPath
 }
@@ -184,10 +196,9 @@ func (c *Client) HarvestAll(ctx context.Context, opts HarvestOptions) (*HarvestR
 		}
 
 		req := SearchRequest{
-			Query:      Query{Text: opts.QueryText},
-			Federation: "none",
-			PageSize:   opts.PageSize,
-			PageToken:  pageToken,
+			Query:     Query{Text: opts.QueryText},
+			PageSize:  opts.PageSize,
+			PageToken: pageToken,
 		}
 
 		resp, err := c.Search(ctx, req)

@@ -1,6 +1,50 @@
 package seed
 
-import "testing"
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+func TestFetchJSON_StatusErrorBodyModes(t *testing.T) {
+	const errorPage = "<html><body>rate limited, try later</body></html>"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(errorPage))
+	}))
+	defer srv.Close()
+
+	tests := []struct {
+		name     string
+		errBody  statusErrBody
+		wantBody bool
+	}{
+		{name: "omit keeps status error body-free", errBody: omitStatusErrBody, wantBody: false},
+		{name: "include embeds body", errBody: includeStatusErrBody, wantBody: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var out any
+			err = fetchJSON(srv.Client(), req, 1<<20, tt.errBody, &out)
+			if err == nil {
+				t.Fatal("expected error for non-200 response")
+			}
+			if !strings.Contains(err.Error(), "returned status 503") {
+				t.Fatalf("error = %q, want status 503 mentioned", err)
+			}
+			if got := strings.Contains(err.Error(), errorPage); got != tt.wantBody {
+				t.Fatalf("error = %q, body embedded = %v, want %v", err, got, tt.wantBody)
+			}
+		})
+	}
+}
 
 func TestSanitize(t *testing.T) {
 	tests := []struct {

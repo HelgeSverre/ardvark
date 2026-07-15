@@ -111,6 +111,26 @@ func TestProbeRowStatus(t *testing.T) {
 	}
 }
 
+func TestColorOptions(t *testing.T) {
+	var buf bytes.Buffer
+	// --color=always forces escape codes even for a non-TTY writer.
+	ui.New(&buf, colorOptions("always")...).Errorf("boom")
+	if !strings.Contains(buf.String(), "\x1b[") {
+		t.Errorf("--color=always: want escape codes, got %q", buf.String())
+	}
+
+	buf.Reset()
+	ui.New(&buf, colorOptions("never")...).Errorf("boom")
+	if strings.Contains(buf.String(), "\x1b[") {
+		t.Errorf("--color=never: want plain output, got %q", buf.String())
+	}
+
+	// auto passes no options, leaving TTY/NO_COLOR/TERM detection in charge.
+	if opts := colorOptions("auto"); opts != nil {
+		t.Errorf("--color=auto: want nil options, got %d", len(opts))
+	}
+}
+
 func TestWriteJSONLAndCSV(t *testing.T) {
 	rows := []exportRow{
 		{Host: "example.com", URN: "urn:air:example.com:skills:x", DisplayName: "X", MediaType: "application/ai-skill+json"},

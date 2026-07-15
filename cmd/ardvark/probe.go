@@ -25,12 +25,7 @@ func init() {
 }
 
 func runProbe(cmd *cobra.Command, args []string) error {
-	cfg, err := loadConfig()
-	if err != nil {
-		return err
-	}
-
-	st, err := openStore(cfg)
+	cfg, st, err := openApp()
 	if err != nil {
 		return err
 	}
@@ -77,7 +72,7 @@ func runProbe(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	p.Summary("probe complete: ",
+	p.Summary("probe complete",
 		fmt.Sprintf("%d hits", hits),
 		fmt.Sprintf("%d misses", misses),
 		fmt.Sprintf("%d errors", errs),

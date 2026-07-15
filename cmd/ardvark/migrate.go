@@ -16,12 +16,7 @@ func init() {
 }
 
 func runMigrate(cmd *cobra.Command, args []string) error {
-	cfg, err := loadConfig()
-	if err != nil {
-		return err
-	}
-
-	st, err := openStore(cfg)
+	cfg, st, err := openApp()
 	if err != nil {
 		return err
 	}

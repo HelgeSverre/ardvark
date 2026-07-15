@@ -2,13 +2,12 @@ package seed
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
+
+	"github.com/helgesverre/ardvark/internal/store"
 )
 
 // crtshDefaultEndpoint is crt.sh's public JSON search endpoint.
@@ -39,9 +38,11 @@ type CrtshSeeder struct {
 
 	// Match narrows results to certificates whose identity mentions this
 	// keyword (e.g. "agent", "mcp"), via crt.sh's "%keyword%" identity
-	// search. Empty matches everything crt.sh returns for a bare wildcard
-	// query; prefer Matches (or leave both empty to fall back to
-	// DefaultCrtshMatches) over relying on the bare-wildcard behavior.
+	// search. Empty sends a bare "q=%" wildcard, which crt.sh cannot
+	// reliably serve (it either rejects it or times out scanning the whole
+	// corpus) — leave Match empty only for direct programmatic/test use
+	// against a stub server; production callers should set Matches (the CLI
+	// falls back to DefaultCrtshMatches when the user supplies no keyword).
 	Match string
 
 	// Matches, if non-empty, overrides Match: each keyword is queried in
@@ -55,14 +56,8 @@ type CrtshSeeder struct {
 	HTTPClient *http.Client
 }
 
-// NewCrtshSeeder returns a CrtshSeeder that narrows results to certificates
-// whose identity mentions match (may be empty).
-func NewCrtshSeeder(match string) *CrtshSeeder {
-	return &CrtshSeeder{Match: match}
-}
-
 // Source implements Seeder.
-func (c *CrtshSeeder) Source() string { return "crtsh" }
+func (c *CrtshSeeder) Source() string { return store.DiscoverySourceCrtsh }
 
 func (c *CrtshSeeder) endpoint() string {
 	if c.Endpoint != "" {
@@ -72,10 +67,7 @@ func (c *CrtshSeeder) endpoint() string {
 }
 
 func (c *CrtshSeeder) httpClient() *http.Client {
-	if c.HTTPClient != nil {
-		return c.HTTPClient
-	}
-	return &http.Client{Timeout: 30 * time.Second}
+	return newHTTPClient(c.HTTPClient, defaultHTTPTimeout)
 }
 
 // crtshRecord is one row of crt.sh's JSON search response. Only the fields
@@ -96,24 +88,19 @@ func (c *CrtshSeeder) Domains(ctx context.Context, n int) ([]string, error) {
 		return nil, fmt.Errorf("seed: crtsh: n must be positive, got %d", n)
 	}
 
-	var names []string
+	collector := newDomainCollector(n)
 	for _, match := range c.matches() {
 		raw, err := c.queryOne(ctx, match)
 		if err != nil {
 			return nil, err
 		}
-		names = append(names, raw...)
-
-		if len(Sanitize(names)) >= n {
+		collector.add(raw)
+		if collector.full() {
 			break
 		}
 	}
 
-	sanitized := Sanitize(names)
-	if len(sanitized) > n {
-		sanitized = sanitized[:n]
-	}
-	return sanitized, nil
+	return collector.domains(), nil
 }
 
 // matches resolves the effective keyword list for a Domains call:
@@ -149,28 +136,14 @@ func (c *CrtshSeeder) queryOne(ctx context.Context, match string) ([]string, err
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.httpClient().Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("seed: crtsh: request to %s: %w", endpoint.String(), err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-	if err != nil {
-		return nil, fmt.Errorf("seed: crtsh: reading response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("seed: crtsh: %s returned status %d (crt.sh is often rate-limited; retry shortly)", endpoint.String(), resp.StatusCode)
-	}
-	// crt.sh serves an HTML page instead of JSON when overloaded; decoding
-	// that would spill markup into the error, so reject it up front.
-	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "json") && !looksLikeJSON(body) {
-		return nil, fmt.Errorf("seed: crtsh: %s returned %s, not JSON (crt.sh is often rate-limited; retry shortly)", endpoint.String(), ctOrUnknown(ct))
-	}
 
 	var records []crtshRecord
-	if err := json.Unmarshal(body, &records); err != nil {
-		return nil, fmt.Errorf("seed: crtsh: decoding response: %w", err)
+	// crt.sh is often rate-limited or overloaded, in which case it serves
+	// an HTML page (status error or otherwise) instead of JSON; fetchJSON's
+	// content-type/body guard catches that case before it would otherwise
+	// spill markup into the decode error.
+	if err := fetchJSON(c.httpClient(), req, 64<<20, omitStatusErrBody, &records); err != nil {
+		return nil, fmt.Errorf("seed: crtsh: %w (crt.sh is often rate-limited; retry shortly)", err)
 	}
 	// Bound how many rows a single broad keyword can contribute, regardless
 	// of how many crt.sh actually returns.
@@ -190,21 +163,4 @@ func (c *CrtshSeeder) queryOne(ctx context.Context, match string) ([]string, err
 		}
 	}
 	return names, nil
-}
-
-// looksLikeJSON reports whether body begins with a JSON array or object, after
-// leading whitespace — a cheap guard against HTML error pages.
-func looksLikeJSON(body []byte) bool {
-	trimmed := strings.TrimLeft(string(body), " \t\r\n")
-	return strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{")
-}
-
-func ctOrUnknown(contentType string) string {
-	if contentType == "" {
-		return "an unknown content type"
-	}
-	if i := strings.IndexByte(contentType, ';'); i >= 0 {
-		contentType = contentType[:i]
-	}
-	return contentType
 }

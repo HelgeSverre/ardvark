@@ -19,11 +19,7 @@ func init() {
 }
 
 func runStats(cmd *cobra.Command, args []string) error {
-	cfg, err := loadConfig()
-	if err != nil {
-		return err
-	}
-	st, err := openStore(cfg)
+	_, st, err := openApp()
 	if err != nil {
 		return err
 	}

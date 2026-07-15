@@ -17,6 +17,10 @@ import (
 // configPath is bound to the root --config persistent flag.
 var configPath string
 
+// colorMode is bound to the root --color persistent flag: auto (TTY/NO_COLOR
+// detection), always, or never.
+var colorMode string
+
 // rootCmd is the ardvark CLI entry point. Subcommands are added to it in
 // their own files' init() functions.
 var rootCmd = &cobra.Command{
@@ -26,10 +30,18 @@ var rootCmd = &cobra.Command{
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	Version:       version,
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		switch colorMode {
+		case "auto", "always", "never":
+			return nil
+		}
+		return fmt.Errorf("invalid --color value %q (want auto, always, or never)", colorMode)
+	},
 }
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&configPath, "config", "./ardvark.json", "path to ardvark.json config file")
+	rootCmd.PersistentFlags().StringVar(&colorMode, "color", "auto", "colorize output: auto, always, or never")
 }
 
 // Execute runs the root command, printing any error to stderr.
@@ -41,23 +53,20 @@ func Execute() error {
 	return nil
 }
 
-// loadConfig reads and validates ardvark.json from the --config path. A
-// missing file is not an error: config.Load returns pure defaults.
-func loadConfig() (config.Config, error) {
+// openApp loads and validates ardvark.json from the --config path (a missing
+// file is not an error: config.Load returns pure defaults) and opens the
+// configured database, running AutoMigrate. The caller owns the store and
+// must defer st.Close().
+func openApp() (config.Config, *store.Store, error) {
 	cfg, err := config.Load(configPath)
 	if err != nil {
-		return config.Config{}, err
+		return config.Config{}, nil, err
 	}
-	return cfg, nil
-}
-
-// openStore opens the configured database and runs AutoMigrate.
-func openStore(cfg config.Config) (*store.Store, error) {
 	st, err := store.Open(cfg.Storage.Driver, cfg.Storage.DSN)
 	if err != nil {
-		return nil, err
+		return config.Config{}, nil, err
 	}
-	return st, nil
+	return cfg, st, nil
 }
 
 // newLogger builds the crawl-event logger from cfg.Log: JSONL to
@@ -90,10 +99,19 @@ func newFetchClient(cfg config.Config) *fetch.Client {
 // printer returns a ui.Printer writing to cmd's configured stdout, so
 // output composes correctly with cobra's own output redirection in tests.
 func printer(cmd *cobra.Command) *ui.Printer {
-	return ui.New(cmd.OutOrStdout())
+	return ui.New(cmd.OutOrStdout(), colorOptions(colorMode)...)
 }
 
-// errPrinter returns a ui.Printer writing to cmd's configured stderr.
-func errPrinter(cmd *cobra.Command) *ui.Printer {
-	return ui.New(cmd.ErrOrStderr())
+// colorOptions maps the --color flag onto ui.Printer options: "always"
+// forces color on, "never" forces it off, and "auto" defers to the printer's
+// own TTY/NO_COLOR/TERM detection.
+func colorOptions(mode string) []ui.Option {
+	switch mode {
+	case "always":
+		return []ui.Option{ui.ForceColor()}
+	case "never":
+		return []ui.Option{ui.NoColor()}
+	default:
+		return nil
+	}
 }

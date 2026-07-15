@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"golang.org/x/net/html"
+
+	"github.com/helgesverre/ardvark/internal/httpx"
 )
 
 // Result is the outcome of extracting links from an HTML document.
@@ -108,30 +110,7 @@ func isAICatalogRel(rel string) bool {
 // resolveHTTPURL resolves ref against base, stripping any fragment, and
 // returns ok=false if the href is empty, malformed, or not http/https.
 func resolveHTTPURL(base *url.URL, ref string) (*url.URL, bool) {
-	ref = strings.TrimSpace(ref)
-	if ref == "" {
-		return nil, false
-	}
-
-	// Reject hrefs with characters that never appear in valid URLs but
-	// tend to sneak into broken markup (e.g. raw whitespace already
-	// trimmed above); rely on url.Parse to reject the rest.
-	refURL, err := url.Parse(ref)
-	if err != nil {
-		return nil, false
-	}
-
-	resolved := base.ResolveReference(refURL)
-	if resolved.Scheme != "http" && resolved.Scheme != "https" {
-		return nil, false
-	}
-	if resolved.Host == "" {
-		return nil, false
-	}
-
-	resolved.Fragment = ""
-	resolved.RawFragment = ""
-	return resolved, true
+	return httpx.ResolveHTTPURL(base, ref, true)
 }
 
 // findBaseHref returns the href of the first <base> element in doc, if any.

@@ -2,13 +2,13 @@ package seed
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
-	"time"
+
+	"github.com/helgesverre/ardvark/internal/store"
 )
 
 // mcpRegistryDefaultURL is the official MCP registry's public API base URL
@@ -49,7 +49,7 @@ func NewMCPRegistrySeeder(registryURL string) *MCPRegistrySeeder {
 }
 
 // Source implements Seeder.
-func (m *MCPRegistrySeeder) Source() string { return "mcp_registry" }
+func (m *MCPRegistrySeeder) Source() string { return store.DiscoverySourceMCPRegistry }
 
 func (m *MCPRegistrySeeder) registryURL() string {
 	if m.RegistryURL != "" {
@@ -59,10 +59,7 @@ func (m *MCPRegistrySeeder) registryURL() string {
 }
 
 func (m *MCPRegistrySeeder) httpClient() *http.Client {
-	if m.HTTPClient != nil {
-		return m.HTTPClient
-	}
-	return &http.Client{Timeout: 30 * time.Second}
+	return newHTTPClient(m.HTTPClient, defaultHTTPTimeout)
 }
 
 type mcpRegistryListResponse struct {
@@ -91,27 +88,25 @@ func (m *MCPRegistrySeeder) Domains(ctx context.Context, n int) ([]string, error
 		return nil, fmt.Errorf("seed: mcp: n must be positive, got %d", n)
 	}
 
-	var names []string
+	collector := newDomainCollector(n)
 	cursor := ""
 	for page := 0; page < mcpRegistryMaxPages; page++ {
 		resp, err := m.listPage(ctx, cursor)
 		if err != nil {
 			return nil, err
 		}
+		var names []string
 		for _, entry := range resp.Servers {
 			names = append(names, domainsFromMCPServer(entry.Server)...)
 		}
-		if len(Sanitize(names)) >= n || resp.Metadata.NextCursor == "" || len(resp.Servers) == 0 {
+		collector.add(names)
+		if collector.full() || resp.Metadata.NextCursor == "" || len(resp.Servers) == 0 {
 			break
 		}
 		cursor = resp.Metadata.NextCursor
 	}
 
-	sanitized := Sanitize(names)
-	if len(sanitized) > n {
-		sanitized = sanitized[:n]
-	}
-	return sanitized, nil
+	return collector.domains(), nil
 }
 
 // listPage fetches one page of the registry's server listing.
@@ -121,7 +116,7 @@ func (m *MCPRegistrySeeder) listPage(ctx context.Context, cursor string) (*mcpRe
 		return nil, fmt.Errorf("seed: mcp: invalid registry URL: %w", err)
 	}
 	q := endpoint.Query()
-	q.Set("limit", fmt.Sprintf("%d", mcpRegistryPageSize))
+	q.Set("limit", strconv.Itoa(mcpRegistryPageSize))
 	if cursor != "" {
 		q.Set("cursor", cursor)
 	}
@@ -133,23 +128,9 @@ func (m *MCPRegistrySeeder) listPage(ctx context.Context, cursor string) (*mcpRe
 	}
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := m.httpClient().Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("seed: mcp: request to %s: %w", endpoint.String(), err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
-	if err != nil {
-		return nil, fmt.Errorf("seed: mcp: reading response: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("seed: mcp: %s returned status %d: %s", endpoint.String(), resp.StatusCode, string(body))
-	}
-
 	var parsed mcpRegistryListResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return nil, fmt.Errorf("seed: mcp: decoding response: %w", err)
+	if err := fetchJSON(m.httpClient(), req, 32<<20, includeStatusErrBody, &parsed); err != nil {
+		return nil, fmt.Errorf("seed: mcp: %w", err)
 	}
 	return &parsed, nil
 }

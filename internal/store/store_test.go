@@ -4,8 +4,6 @@ import (
 	"errors"
 	"testing"
 	"time"
-
-	"gorm.io/gorm"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -107,8 +105,8 @@ func TestUpsertDomainCreatesThenReturnsExisting(t *testing.T) {
 func TestDomainByHostNotFound(t *testing.T) {
 	s := newTestStore(t)
 	_, err := s.DomainByHost("missing.example.com")
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
-		t.Fatalf("expected ErrRecordNotFound, got %v", err)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }
 
@@ -331,8 +329,63 @@ func TestSaveCatalogEntryCheckIndexOutOfRange(t *testing.T) {
 func TestCatalogByHashNotFound(t *testing.T) {
 	s := newTestStore(t)
 	_, err := s.CatalogByHash("nonexistent")
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
-		t.Fatalf("expected ErrRecordNotFound, got %v", err)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestLatestCatalogBySourceNotFound(t *testing.T) {
+	s := newTestStore(t)
+	_, err := s.LatestCatalogBySource(999, "https://nowhere.example/catalog.json")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestSaveEntries(t *testing.T) {
+	s := newTestStore(t)
+
+	if err := s.SaveEntries(nil); err != nil {
+		t.Fatalf("SaveEntries (empty): %v", err)
+	}
+
+	entries := []CatalogEntry{
+		{CatalogID: 1, URN: "urn:air:reg.example:agents:a", Source: EntrySourceRegistry},
+		{CatalogID: 1, URN: "urn:air:reg.example:agents:b", Source: EntrySourceRegistry},
+	}
+	if err := s.SaveEntries(entries); err != nil {
+		t.Fatalf("SaveEntries: %v", err)
+	}
+
+	var count int64
+	s.DB.Model(&CatalogEntry{}).Where("catalog_id = ?", 1).Count(&count)
+	if count != 2 {
+		t.Fatalf("expected 2 entry rows, got %d", count)
+	}
+}
+
+func TestUpdateRegistryStatus(t *testing.T) {
+	s := newTestStore(t)
+
+	r := &Registry{EntryID: 1, BaseURL: "https://registry.example.com", HarvestStatus: HarvestStatusPending}
+	if err := s.SaveRegistry(r); err != nil {
+		t.Fatalf("SaveRegistry: %v", err)
+	}
+
+	harvestedAt := time.Now()
+	if err := s.UpdateRegistryStatus(r.ID, HarvestStatusOK, harvestedAt); err != nil {
+		t.Fatalf("UpdateRegistryStatus: %v", err)
+	}
+
+	var reloaded Registry
+	if err := s.DB.First(&reloaded, r.ID).Error; err != nil {
+		t.Fatalf("reload registry: %v", err)
+	}
+	if reloaded.HarvestStatus != HarvestStatusOK {
+		t.Fatalf("expected harvest_status ok, got %q", reloaded.HarvestStatus)
+	}
+	if reloaded.LastHarvestedAt == nil {
+		t.Fatal("expected last_harvested_at to be set")
 	}
 }
 

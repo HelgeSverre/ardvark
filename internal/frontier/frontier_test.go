@@ -15,7 +15,7 @@ func newTestFrontier(t *testing.T) *Frontier {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	return NewFromStore(s)
+	return New(s.DB)
 }
 
 func TestEnqueueDedup(t *testing.T) {
@@ -134,8 +134,8 @@ func TestCompleteMarksDone(t *testing.T) {
 
 func TestCompleteNotFound(t *testing.T) {
 	f := newTestFrontier(t)
-	if err := f.Complete(9999); err == nil {
-		t.Fatal("expected error for missing item")
+	if err := f.Complete(9999); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected store.ErrNotFound for missing item, got %v", err)
 	}
 }
 
@@ -152,8 +152,12 @@ func TestFailRetriesThenFails(t *testing.T) {
 
 	// Attempts 1 and 2: re-queued as pending.
 	for i := 1; i <= maxAttempts-1; i++ {
-		if err := f.Fail(item.ID, cause, maxAttempts); err != nil {
+		permanent, err := f.Fail(item.ID, cause, maxAttempts)
+		if err != nil {
 			t.Fatalf("Fail (attempt %d): %v", i, err)
+		}
+		if permanent {
+			t.Fatalf("attempt %d: expected Fail to report a retryable failure, got permanent", i)
 		}
 		var reloaded store.FrontierItem
 		if err := f.db.First(&reloaded, item.ID).Error; err != nil {
@@ -171,8 +175,12 @@ func TestFailRetriesThenFails(t *testing.T) {
 	}
 
 	// Final attempt reaches maxAttempts: permanently failed.
-	if err := f.Fail(item.ID, cause, maxAttempts); err != nil {
+	permanent, err := f.Fail(item.ID, cause, maxAttempts)
+	if err != nil {
 		t.Fatalf("Fail (final): %v", err)
+	}
+	if !permanent {
+		t.Fatal("expected Fail to report the final attempt as permanent")
 	}
 	var final store.FrontierItem
 	if err := f.db.First(&final, item.ID).Error; err != nil {
@@ -188,8 +196,15 @@ func TestFailRetriesThenFails(t *testing.T) {
 
 func TestFailNotFound(t *testing.T) {
 	f := newTestFrontier(t)
-	if err := f.Fail(9999, errors.New("boom"), 3); err == nil {
-		t.Fatal("expected error for missing item")
+	if _, err := f.Fail(9999, errors.New("boom"), 3); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected store.ErrNotFound for missing item, got %v", err)
+	}
+}
+
+func TestRequeueNotFound(t *testing.T) {
+	f := newTestFrontier(t)
+	if err := f.Requeue(9999); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected store.ErrNotFound for missing item, got %v", err)
 	}
 }
 

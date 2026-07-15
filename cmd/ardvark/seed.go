@@ -11,7 +11,18 @@ import (
 	"github.com/helgesverre/ardvark/internal/crawler"
 	"github.com/helgesverre/ardvark/internal/frontier"
 	"github.com/helgesverre/ardvark/internal/seed"
+	"github.com/helgesverre/ardvark/internal/store"
 )
+
+// orDefault returns flag when set (non-zero value), else def — the
+// flag-over-config precedence every seed subcommand applies.
+func orDefault[T comparable](flag, def T) T {
+	var zero T
+	if flag != zero {
+		return flag
+	}
+	return def
+}
 
 var (
 	seedCTCount int
@@ -107,15 +118,13 @@ func init() {
 }
 
 func runSeedCT(cmd *cobra.Command, args []string) error {
-	cfg, err := loadConfig()
+	cfg, st, err := openApp()
 	if err != nil {
 		return err
 	}
+	defer st.Close()
 
-	count := cfg.Seed.CT.EntryCount
-	if seedCTCount > 0 {
-		count = seedCTCount
-	}
+	count := orDefault(seedCTCount, cfg.Seed.CT.EntryCount)
 
 	// --log accepts either an explicit log URL or an operator token; config
 	// seed.ct.logs supplies the default operator filter.
@@ -136,19 +145,17 @@ func runSeedCT(cmd *cobra.Command, args []string) error {
 		label = fmt.Sprintf("%d entries from %s log(s)", count, strings.Join(operators, ","))
 	}
 
-	return runSeeder(cmd, cfg, ctSeeder, count, label)
+	return runSeeder(cmd, cfg, st, ctSeeder, count, label)
 }
 
 func runSeedCrtsh(cmd *cobra.Command, args []string) error {
-	cfg, err := loadConfig()
+	cfg, st, err := openApp()
 	if err != nil {
 		return err
 	}
+	defer st.Close()
 
-	count := cfg.Seed.Crtsh.Count
-	if seedCrtshCount > 0 {
-		count = seedCrtshCount
-	}
+	count := orDefault(seedCrtshCount, cfg.Seed.Crtsh.Count)
 
 	crtshSeeder := &seed.CrtshSeeder{Endpoint: cfg.Seed.Crtsh.Endpoint}
 
@@ -164,63 +171,48 @@ func runSeedCrtsh(cmd *cobra.Command, args []string) error {
 		label = fmt.Sprintf("%s (default keywords=%v)", label, seed.DefaultCrtshMatches)
 	}
 
-	return runSeeder(cmd, cfg, crtshSeeder, count, label)
+	return runSeeder(cmd, cfg, st, crtshSeeder, count, label)
 }
 
 func runSeedTranco(cmd *cobra.Command, args []string) error {
-	cfg, err := loadConfig()
+	cfg, st, err := openApp()
 	if err != nil {
 		return err
 	}
+	defer st.Close()
 
-	top := cfg.Seed.Tranco.Top
-	if seedTrancoTop > 0 {
-		top = seedTrancoTop
-	}
-	listURL := cfg.Seed.Tranco.ListURL
-	if seedTrancoURL != "" {
-		listURL = seedTrancoURL
-	}
+	top := orDefault(seedTrancoTop, cfg.Seed.Tranco.Top)
+	listURL := orDefault(seedTrancoURL, cfg.Seed.Tranco.ListURL)
 
-	return runSeeder(cmd, cfg, seed.NewTrancoSeeder(listURL), top,
+	return runSeeder(cmd, cfg, st, seed.NewTrancoSeeder(listURL), top,
 		fmt.Sprintf("top %d domains from %s", top, listURL))
 }
 
 func runSeedGitHub(cmd *cobra.Command, args []string) error {
-	cfg, err := loadConfig()
+	cfg, st, err := openApp()
 	if err != nil {
 		return err
 	}
+	defer st.Close()
 
-	count := cfg.Seed.GitHub.Count
-	if seedGitHubCount > 0 {
-		count = seedGitHubCount
-	}
-	query := cfg.Seed.GitHub.Query
-	if seedGitHubQuery != "" {
-		query = seedGitHubQuery
-	}
+	count := orDefault(seedGitHubCount, cfg.Seed.GitHub.Count)
+	query := orDefault(seedGitHubQuery, cfg.Seed.GitHub.Query)
 
-	return runSeeder(cmd, cfg, seed.NewGitHubSeeder(query), count,
+	return runSeeder(cmd, cfg, st, seed.NewGitHubSeeder(query), count,
 		fmt.Sprintf("%d domains matching %q on GitHub", count, query))
 }
 
 func runSeedMCP(cmd *cobra.Command, args []string) error {
-	cfg, err := loadConfig()
+	cfg, st, err := openApp()
 	if err != nil {
 		return err
 	}
+	defer st.Close()
 
-	count := cfg.Seed.MCPRegistry.Count
-	if seedMCPCount > 0 {
-		count = seedMCPCount
-	}
-	registryURL := cfg.Seed.MCPRegistry.RegistryURL
-	if seedMCPRegistryURL != "" {
-		registryURL = seedMCPRegistryURL
-	}
+	count := orDefault(seedMCPCount, cfg.Seed.MCPRegistry.Count)
+	registryURL := orDefault(seedMCPRegistryURL, cfg.Seed.MCPRegistry.RegistryURL)
 
-	return runSeeder(cmd, cfg, seed.NewMCPRegistrySeeder(registryURL), count,
+	return runSeeder(cmd, cfg, st, seed.NewMCPRegistrySeeder(registryURL), count,
 		fmt.Sprintf("%d domains from MCP registry %s", count, registryURL))
 }
 
@@ -228,14 +220,8 @@ func runSeedMCP(cmd *cobra.Command, args []string) error {
 // domains, then upsert each as a domains row and enqueue a host_probe
 // frontier item, tagged with the seeder's discovery_source. Shared by every
 // `seed <source>` subcommand so each one only has to build its Seeder and
-// resolve its flags/config.
-func runSeeder(cmd *cobra.Command, cfg config.Config, s seed.Seeder, n int, sourceLabel string) error {
-	st, err := openStore(cfg)
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-
+// resolve its flags/config. The caller owns st and its Close.
+func runSeeder(cmd *cobra.Command, cfg config.Config, st *store.Store, s seed.Seeder, n int, sourceLabel string) error {
 	logger, err := newLogger(cfg)
 	if err != nil {
 		return err
@@ -265,7 +251,7 @@ func runSeeder(cmd *cobra.Command, cfg config.Config, s seed.Seeder, n int, sour
 	}
 
 	p := printer(cmd)
-	p.Summary(fmt.Sprintf("seed %s complete: ", s.Source()),
+	p.Summary(fmt.Sprintf("seed %s complete", s.Source()),
 		sourceLabel,
 		fmt.Sprintf("%d added", added),
 		fmt.Sprintf("%d skipped (already queued)", skipped),

@@ -50,11 +50,7 @@ func runExport(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("export: --format must be \"jsonl\" or \"csv\", got %q", exportFormat)
 	}
 
-	cfg, err := loadConfig()
-	if err != nil {
-		return err
-	}
-	st, err := openStore(cfg)
+	_, st, err := openApp()
 	if err != nil {
 		return err
 	}

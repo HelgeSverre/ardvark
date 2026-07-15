@@ -43,12 +43,7 @@ func init() {
 }
 
 func runCrawl(cmd *cobra.Command, args []string) error {
-	cfg, err := loadConfig()
-	if err != nil {
-		return err
-	}
-
-	st, err := openStore(cfg)
+	cfg, st, err := openApp()
 	if err != nil {
 		return err
 	}
@@ -121,7 +116,7 @@ func runCrawl(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	p.Summary("run complete: ",
+	p.Summary("run complete",
 		fmt.Sprintf("%d pages fetched", pagesFetched),
 		fmt.Sprintf("%d hosts probed", hostsProbed),
 		fmt.Sprintf("%d catalogs found", catalogsFound),

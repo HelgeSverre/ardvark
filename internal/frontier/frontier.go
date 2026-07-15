@@ -17,6 +17,12 @@ import (
 
 // Frontier is a persistent, dedup'd work queue backed by the
 // frontier_items table.
+//
+// Mutators addressed by item id (Complete, Requeue, Fail) return an error
+// wrapping store.ErrNotFound when the id matches no row: an in-flight item
+// vanishing mid-crawl indicates a logic bug, never a normal outcome.
+// ReclaimInFlight is a bulk sweep for which zero matched rows is normal (a
+// clean start has nothing to reclaim).
 type Frontier struct {
 	db *gorm.DB
 }
@@ -24,11 +30,6 @@ type Frontier struct {
 // New wraps a *gorm.DB (or Store.DB) in a Frontier.
 func New(db *gorm.DB) *Frontier {
 	return &Frontier{db: db}
-}
-
-// NewFromStore wraps a *store.Store in a Frontier.
-func NewFromStore(s *store.Store) *Frontier {
-	return &Frontier{db: s.DB}
 }
 
 // Item is a unit of frontier work.
@@ -177,6 +178,9 @@ func (f *Frontier) Requeue(id uint) error {
 	if res.Error != nil {
 		return fmt.Errorf("frontier: requeue %d: %w", id, res.Error)
 	}
+	if res.RowsAffected == 0 {
+		return fmt.Errorf("frontier: requeue %d: %w", id, store.ErrNotFound)
+	}
 	return nil
 }
 
@@ -202,7 +206,7 @@ func (f *Frontier) Complete(id uint) error {
 		return fmt.Errorf("frontier: complete %d: %w", id, res.Error)
 	}
 	if res.RowsAffected == 0 {
-		return fmt.Errorf("frontier: complete %d: item not found", id)
+		return fmt.Errorf("frontier: complete %d: %w", id, store.ErrNotFound)
 	}
 	return nil
 }
@@ -211,14 +215,17 @@ func (f *Frontier) Complete(id uint) error {
 // last_error, then either re-queues it as pending (status "pending",
 // available for immediate re-dequeue — the crawler's own backoff/retry
 // scheduling layer is responsible for delaying re-dispatch) or, once
-// attempts reaches maxAttempts, marks it permanently "failed".
-func (f *Frontier) Fail(id uint, cause error, maxAttempts int) error {
+// attempts reaches maxAttempts, marks it permanently "failed". The returned
+// permanent flag reports which of the two happened, so callers do not have
+// to mirror the attempts arithmetic to know whether the item will ever be
+// dispatched again.
+func (f *Frontier) Fail(id uint, cause error, maxAttempts int) (permanent bool, err error) {
 	var item store.FrontierItem
 	if err := f.db.First(&item, id).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return fmt.Errorf("frontier: fail %d: item not found", id)
+			return false, fmt.Errorf("frontier: fail %d: %w", id, store.ErrNotFound)
 		}
-		return fmt.Errorf("frontier: fail %d: %w", id, err)
+		return false, fmt.Errorf("frontier: fail %d: %w", id, err)
 	}
 
 	attempts := item.Attempts + 1
@@ -238,9 +245,12 @@ func (f *Frontier) Fail(id uint, cause error, maxAttempts int) error {
 		"status":     status,
 	})
 	if res.Error != nil {
-		return fmt.Errorf("frontier: fail %d: %w", id, res.Error)
+		return false, fmt.Errorf("frontier: fail %d: %w", id, res.Error)
 	}
-	return nil
+	if res.RowsAffected == 0 {
+		return false, fmt.Errorf("frontier: fail %d: %w", id, store.ErrNotFound)
+	}
+	return status == store.FrontierStatusFailed, nil
 }
 
 // PendingCount returns the number of items currently in "pending" status.

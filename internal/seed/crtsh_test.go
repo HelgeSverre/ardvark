@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -148,13 +149,25 @@ func TestCrtshSeederDomains_StopsEarlyOnceNSatisfied(t *testing.T) {
 }
 
 func TestCrtshSeederDomains_HTTPError(t *testing.T) {
+	// crt.sh's rate-limit responses carry a full HTML page; the status error
+	// must not embed it.
+	const errorPage = "<html><body>too many requests</body></html>"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(errorPage))
 	}))
 	defer srv.Close()
 
 	seeder := &CrtshSeeder{Endpoint: srv.URL}
-	if _, err := seeder.Domains(context.Background(), 1); err == nil {
+	_, err := seeder.Domains(context.Background(), 1)
+	if err == nil {
 		t.Fatal("expected error for non-200 response")
+	}
+	if strings.Contains(err.Error(), errorPage) {
+		t.Fatalf("error = %q, must not embed the HTML error page", err)
+	}
+	if !strings.Contains(err.Error(), "retry shortly") {
+		t.Fatalf("error = %q, want rate-limit retry hint", err)
 	}
 }

@@ -277,7 +277,7 @@ func (c *Client) doGet(ctx context.Context, rawURL string) (*Fetched, error) {
 
 	maxBody := c.cfg.MaxBodyBytes
 	if maxBody <= 0 {
-		maxBody = 5 * 1024 * 1024
+		maxBody = config.DefaultMaxBodyBytes
 	}
 
 	limited := io.LimitReader(resp.Body, maxBody+1)

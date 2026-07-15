@@ -19,12 +19,11 @@ import (
 type Style int
 
 const (
-	StylePlain  Style = iota
-	StyleGood         // soft green — valid, hit
-	StyleWarn         // peach — warnings
-	StyleBad          // terracotta — invalid, errors
-	StyleMuted        // warm brown — misses, detail, summaries
-	StyleAccent       // peach — prompts, emphasis
+	StylePlain Style = iota
+	StyleGood        // soft green — valid, hit
+	StyleWarn        // peach — warnings
+	StyleBad         // terracotta — invalid, errors
+	StyleMuted       // warm brown — misses, detail, summaries
 	StyleBold
 )
 
@@ -35,11 +34,10 @@ type color struct {
 }
 
 var palette = map[Style]color{
-	StyleGood:   {0x8F, 0xBF, 0x7F, 108}, // green from the site demo
-	StyleWarn:   {0xF4, 0xA9, 0x7F, 216}, // mascot peach
-	StyleBad:    {0xE8, 0x73, 0x4A, 173}, // mascot terracotta
-	StyleMuted:  {0xB0, 0x8F, 0x73, 138}, // warm brown
-	StyleAccent: {0xF4, 0xA9, 0x7F, 216},
+	StyleGood:  {0x8F, 0xBF, 0x7F, 108}, // green from the site demo
+	StyleWarn:  {0xF4, 0xA9, 0x7F, 216}, // mascot peach
+	StyleBad:   {0xE8, 0x73, 0x4A, 173}, // mascot terracotta
+	StyleMuted: {0xB0, 0x8F, 0x73, 138}, // warm brown
 }
 
 // Status classifies a probe/crawl row.
@@ -155,11 +153,12 @@ func (p *Printer) Row(status Status, host, method, result, extra string) {
 	fmt.Fprintln(p.w, strings.TrimRight(line, " "))
 }
 
-// Summary prints the muted end-of-run line, joining parts with " · ":
+// Summary prints the muted end-of-run line: the bare label, a ": "
+// separator, then parts joined with " · ":
 //
 //	run complete: 847 hosts probed · 3 catalogs · 41 resources indexed
-func (p *Printer) Summary(prefix string, parts ...string) {
-	fmt.Fprintln(p.w, p.Paint(StyleMuted, prefix+strings.Join(parts, " · ")))
+func (p *Printer) Summary(label string, parts ...string) {
+	fmt.Fprintln(p.w, p.Paint(StyleMuted, label+": "+strings.Join(parts, " · ")))
 }
 
 // Check prints one verification check line for `ardvark verify`:
@@ -194,11 +193,6 @@ func (p *Printer) Verdict(verdict string) {
 		style = StyleWarn
 	}
 	fmt.Fprintf(p.w, "%s %s\n", p.Paint(StyleBold, "verdict:"), p.Paint(style, verdict))
-}
-
-// Infof prints a plain informational line.
-func (p *Printer) Infof(format string, args ...any) {
-	fmt.Fprintf(p.w, format+"\n", args...)
 }
 
 // Mutedf prints a muted line (progress notes, skip reasons).

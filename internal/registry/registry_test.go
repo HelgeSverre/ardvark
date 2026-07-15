@@ -225,6 +225,49 @@ func TestHarvestAll_SameTokenGuard(t *testing.T) {
 	}
 }
 
+// TestSearchURL verifies /search is appended to the base URL, except when
+// the base URL's path already ends with /search.
+func TestSearchURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		baseURL string
+		want    string
+	}{
+		{"bare host", "https://example.com", "https://example.com/search"},
+		{"trailing slash", "https://example.com/", "https://example.com/search"},
+		{"path suffix", "https://example.com/registry", "https://example.com/registry/search"},
+		{"already /search", "https://example.com/search", "https://example.com/search"},
+		{"already /search with trailing slash", "https://example.com/search/", "https://example.com/search"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := New(tt.baseURL, nil)
+			if got := c.searchURL(); got != tt.want {
+				t.Errorf("searchURL() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestIsNotImplemented_ThroughHarvestAll verifies IsNotImplemented sees
+// through the fmt.Errorf %w wrapping HarvestAll applies to page errors.
+func TestIsNotImplemented_ThroughHarvestAll(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotImplemented)
+		w.Write([]byte("federation not supported"))
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, nil)
+	_, err := c.HarvestAll(context.Background(), HarvestOptions{})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !IsNotImplemented(err) {
+		t.Error("IsNotImplemented(err) = false, want true")
+	}
+}
+
 // TestHarvestAll_ErrorStopsHarvest verifies a mid-pagination error surfaces
 // with partial results still returned.
 func TestHarvestAll_ErrorStopsHarvest(t *testing.T) {

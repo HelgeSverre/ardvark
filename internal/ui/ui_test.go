@@ -66,7 +66,7 @@ func TestRowColors(t *testing.T) {
 
 func TestSummary(t *testing.T) {
 	var buf bytes.Buffer
-	plainPrinter(&buf).Summary("run complete: ", "847 hosts probed", "3 catalogs", "41 resources indexed")
+	plainPrinter(&buf).Summary("run complete", "847 hosts probed", "3 catalogs", "41 resources indexed")
 	want := "run complete: 847 hosts probed · 3 catalogs · 41 resources indexed\n"
 	if buf.String() != want {
 		t.Errorf("got %q, want %q", buf.String(), want)

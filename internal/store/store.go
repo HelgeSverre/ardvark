@@ -13,6 +13,12 @@ import (
 	"github.com/glebarez/sqlite"
 )
 
+// ErrNotFound is the store's driver-agnostic not-found sentinel. Lookup
+// methods translate gorm.ErrRecordNotFound into an error wrapping
+// ErrNotFound at the store boundary, so callers never need a gorm import
+// just to distinguish "missing" from a real failure.
+var ErrNotFound = errors.New("store: not found")
+
 // Store wraps a *gorm.DB with focused, crawler-facing methods over the nine
 // ardvark tables.
 type Store struct {
@@ -153,10 +159,27 @@ func (s *Store) UpsertDomain(host, discoverySource string) (*Domain, error) {
 	return d, nil
 }
 
-// DomainByHost returns the domain row for host, or gorm.ErrRecordNotFound.
+// DomainByHost returns the domain row for host, or an error wrapping
+// ErrNotFound.
 func (s *Store) DomainByHost(host string) (*Domain, error) {
 	var d Domain
 	if err := s.DB.Where("host = ?", host).First(&d).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("store: domain %q: %w", host, ErrNotFound)
+		}
+		return nil, err
+	}
+	return &d, nil
+}
+
+// DomainByID returns the domain row for id, or an error wrapping
+// ErrNotFound.
+func (s *Store) DomainByID(id uint) (*Domain, error) {
+	var d Domain
+	if err := s.DB.First(&d, id).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("store: domain %d: %w", id, ErrNotFound)
+		}
 		return nil, err
 	}
 	return &d, nil
@@ -167,7 +190,7 @@ func (s *Store) DomainByHost(host string) (*Domain, error) {
 func (s *Store) RecentlyProbed(host string, window time.Duration) (bool, error) {
 	d, err := s.DomainByHost(host)
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+		if errors.Is(err, ErrNotFound) {
 			return false, nil
 		}
 		return false, fmt.Errorf("store: checking recently probed for %q: %w", host, err)
@@ -276,28 +299,49 @@ func (s *Store) SaveCatalog(cat *Catalog, catalogChecks []*VerificationCheck, en
 }
 
 // CatalogByHash returns the most recent catalog row matching contentHash,
-// or gorm.ErrRecordNotFound if none exists. Used for change detection on
-// re-crawls.
+// or an error wrapping ErrNotFound if none exists. Used for change
+// detection on re-crawls.
 func (s *Store) CatalogByHash(contentHash string) (*Catalog, error) {
 	var c Catalog
 	if err := s.DB.Where("content_hash = ?", contentHash).Order("fetched_at desc").First(&c).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("store: catalog with hash %q: %w", contentHash, ErrNotFound)
+		}
 		return nil, err
 	}
 	return &c, nil
 }
 
 // LatestCatalogBySource returns the most recently fetched catalog row for
-// the given (domainID, sourceURL) pair, or gorm.ErrRecordNotFound if none
-// exists. Content hash alone does not identify "the same document" (two
-// different URLs could coincidentally hash the same, e.g. both empty), so
-// change detection keys on source_url/domain first and content_hash second.
+// the given (domainID, sourceURL) pair, or an error wrapping ErrNotFound if
+// none exists. Content hash alone does not identify "the same document"
+// (two different URLs could coincidentally hash the same, e.g. both empty),
+// so change detection keys on source_url/domain first and content_hash
+// second.
 func (s *Store) LatestCatalogBySource(domainID uint, sourceURL string) (*Catalog, error) {
 	var c Catalog
 	if err := s.DB.Where("domain_id = ? AND source_url = ?", domainID, sourceURL).
 		Order("fetched_at desc").First(&c).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("store: catalog for domain %d source %q: %w", domainID, sourceURL, ErrNotFound)
+		}
 		return nil, err
 	}
 	return &c, nil
+}
+
+// SaveEntries inserts catalog entry rows in one batch, e.g. entries
+// harvested from a registry and attributed to an existing catalog. Each
+// row's CatalogID (and Source/SourceRegistryID provenance) must already be
+// set by the caller.
+func (s *Store) SaveEntries(entries []CatalogEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	if err := s.DB.Create(&entries).Error; err != nil {
+		return fmt.Errorf("store: creating catalog entries: %w", err)
+	}
+	return nil
 }
 
 // -- Artifacts & registries ------------------------------------------------
@@ -317,6 +361,17 @@ func (s *Store) SaveArtifact(a *Artifact) error {
 func (s *Store) SaveRegistry(r *Registry) error {
 	if err := s.DB.Create(r).Error; err != nil {
 		return fmt.Errorf("store: creating registry: %w", err)
+	}
+	return nil
+}
+
+// UpdateRegistryStatus sets a registries row's harvest_status and
+// last_harvested_at after a harvest attempt.
+func (s *Store) UpdateRegistryStatus(registryID uint, status string, harvestedAt time.Time) error {
+	res := s.DB.Model(&Registry{}).Where("id = ?", registryID).
+		Updates(map[string]any{"harvest_status": status, "last_harvested_at": &harvestedAt})
+	if res.Error != nil {
+		return fmt.Errorf("store: updating registry %d status: %w", registryID, res.Error)
 	}
 	return nil
 }

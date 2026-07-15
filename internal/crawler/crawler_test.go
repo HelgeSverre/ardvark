@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -647,15 +648,13 @@ func TestProcess_ReleasesProvenanceOnCompletion(t *testing.T) {
 	eng.process(context.Background(), catalogItem)
 	eng.process(context.Background(), artifactItem)
 
-	eng.provMu.Lock()
-	defer eng.provMu.Unlock()
-	if _, ok := eng.parentCatalogByURL[catalogURL]; ok {
+	if _, ok := eng.parentCatalogByURL.get(catalogURL); ok {
 		t.Error("expected parentCatalogByURL entry to be released after the catalog_fetch item completed")
 	}
-	if _, ok := eng.catalogMethodByURL[catalogURL]; ok {
+	if _, ok := eng.catalogMethodByURL.get(catalogURL); ok {
 		t.Error("expected catalogMethodByURL entry to be released after the catalog_fetch item completed")
 	}
-	if _, ok := eng.artifactEntryByURL[artifactURL]; ok {
+	if _, ok := eng.artifactEntryByURL.get(artifactURL); ok {
 		t.Error("expected artifactEntryByURL entry to be released after the artifact_fetch item completed")
 	}
 }
@@ -736,6 +735,80 @@ func TestRun_DrainsSeedURLThroughPageFetch(t *testing.T) {
 	st.DB.Model(&store.FrontierItem{}).Where("status = ?", store.FrontierStatusPending).Count(&pending)
 	if pending != 0 {
 		t.Errorf("expected the frontier to be fully drained, got %d pending", pending)
+	}
+}
+
+// TestRun_SlowItemDoesNotBlockWorkers is the regression test for the old
+// batch-synchronized Run: dequeuing concurrency() items and waiting on the
+// whole batch meant one slow item idled every other worker until it
+// finished. With the continuous pool, one worker rides out the slow item
+// while the rest keep draining the queue, so every fast item must have been
+// served before the slow handler has even returned.
+func TestRun_SlowItemDoesNotBlockWorkers(t *testing.T) {
+	const slowDelay = 750 * time.Millisecond
+	const fastCount = 5
+
+	var mu sync.Mutex
+	var slowDone time.Time
+	var lastFast time.Time
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/slow.json", func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(slowDelay)
+		mu.Lock()
+		slowDone = time.Now()
+		mu.Unlock()
+		w.Write([]byte(`{}`))
+	})
+	mux.HandleFunc("/fast/", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		if now := time.Now(); now.After(lastFast) {
+			lastFast = now
+		}
+		mu.Unlock()
+		w.Write([]byte(`{}`))
+	})
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(404) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := testCrawlerConfig()
+	cfg.Crawler.Concurrency = 2
+	eng, _ := newTestEngine(t, cfg)
+	host := strings.TrimPrefix(srv.URL, "http://")
+
+	// The slow item is enqueued first, so it lands on a worker immediately;
+	// the fast items must all funnel through the remaining worker while the
+	// slow one is still in flight.
+	urls := []string{srv.URL + "/slow.json"}
+	for i := 0; i < fastCount; i++ {
+		urls = append(urls, fmt.Sprintf("%s/fast/%d.json", srv.URL, i))
+	}
+	for _, u := range urls {
+		eng.setArtifactEntry(u, 1)
+		if _, err := eng.frontier.Enqueue(&store.FrontierItem{
+			Kind:     store.KindArtifactFetch,
+			URL:      u,
+			Host:     host,
+			DedupKey: dedupKey(store.KindArtifactFetch, u),
+		}); err != nil {
+			t.Fatalf("Enqueue %s: %v", u, err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := eng.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if slowDone.IsZero() || lastFast.IsZero() {
+		t.Fatal("expected both the slow and the fast handlers to have been hit")
+	}
+	if !lastFast.Before(slowDone) {
+		t.Errorf("last fast item was served %v after the slow item finished; a slow item stalled the pool", lastFast.Sub(slowDone))
 	}
 }
 

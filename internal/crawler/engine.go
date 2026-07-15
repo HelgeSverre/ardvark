@@ -27,6 +27,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/helgesverre/ardvark/internal/config"
@@ -39,6 +40,19 @@ import (
 // Options.MaxAttempts is unset, per the design doc's error-handling
 // section.
 const defaultMaxAttempts = 3
+
+// defaultConcurrency is the worker pool size when crawler.concurrency is
+// unset.
+const defaultConcurrency = 8
+
+// defaultRegistryTimeout is the registry HTTP client timeout when
+// crawler.requestTimeoutSeconds is unset.
+const defaultRegistryTimeout = 15 * time.Second
+
+// idlePollInterval is how often Run's dispatcher re-checks the frontier
+// while the queue is empty but items are still in flight (an in-flight item
+// may enqueue new work, so the crawl cannot terminate yet).
+const idlePollInterval = 25 * time.Millisecond
 
 // ARD entry media types the engine treats specially (see
 // processCatalog).
@@ -84,15 +98,14 @@ type Engine struct {
 	httpClientOnce sync.Once
 	httpClient     *http.Client
 
-	provMu             sync.Mutex
-	parentCatalogByURL map[string]uint
-	artifactEntryByURL map[string]uint
-	registryCtxByURL   map[string]registryContext
+	parentCatalogByURL *lockedMap[string, uint]
+	artifactEntryByURL *lockedMap[string, uint]
+	registryCtxByURL   *lockedMap[string, registryContext]
 	// catalogMethodByURL remembers which probe method (well_known,
 	// robots_agentmap, link_tag) discovered each enqueued catalog URL, so
 	// the verified-catalog ProbeEvent can report it. Same in-memory
 	// provenance caveat as the maps above.
-	catalogMethodByURL map[string]string
+	catalogMethodByURL *lockedMap[string, string]
 
 	// pagesMu guards pageCounts/pageOrder/pageElems, an in-memory
 	// approximation of "pages fetched so far per domain" used to enforce
@@ -140,10 +153,10 @@ func New(cfg config.Config, st *store.Store, fr *frontier.Frontier, fetchClient 
 		fetch:              fetchClient,
 		logger:             logger,
 		opts:               opts,
-		parentCatalogByURL: make(map[string]uint),
-		artifactEntryByURL: make(map[string]uint),
-		registryCtxByURL:   make(map[string]registryContext),
-		catalogMethodByURL: make(map[string]string),
+		parentCatalogByURL: newLockedMap[string, uint](),
+		artifactEntryByURL: newLockedMap[string, uint](),
+		registryCtxByURL:   newLockedMap[string, registryContext](),
+		catalogMethodByURL: newLockedMap[string, string](),
 		pageCounts:         make(map[string]int),
 		pageOrder:          list.New(),
 		pageElems:          make(map[string]*list.Element),
@@ -157,14 +170,7 @@ func (e *Engine) EnqueueSeedURL(rawURL string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("crawler: enqueue seed url: %w", err)
 	}
-	return e.frontier.Enqueue(&store.FrontierItem{
-		RunID:    e.opts.RunID,
-		Kind:     store.KindPageFetch,
-		URL:      rawURL,
-		Host:     host,
-		Depth:    0,
-		DedupKey: dedupKey(store.KindPageFetch, rawURL),
-	})
+	return e.enqueue(store.KindPageFetch, rawURL, host, 0)
 }
 
 // EnqueueSeedHost enqueues a host_probe item at depth 0 for host, the entry
@@ -173,22 +179,45 @@ func (e *Engine) EnqueueSeedHost(host, discoverySource string) (bool, error) {
 	if _, err := e.store.UpsertDomain(host, discoverySource); err != nil {
 		return false, fmt.Errorf("crawler: enqueue seed host: %w", err)
 	}
-	return e.frontier.Enqueue(&store.FrontierItem{
-		RunID:    e.opts.RunID,
-		Kind:     store.KindHostProbe,
-		Host:     host,
-		Depth:    0,
-		DedupKey: dedupKey(store.KindHostProbe, host),
-	})
+	return e.enqueue(store.KindHostProbe, "", host, 0)
 }
 
-// Run drains the frontier: it repeatedly dequeues up to
-// crawler.concurrency pending items, processes them concurrently, and
-// waits for the batch to finish before dequeuing again (so items newly
-// enqueued mid-batch, e.g. page links discovered by a page_fetch, are
-// picked up on the next iteration). Run returns nil once the frontier is
-// empty or ctx is cancelled (graceful shutdown: no new batch is started,
-// but the current in-flight batch is allowed to finish).
+// enqueue builds and enqueues a frontier item for kind, deriving the dedup
+// key from the item's natural key (host for host_probe, URL otherwise) in
+// one place so keys cannot drift across call sites. An enqueue failure is
+// warn-logged here — the crawl always continues without the item — and
+// also returned for the callers that must react to it (seed enqueues,
+// page-budget release).
+func (e *Engine) enqueue(kind, url, host string, depth int) (bool, error) {
+	natural := url
+	if kind == store.KindHostProbe {
+		natural = host
+	}
+	added, err := e.frontier.Enqueue(&store.FrontierItem{
+		RunID:    e.opts.RunID,
+		Kind:     kind,
+		URL:      url,
+		Host:     host,
+		Depth:    depth,
+		DedupKey: dedupKey(kind, natural),
+	})
+	if err != nil {
+		e.logger.Warn("crawler: failed to enqueue item", "kind", kind, "url", url, "host", host, "error", err)
+		return false, err
+	}
+	return added, nil
+}
+
+// Run drains the frontier with a continuous worker pool: concurrency()
+// long-lived workers consume items from a channel fed by a dispatcher loop
+// that repeatedly dequeues pending items (frontier.Dequeue marks them
+// in_flight atomically, so the single dispatcher is the only frontier
+// reader and workers never race for items). A slow item therefore occupies
+// one worker, not the whole pool. Run returns nil once the frontier is
+// empty and every worker is idle — "queue empty" alone is not termination,
+// since an in-flight item may enqueue new work — or when ctx is cancelled
+// (graceful shutdown: items already dequeued are still dispatched, and
+// process requeues them once it sees ctx.Err).
 func (e *Engine) Run(ctx context.Context) error {
 	// Reclaim items left in_flight by a previously killed process (ardvark
 	// runs one crawl at a time, so any in_flight row at startup is stale).
@@ -198,38 +227,59 @@ func (e *Engine) Run(ctx context.Context) error {
 		e.logger.Info("crawler: reclaimed stale in-flight items", "count", n)
 	}
 
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil
-		}
-
-		items, err := e.frontier.Dequeue(e.concurrency())
-		if err != nil {
-			return fmt.Errorf("crawler: dequeue: %w", err)
-		}
-		if len(items) == 0 {
-			return nil
-		}
-
-		var wg sync.WaitGroup
-		for _, item := range items {
-			item := item
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+	workers := e.concurrency()
+	items := make(chan store.FrontierItem)
+	var inFlight atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for item := range items {
 				e.process(ctx, item)
-			}()
-		}
-		wg.Wait()
+				inFlight.Add(-1)
+			}
+		}()
 	}
+
+	var runErr error
+	for ctx.Err() == nil {
+		// Snapshot idleness before dequeuing: if nothing was in flight then
+		// and the dequeue still comes back empty, no worker can have
+		// enqueued new work in between (workers commit all enqueues before
+		// their in-flight count drops), so the crawl is done.
+		idle := inFlight.Load() == 0
+		batch, err := e.frontier.Dequeue(workers)
+		if err != nil {
+			runErr = fmt.Errorf("crawler: dequeue: %w", err)
+			break
+		}
+		if len(batch) == 0 {
+			if idle {
+				break
+			}
+			select {
+			case <-ctx.Done():
+			case <-time.After(idlePollInterval):
+			}
+			continue
+		}
+		inFlight.Add(int64(len(batch)))
+		for _, item := range batch {
+			items <- item
+		}
+	}
+	close(items)
+	wg.Wait()
+	return runErr
 }
 
-// concurrency returns the configured worker pool size, defaulting to 8.
+// concurrency returns the configured worker pool size.
 func (e *Engine) concurrency() int {
 	if e.cfg.Crawler.Concurrency > 0 {
 		return e.cfg.Crawler.Concurrency
 	}
-	return 8
+	return defaultConcurrency
 }
 
 // maxAttempts returns the retry cap for transient failures.
@@ -288,16 +338,14 @@ func (e *Engine) process(ctx context.Context, item store.FrontierItem) {
 		}
 	}
 
-	if ferr := e.frontier.Fail(item.ID, err, max); ferr != nil {
+	permanent, ferr := e.frontier.Fail(item.ID, err, max)
+	if ferr != nil {
 		e.logger.Error("crawler: failed to record item failure", "item_id", item.ID, "kind", item.Kind, "error", ferr)
 		return
 	}
-	// Mirror frontier.Fail's own pending-vs-failed decision (attempts,
-	// after this failure, reaching max) to know whether the item will ever
-	// be dispatched again. A still-pending item (more retries left) still
-	// needs its provenance entry for the next attempt; a permanently
-	// failed one never will.
-	if item.Attempts+1 >= max {
+	// A still-pending item (more retries left) still needs its provenance
+	// entry for the next attempt; a permanently failed one never will.
+	if permanent {
 		e.releaseProvenance(item)
 	}
 	e.logger.Warn("crawler: item failed", "item_id", item.ID, "kind", item.Kind, "url", item.URL, "host", item.Host, "transient", transient, "error", err.Error())
@@ -369,7 +417,7 @@ func (e *Engine) registryHTTPClient() *http.Client {
 	e.httpClientOnce.Do(func() {
 		timeout := time.Duration(e.cfg.Crawler.RequestTimeoutSeconds) * time.Second
 		if timeout <= 0 {
-			timeout = 15 * time.Second
+			timeout = defaultRegistryTimeout
 		}
 		e.httpClient = &http.Client{Timeout: timeout}
 	})
@@ -396,56 +444,72 @@ func (e *Engine) registryHTTPClient() *http.Client {
 // first completion. This ordering — set-then-enqueue, dequeue-then-read,
 // complete-then-release — is what makes eager release safe.
 
+// lockedMap is a mutex-guarded map: the minimal get/set/delete shape the
+// provenance tracking needs, shared across the four maps instead of four
+// hand-rolled accessor pairs.
+type lockedMap[K comparable, V any] struct {
+	mu sync.Mutex
+	m  map[K]V
+}
+
+func newLockedMap[K comparable, V any]() *lockedMap[K, V] {
+	return &lockedMap[K, V]{m: make(map[K]V)}
+}
+
+func (l *lockedMap[K, V]) get(k K) (V, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	v, ok := l.m[k]
+	return v, ok
+}
+
+func (l *lockedMap[K, V]) set(k K, v V) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.m[k] = v
+}
+
+func (l *lockedMap[K, V]) delete(k K) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.m, k)
+}
+
 func (e *Engine) setParentCatalog(url string, catalogID uint) {
-	e.provMu.Lock()
-	defer e.provMu.Unlock()
-	e.parentCatalogByURL[url] = catalogID
+	e.parentCatalogByURL.set(url, catalogID)
 }
 
 func (e *Engine) parentCatalogFor(url string) *uint {
-	e.provMu.Lock()
-	defer e.provMu.Unlock()
-	if id, ok := e.parentCatalogByURL[url]; ok {
+	if id, ok := e.parentCatalogByURL.get(url); ok {
 		return &id
 	}
 	return nil
 }
 
 func (e *Engine) setArtifactEntry(url string, entryID uint) {
-	e.provMu.Lock()
-	defer e.provMu.Unlock()
-	e.artifactEntryByURL[url] = entryID
+	e.artifactEntryByURL.set(url, entryID)
 }
 
 func (e *Engine) artifactEntry(url string) uint {
-	e.provMu.Lock()
-	defer e.provMu.Unlock()
-	return e.artifactEntryByURL[url]
+	id, _ := e.artifactEntryByURL.get(url)
+	return id
 }
 
 func (e *Engine) setCatalogMethod(url, method string) {
-	e.provMu.Lock()
-	defer e.provMu.Unlock()
-	e.catalogMethodByURL[url] = method
+	e.catalogMethodByURL.set(url, method)
 }
 
 func (e *Engine) catalogMethodFor(url string) string {
-	e.provMu.Lock()
-	defer e.provMu.Unlock()
-	return e.catalogMethodByURL[url]
+	method, _ := e.catalogMethodByURL.get(url)
+	return method
 }
 
 func (e *Engine) setRegistryContext(url string, entryID, catalogID, regRowID uint) {
-	e.provMu.Lock()
-	defer e.provMu.Unlock()
-	e.registryCtxByURL[url] = registryContext{entryID: entryID, catalogID: catalogID, regRowID: regRowID}
+	e.registryCtxByURL.set(url, registryContext{entryID: entryID, catalogID: catalogID, regRowID: regRowID})
 }
 
 func (e *Engine) registryContextFor(url string) (registryContext, bool) {
-	e.provMu.Lock()
-	defer e.provMu.Unlock()
-	ctx, ok := e.registryCtxByURL[url]
-	return ctx, ok
+	return e.registryCtxByURL.get(url)
 }
 
 // releaseProvenance drops item's in-memory provenance entry (parent
@@ -455,18 +519,12 @@ func (e *Engine) registryContextFor(url string) (registryContext, bool) {
 func (e *Engine) releaseProvenance(item store.FrontierItem) {
 	switch item.Kind {
 	case store.KindCatalogFetch:
-		e.provMu.Lock()
-		delete(e.parentCatalogByURL, item.URL)
-		delete(e.catalogMethodByURL, item.URL)
-		e.provMu.Unlock()
+		e.parentCatalogByURL.delete(item.URL)
+		e.catalogMethodByURL.delete(item.URL)
 	case store.KindArtifactFetch:
-		e.provMu.Lock()
-		delete(e.artifactEntryByURL, item.URL)
-		e.provMu.Unlock()
+		e.artifactEntryByURL.delete(item.URL)
 	case store.KindRegistryHarvest:
-		e.provMu.Lock()
-		delete(e.registryCtxByURL, item.URL)
-		e.provMu.Unlock()
+		e.registryCtxByURL.delete(item.URL)
 	}
 }
 

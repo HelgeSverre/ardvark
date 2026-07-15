@@ -7,7 +7,6 @@
 package probe
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -15,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/helgesverre/ardvark/internal/fetch"
+	"github.com/helgesverre/ardvark/internal/httpx"
 )
 
 // Probe methods, matching the values expected by store.Probe.Method.
@@ -74,7 +74,8 @@ func Probe(ctx context.Context, client *fetch.Client, host string) []Result {
 // probeWellKnown fetches https://<host>/.well-known/ai-catalog.json,
 // bypassing the robots.txt gate (well-known probes are always attempted)
 // while still going through the client's rate limiting and politeness
-// caps.
+// caps. Probing is https-only by policy (unlike fetch, which parameterizes
+// scheme) since well-known discovery targets are assumed to serve over TLS.
 func probeWellKnown(ctx context.Context, client *fetch.Client, host string) Result {
 	wellKnownURL := "https://" + host + wellKnownPath
 
@@ -86,7 +87,7 @@ func probeWellKnown(ctx context.Context, client *fetch.Client, host string) Resu
 	// A 200 alone isn't an ARD document: parked domains and SPA catch-alls
 	// serve a generic HTML page at every path. Require a JSON-ish response so
 	// those don't pollute the catalog table as "invalid" false positives.
-	if !looksLikeJSON(fetched.ContentType, fetched.Body) {
+	if !httpx.LooksLikeJSON(fetched.ContentType, fetched.Body) {
 		return Result{
 			Method:      MethodWellKnown,
 			URL:         fetched.URL,
@@ -107,23 +108,12 @@ func probeWellKnown(ctx context.Context, client *fetch.Client, host string) Resu
 	}
 }
 
-// looksLikeJSON reports whether a well-known response is plausibly a JSON
-// document, by content type or by the body's first non-space byte. It stays
-// lenient on content type (servers often mislabel .json) but rejects the HTML
-// that parked domains and SPA catch-alls return.
-func looksLikeJSON(contentType string, body []byte) bool {
-	if strings.Contains(strings.ToLower(contentType), "json") {
-		return true
-	}
-	trimmed := bytes.TrimLeft(body, " \t\r\n")
-	return len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[')
-}
-
 // probeRobotsAgentmap fetches host's robots.txt (via the client's cached
 // robots fetch) and scans its raw lines for "Agentmap:" directives, each of
 // which names an ARD catalog document URL. The directive's value is
 // resolved relative to the robots.txt URL if it is not already absolute.
 func probeRobotsAgentmap(ctx context.Context, client *fetch.Client, host string) Result {
+	// https-only by policy, same as probeWellKnown.
 	robotsURL := "https://" + host + "/robots.txt"
 
 	raw, err := client.RawRobots(ctx, host)
@@ -228,18 +218,17 @@ func classifyFetchErr(method, rawURL string, err error) Result {
 
 // resolveAgainst resolves ref against baseURL, returning the absolute
 // http/https URL string, or ok=false if ref is empty, malformed, or not
-// http/https after resolution.
+// http/https after resolution. Unlike harvest's link resolution, an
+// Agentmap directive's fragment (if any) is kept as-is rather than
+// stripped, since it's a pointer to a single named document rather than a
+// link being deduped among many.
 func resolveAgainst(baseURL, ref string) (string, bool) {
 	base, err := url.Parse(baseURL)
 	if err != nil {
 		return "", false
 	}
-	refURL, err := url.Parse(ref)
-	if err != nil {
-		return "", false
-	}
-	resolved := base.ResolveReference(refURL)
-	if resolved.Scheme != "http" && resolved.Scheme != "https" {
+	resolved, ok := httpx.ResolveHTTPURL(base, ref, false)
+	if !ok {
 		return "", false
 	}
 	return resolved.String(), true
