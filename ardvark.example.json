@@ -1,0 +1,34 @@
+{
+  "storage": {
+    "driver": "sqlite",
+    "dsn": "ardvark.db"
+  },
+  "log": {
+    "file": "ardvark.jsonl",
+    "level": "info"
+  },
+  "crawler": {
+    "concurrency": 8,
+    "maxDepth": 2,
+    "maxPagesPerDomain": 50,
+    "perHostRequestsPerSecond": 1,
+    "requestTimeoutSeconds": 15,
+    "maxBodyBytes": 5242880,
+    "userAgent": "ardvark/0.1 (+https://github.com/helgesverre/ardvark)",
+    "respectRobotsTxt": true,
+    "refreshAfterHours": 168
+  },
+  "ard": {
+    "maxCatalogDepth": 3,
+    "fetchArtifacts": true
+  },
+  "registry": {
+    "harvest": true,
+    "maxReferralDepth": 2,
+    "pageLimit": 20
+  },
+  "ctSeed": {
+    "logUrl": "https://oak.ct.letsencrypt.org/2026h2/",
+    "entryCount": 1000
+  }
+}

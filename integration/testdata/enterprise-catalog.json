@@ -1,0 +1,46 @@
+{
+  "specVersion": "1.0",
+  "host": {
+    "displayName": "Acme Corp",
+    "identifier": "did:web:acme.example",
+    "documentationUrl": "https://acme.example/docs",
+    "logoUrl": "https://acme.example/logo.png"
+  },
+  "entries": [
+    {
+      "identifier": "urn:air:acme.example:agents:support-bot",
+      "displayName": "Support Bot",
+      "type": "application/a2a-agent-card+json",
+      "url": "https://acme.example/agents/support-bot/card.json",
+      "description": "Handles tier-1 customer support conversations.",
+      "tags": ["support", "customer-service"],
+      "capabilities": ["TicketLookup", "RefundTool"],
+      "representativeQueries": [
+        "How do I reset my password?",
+        "Where is my order?",
+        "I need a refund for my last purchase"
+      ],
+      "version": "2.3.0",
+      "updatedAt": "2026-06-01T12:00:00Z"
+    },
+    {
+      "identifier": "urn:air:acme.example:tools:invoice-lookup",
+      "displayName": "Invoice Lookup MCP Server",
+      "type": "application/mcp-server-card+json",
+      "data": {
+        "name": "invoice-lookup",
+        "description": "Look up invoices by customer ID or invoice number.",
+        "tools": [
+          { "name": "get_invoice", "description": "Fetch an invoice by ID." }
+        ]
+      },
+      "description": "Internal invoicing MCP server exposed for partner agents.",
+      "tags": ["finance", "invoicing"],
+      "representativeQueries": [
+        "Show me invoice 48213",
+        "List invoices for customer 902"
+      ],
+      "version": "1.0.0"
+    }
+  ]
+}

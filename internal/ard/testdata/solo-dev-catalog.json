@@ -1,0 +1,19 @@
+{
+  "specVersion": "1.0",
+  "host": {
+    "displayName": "Jane's Weekend Projects"
+  },
+  "entries": [
+    {
+      "identifier": "urn:air:jane.dev:skills:recipe-finder",
+      "displayName": "Recipe Finder Skill",
+      "type": "application/ai-skill+json",
+      "url": "https://jane.dev/skills/recipe-finder.json",
+      "description": "Finds recipes from a pantry list of ingredients.",
+      "representativeQueries": [
+        "What can I make with chicken and rice?",
+        "Suggest a recipe using pantry leftovers"
+      ]
+    }
+  ]
+}

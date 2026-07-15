@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/helgesverre/ardvark/internal/config/config.schema.json",
+  "title": "ArdvarkConfig",
+  "description": "Schema for ardvark.json, the ardvark crawler configuration file.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "driver": {
+          "type": "string",
+          "enum": ["sqlite", "mysql", "postgres"]
+        },
+        "dsn": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "log": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "file": {
+          "type": "string",
+          "minLength": 1
+        },
+        "level": {
+          "type": "string",
+          "enum": ["debug", "info", "warn", "error"]
+        }
+      }
+    },
+    "crawler": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "concurrency": { "type": "integer", "minimum": 1 },
+        "maxDepth": { "type": "integer", "minimum": 0 },
+        "maxPagesPerDomain": { "type": "integer", "minimum": 1 },
+        "perHostRequestsPerSecond": { "type": "number", "exclusiveMinimum": 0 },
+        "requestTimeoutSeconds": { "type": "integer", "minimum": 1 },
+        "maxBodyBytes": { "type": "integer", "minimum": 1 },
+        "userAgent": { "type": "string", "minLength": 1 },
+        "respectRobotsTxt": { "type": "boolean" },
+        "refreshAfterHours": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "ard": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxCatalogDepth": { "type": "integer", "minimum": 0 },
+        "fetchArtifacts": { "type": "boolean" }
+      }
+    },
+    "registry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "harvest": { "type": "boolean" },
+        "maxReferralDepth": { "type": "integer", "minimum": 0 },
+        "pageLimit": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "ctSeed": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "logUrl": { "type": "string", "format": "uri", "minLength": 1 },
+        "entryCount": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}
