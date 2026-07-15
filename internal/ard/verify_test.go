@@ -3,6 +3,8 @@ package ard
 import (
 	"os"
 	"testing"
+
+	"github.com/helgesverre/ardvark/internal/mediatype"
 )
 
 func checkByID(checks []Check, id, subject string) (Check, bool) {
@@ -250,7 +252,7 @@ func TestCheckMediaType(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := checkMediaType(Entry{Type: tt.typ}, "subject")
+			c := checkMediaType(Entry{Type: tt.typ}, mediatype.Parse(tt.typ), "subject")
 			if c.CheckID != "entry.media_type" || c.Severity != SeverityWarning {
 				t.Fatalf("check = %+v, want entry.media_type/warning", c)
 			}
@@ -667,6 +669,42 @@ func TestVerify_GoldenCorpus(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestVerify_MediaType_KnownFamiliesNoWarning(t *testing.T) {
+	raw := []byte(`{"specVersion":"1.0","host":{"displayName":"H"},"entries":[
+		{"identifier":"urn:air:example.com:skills:s","displayName":"S","type":"application/agent-skills+md","url":"https://example.com/s.md"},
+		{"identifier":"urn:air:example.com:arch:a","displayName":"A","type":"application/ai-skill-archive+gzip","url":"https://example.com/a.tar.gz"},
+		{"identifier":"urn:air:example.com:api:o","displayName":"O","type":"application/vnd.oai.openapi","url":"https://example.com/o.yaml"}
+	]}`)
+	report := Verify(raw, "example.com")
+	for _, c := range report.Checks {
+		if c.CheckID == "entry.media_type" && !c.Passed {
+			t.Errorf("unexpected failed entry.media_type check: %+v", c)
+		}
+	}
+}
+
+func TestVerify_MediaType_UnsuffixedRegistryIsPointer(t *testing.T) {
+	raw := []byte(`{"specVersion":"1.0","host":{"displayName":"H"},"entries":[
+		{"identifier":"urn:air:example.com:registry:r","displayName":"R","type":"application/ai-registry","url":"https://example.com/api"}
+	]}`)
+	report := Verify(raw, "example.com")
+	// Pointer entries must not be nagged about representativeQueries.
+	if _, ok := checkByID(report.Checks, "queries.count", "urn:air:example.com:registry:r"); ok {
+		t.Error("queries.count should be skipped for an unsuffixed application/ai-registry pointer")
+	}
+}
+
+func TestVerify_MediaType_UnknownStillWarns(t *testing.T) {
+	raw := []byte(`{"specVersion":"1.0","host":{"displayName":"H"},"entries":[
+		{"identifier":"urn:air:example.com:x:y","displayName":"Y","type":"application/octet-stream","url":"https://example.com/y.bin"}
+	]}`)
+	report := Verify(raw, "example.com")
+	c, ok := checkByID(report.Checks, "entry.media_type", "urn:air:example.com:x:y")
+	if !ok || c.Passed {
+		t.Errorf("expected failed entry.media_type warning for unknown type, got ok=%v check=%+v", ok, c)
+	}
 }
 
 // queries.count must not fire for container/pointer entries (nested catalogs

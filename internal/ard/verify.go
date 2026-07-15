@@ -15,6 +15,7 @@ import (
 	"golang.org/x/net/publicsuffix"
 
 	"github.com/helgesverre/ardvark/internal/httpx"
+	"github.com/helgesverre/ardvark/internal/mediatype"
 )
 
 // Severity levels for verification checks.
@@ -93,41 +94,6 @@ func compiledCatalogSchema() (*jsonschema.Schema, error) {
 		catalogSchema = sch
 	})
 	return catalogSchema, catalogSchemaErr
-}
-
-// ARD entry media types, as of specVersion 1.0. mediaTypeAICatalog and
-// mediaTypeAIRegistry are also the two "pointer" types isPointerMediaType
-// checks against, so they're named consts rather than inline strings to keep
-// that map and that check from drifting apart.
-const (
-	mediaTypeA2AAgentCard  = "application/a2a-agent-card+json"
-	mediaTypeMCPServerCard = "application/mcp-server-card+json"
-	mediaTypeAICatalog     = "application/ai-catalog+json"
-	mediaTypeAIRegistry    = "application/ai-registry+json"
-	mediaTypeAISkill       = "application/ai-skill"
-	mediaTypeAISkillMD     = "application/ai-skill+md"
-	// Forms seen on catalogs published in the wild, predating or deviating
-	// from the spec draft: "-card"-less agent/server types (e.g.
-	// unlimit.website), and a +json skill form (the spec defines only
-	// application/ai-skill and application/ai-skill+md).
-	mediaTypeMCPServer   = "application/mcp-server+json"
-	mediaTypeA2AAgent    = "application/a2a-agent+json"
-	mediaTypeAISkillJSON = "application/ai-skill+json"
-)
-
-// knownEntryMediaTypes are the ARD media types recognized by entry.type. The
-// spec explicitly says unrecognized types should not be strictly enforced,
-// hence this check is a warning.
-var knownEntryMediaTypes = map[string]bool{
-	mediaTypeA2AAgentCard:  true,
-	mediaTypeMCPServerCard: true,
-	mediaTypeAICatalog:     true,
-	mediaTypeAIRegistry:    true,
-	mediaTypeAISkill:       true,
-	mediaTypeAISkillMD:     true,
-	mediaTypeMCPServer:     true,
-	mediaTypeA2AAgent:      true,
-	mediaTypeAISkillJSON:   true,
 }
 
 // TransportChecks runs the verification pipeline's step-1 transport checks
@@ -424,13 +390,15 @@ func semanticChecks(c Catalog, servingDomain string, schemaFailed bool) []Check 
 			checks = append(checks, checkPublisherMatches(urn, servingDomain, subject))
 		}
 
+		mt := mediatype.Parse(e.Type)
+
 		// representativeQueries describe a callable capability; they are not
 		// meaningful for container/pointer entries (a nested catalog or a
 		// registry endpoint), so don't warn on their absence there.
-		if !isPointerMediaType(e.Type) {
+		if !mt.IsPointer() {
 			checks = append(checks, checkQueriesCount(e, subject))
 		}
-		checks = append(checks, checkMediaType(e, subject))
+		checks = append(checks, checkMediaType(e, mt, subject))
 	}
 
 	return checks
@@ -569,12 +537,6 @@ func asciiDomain(s string) string {
 	return s
 }
 
-// isPointerMediaType reports whether an entry type is a container or endpoint
-// pointer (a nested catalog or a registry) rather than a callable capability.
-func isPointerMediaType(mediaType string) bool {
-	return mediaType == mediaTypeAICatalog || mediaType == mediaTypeAIRegistry
-}
-
 // checkQueriesCount: queries.count (warning) — 2-5 representativeQueries
 // recommended.
 func checkQueriesCount(e Entry, subject string) Check {
@@ -590,11 +552,13 @@ func checkQueriesCount(e Entry, subject string) Check {
 	}
 }
 
-// checkMediaType: entry.media_type (warning) — unrecognized ARD media type.
-func checkMediaType(e Entry, subject string) Check {
-	passed := knownEntryMediaTypes[e.Type]
+// checkMediaType: entry.media_type (warning) — unrecognized media type. A type
+// classifies as known when it maps to any Kind (including a recognized non-ARD
+// artifact type); the message reports the classified kind and encoding hint.
+func checkMediaType(e Entry, mt mediatype.MediaType, subject string) Check {
+	passed := mt.IsKnown()
 	return newCheck("entry.media_type", SeverityWarning, subject, passed,
-		fmt.Sprintf("type %q is a recognized ARD media type", e.Type),
+		fmt.Sprintf("type %q recognized as %s (format: %s)", e.Type, mt.Kind(), mt.Format()),
 		fmt.Sprintf("type %q is not a recognized ARD media type (spec does not enforce this strictly)", e.Type))
 }
 
