@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240">
+  <title>ardvark — abstract mark</title>
+  <!-- body: circle doubling as a lowercase "a" bowl -->
+  <circle cx="98" cy="132" r="58" fill="#E8734A"/>
+  <!-- ear notch -->
+  <path d="M74,82 C70,62 80,48 96,44 C88,58 90,70 98,80 Z" fill="#3D2C29"/>
+  <!-- snout: one tapered sweep -->
+  <path d="M146,110 C196,122 214,154 212,188 C211,199 197,199 194,188 C186,160 164,144 130,138 Z" fill="#3D2C29"/>
+  <!-- nostril -->
+  <circle cx="203" cy="189" r="3.5" fill="#E8734A"/>
+  <!-- eye -->
+  <circle cx="118" cy="106" r="7" fill="#F6E7D8"/>
+  <circle cx="120" cy="107" r="3" fill="#3D2C29"/>
+</svg>

@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240">
+  <title>ardvark — classic flat</title>
+  <!-- ground shadow -->
+  <ellipse cx="125" cy="210" rx="78" ry="9" fill="#3D2C29" opacity="0.08"/>
+  <!-- legs -->
+  <rect x="66" y="178" width="17" height="34" rx="8.5" fill="#D9603B"/>
+  <rect x="126" y="178" width="17" height="34" rx="8.5" fill="#D9603B"/>
+  <!-- tail -->
+  <path d="M44,150 C24,152 16,168 22,180 C26,168 34,162 50,164 Z" fill="#D9603B"/>
+  <!-- ears (behind head) -->
+  <g>
+    <ellipse cx="141" cy="66" rx="9.5" ry="23" fill="#D9603B" transform="rotate(-14 141 66)"/>
+    <ellipse cx="141" cy="70" rx="4.5" ry="14" fill="#F4A97F" transform="rotate(-14 141 70)"/>
+    <ellipse cx="163" cy="63" rx="9.5" ry="23" fill="#E8734A" transform="rotate(7 163 63)"/>
+    <ellipse cx="163" cy="67" rx="4.5" ry="14" fill="#F4A97F" transform="rotate(7 163 67)"/>
+  </g>
+  <!-- body -->
+  <ellipse cx="105" cy="150" rx="68" ry="52" fill="#E8734A"/>
+  <!-- belly -->
+  <ellipse cx="98" cy="170" rx="42" ry="26" fill="#F4A97F"/>
+  <!-- head -->
+  <circle cx="160" cy="105" r="34" fill="#E8734A"/>
+  <!-- snout -->
+  <path d="M184,88 C214,94 232,116 233,138 C233,146 225,148 220,141 C209,126 195,117 178,111 Z" fill="#E8734A"/>
+  <circle cx="227" cy="137" r="3" fill="#3D2C29"/>
+  <!-- face -->
+  <circle cx="168" cy="100" r="4.2" fill="#3D2C29"/>
+  <circle cx="180" cy="116" r="6" fill="#F4A97F"/>
+</svg>

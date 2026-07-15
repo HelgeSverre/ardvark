@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240">
+  <title>ardvark — line art</title>
+  <g fill="none" stroke="#3D2C29" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <!-- back, head and snout in one sweep -->
+    <path d="M34,172 C32,122 74,94 118,94 C154,94 184,112 210,142 C215,148 210,155 203,150 C182,135 158,126 134,126"/>
+    <!-- belly -->
+    <path d="M40,172 C60,184 96,186 122,176"/>
+    <!-- legs -->
+    <path d="M62,178 L62,204"/>
+    <path d="M108,180 L108,204"/>
+    <!-- ears -->
+    <path d="M118,92 C112,74 116,60 126,52"/>
+    <path d="M140,96 C140,76 148,64 158,60"/>
+    <!-- tail -->
+    <path d="M36,166 C22,168 14,178 16,190"/>
+  </g>
+  <!-- eye -->
+  <circle cx="152" cy="116" r="5" fill="#3D2C29"/>
+  <!-- nose accent -->
+  <circle cx="206" cy="146" r="4" fill="#E8734A"/>
+</svg>

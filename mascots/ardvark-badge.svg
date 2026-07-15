@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240">
+  <title>ardvark — head badge</title>
+  <circle cx="120" cy="120" r="110" fill="#F6E7D8"/>
+  <!-- ears -->
+  <g>
+    <ellipse cx="92" cy="62" rx="13" ry="30" fill="#D9603B" transform="rotate(-12 92 62)"/>
+    <ellipse cx="92" cy="68" rx="6" ry="18" fill="#F4A97F" transform="rotate(-12 92 68)"/>
+    <ellipse cx="148" cy="62" rx="13" ry="30" fill="#E8734A" transform="rotate(12 148 62)"/>
+    <ellipse cx="148" cy="68" rx="6" ry="18" fill="#F4A97F" transform="rotate(12 148 68)"/>
+  </g>
+  <!-- head -->
+  <circle cx="120" cy="112" r="50" fill="#E8734A"/>
+  <!-- snout drooping down -->
+  <path d="M106,152 C100,180 106,200 124,202 C136,203 140,191 132,186 C122,180 120,166 123,150 Z" fill="#E8734A"/>
+  <ellipse cx="127" cy="197" rx="7" ry="5" fill="#D9603B"/>
+  <circle cx="125" cy="196" r="1.8" fill="#3D2C29"/>
+  <circle cx="130" cy="197" r="1.8" fill="#3D2C29"/>
+  <!-- face -->
+  <circle cx="102" cy="106" r="5" fill="#3D2C29"/>
+  <circle cx="138" cy="106" r="5" fill="#3D2C29"/>
+  <circle cx="104" cy="108" r="1.6" fill="#FFFFFF"/>
+  <circle cx="140" cy="108" r="1.6" fill="#FFFFFF"/>
+  <circle cx="88" cy="124" r="8" fill="#F4A97F"/>
+  <circle cx="152" cy="124" r="8" fill="#F4A97F"/>
+</svg>

@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 240" width="240" height="240">
+  <title>ardvark — digging for catalogs</title>
+  <!-- tail up -->
+  <path d="M52,110 C40,96 42,80 56,72 C52,86 58,96 70,102 Z" fill="#D9603B"/>
+  <!-- body pitched forward -->
+  <ellipse cx="104" cy="126" rx="62" ry="46" fill="#E8734A" transform="rotate(18 104 126)"/>
+  <ellipse cx="96" cy="142" rx="36" ry="22" fill="#F4A97F" transform="rotate(18 96 142)"/>
+  <!-- ears -->
+  <ellipse cx="138" cy="106" rx="9" ry="21" fill="#D9603B" transform="rotate(-30 138 106)"/>
+  <ellipse cx="156" cy="112" rx="9" ry="21" fill="#E8734A" transform="rotate(-14 156 112)"/>
+  <!-- head down -->
+  <circle cx="156" cy="146" r="30" fill="#E8734A"/>
+  <!-- snout into the ground -->
+  <path d="M172,166 C186,176 192,188 194,204 L176,208 C170,194 162,184 152,178 Z" fill="#E8734A"/>
+  <!-- closed happy eye -->
+  <path d="M158,140 q6,5 12,0" fill="none" stroke="#3D2C29" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="146" cy="156" r="5.5" fill="#F4A97F"/>
+  <!-- front leg -->
+  <rect x="118" y="160" width="15" height="34" rx="7.5" fill="#D9603B" transform="rotate(12 125 177)"/>
+  <!-- ground -->
+  <rect x="0" y="190" width="240" height="50" fill="#EAD9C4"/>
+  <path d="M0,190 H240" stroke="#D9BFA0" stroke-width="3"/>
+  <!-- dirt puffs at dig site -->
+  <circle cx="204" cy="182" r="5" fill="#D9BFA0"/>
+  <circle cx="214" cy="172" r="3.5" fill="#D9BFA0"/>
+  <circle cx="196" cy="170" r="2.8" fill="#D9BFA0"/>
+  <!-- a little unearthed catalog -->
+  <g transform="rotate(-10 52 206)">
+    <rect x="40" y="196" width="24" height="20" rx="3" fill="#FFFFFF" stroke="#3D2C29" stroke-width="2.5"/>
+    <path d="M45,203 h14 M45,209 h10" stroke="#E8734A" stroke-width="2.5" stroke-linecap="round"/>
+  </g>
+</svg>
