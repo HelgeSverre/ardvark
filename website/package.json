@@ -1,0 +1,12 @@
+{
+  "name": "ardvark-website",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "og": "node og/generate.mjs",
+    "dev": "python3 -m http.server 8321"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.54.0"
+  }
+}

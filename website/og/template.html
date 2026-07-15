@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ardvark OG card — 1200x630</title>
+<style>
+  /* Palette: mascot colors (see website/brand.css) */
+  :root {
+    --terracotta: #E8734A;
+    --terracotta-ink: #C9552F;
+    --peach: #F4A97F;
+    --sand: #F6E7D8;
+    --cream: #FDF8F1;
+    --brown: #3D2C29;
+    --brown-deep: #2B1E1B;
+    --muted: #8A6A52;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { width: 1200px; height: 630px; overflow: hidden; }
+
+  .card {
+    width: 1200px;
+    height: 630px;
+    background: var(--cream);
+    position: relative;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    display: flex;
+    align-items: center;
+  }
+
+  /* soft sand circle behind the mascot */
+  .blob {
+    position: absolute;
+    right: -140px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 620px;
+    height: 620px;
+    border-radius: 50%;
+    background: var(--sand);
+  }
+
+  .text {
+    position: relative;
+    padding-left: 96px;
+    max-width: 740px;
+  }
+
+  .wordmark {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 92px;
+    font-weight: 700;
+    color: var(--brown-deep);
+    letter-spacing: -0.03em;
+  }
+  .wordmark .dot { color: var(--terracotta); }
+
+  .tagline {
+    margin-top: 28px;
+    font-size: 34px;
+    line-height: 1.35;
+    color: var(--brown);
+    font-weight: 500;
+  }
+  .tagline em {
+    font-style: normal;
+    color: var(--terracotta-ink);
+  }
+
+  .chip {
+    margin-top: 44px;
+    display: inline-flex;
+    align-items: center;
+    gap: 14px;
+    background: var(--brown-deep);
+    color: var(--sand);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 22px;
+    padding: 18px 26px;
+    border-radius: 14px;
+    white-space: nowrap;
+  }
+  .chip .prompt { color: var(--peach); }
+
+  .url {
+    position: absolute;
+    left: 96px;
+    bottom: 48px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 26px;
+    color: var(--muted);
+  }
+
+  .mascot {
+    position: absolute;
+    right: 70px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 480px;
+    height: 480px;
+  }
+
+  /* terracotta baseline bar */
+  .bar {
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    height: 14px;
+    background: var(--terracotta);
+  }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="blob"></div>
+
+  <div class="text">
+    <div class="wordmark">ardvark<span class="dot">.</span></div>
+    <div class="tagline">Digs up <em>ai-catalog.json</em> across the web — crawls, verifies against the ARD spec, and indexes every agentic resource.</div>
+    <div class="chip"><span class="prompt">$</span> brew install helgesverre/tap/ardvark</div>
+  </div>
+
+  <div class="url">ardvark.no</div>
+
+  <!-- line mascot (inline copy of mascots/ardvark-line.svg) -->
+  <svg class="mascot" viewBox="0 0 240 240" xmlns="http://www.w3.org/2000/svg">
+    <g fill="none" stroke="#3D2C29" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M34,172 C32,122 74,94 118,94 C154,94 184,112 210,142 C215,148 210,155 203,150 C182,135 158,126 134,126"/>
+      <path d="M40,172 C60,184 96,186 122,176"/>
+      <path d="M62,178 L62,204"/>
+      <path d="M108,180 L108,204"/>
+      <path d="M118,92 C112,74 116,60 126,52"/>
+      <path d="M140,96 C140,76 148,64 158,60"/>
+      <path d="M36,166 C22,168 14,178 16,190"/>
+    </g>
+    <circle cx="152" cy="116" r="5" fill="#3D2C29"/>
+    <circle cx="206" cy="146" r="4" fill="#E8734A"/>
+  </svg>
+
+  <div class="bar"></div>
+</div>
+</body>
+</html>
