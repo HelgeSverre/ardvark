@@ -474,16 +474,28 @@ func (f *Frontier) CountByHostKind(host, kind string) (int64, error) {
 // not that the frontier is — other worker processes sharing the same
 // mysql/postgres database may still be holding in_flight items (which
 // could enqueue further work) or have pending items yet to be claimed.
+//
+// Both counts MUST come from a single statement. With two separate COUNT
+// queries, a peer worker can commit "enqueue child (pending 0→1), complete
+// parent (in_flight 1→0)" between them, so the caller would observe
+// pending=0 (read before the enqueue) and in_flight=0 (read after the
+// complete) — a composite state that never existed — and terminate while
+// work remains. One statement sees one committed snapshot, which cannot
+// straddle that transition.
 func (f *Frontier) Counts() (pending, inFlight int64, err error) {
-	if err = f.db.Model(&store.FrontierItem{}).
-		Where("status = ?", store.FrontierStatusPending).
-		Count(&pending).Error; err != nil {
-		return 0, 0, fmt.Errorf("frontier: counts (pending): %w", err)
+	var row struct {
+		Pending  int64
+		InFlight int64
 	}
-	if err = f.db.Model(&store.FrontierItem{}).
-		Where("status = ?", store.FrontierStatusInFlight).
-		Count(&inFlight).Error; err != nil {
-		return 0, 0, fmt.Errorf("frontier: counts (in_flight): %w", err)
+	err = f.db.Model(&store.FrontierItem{}).
+		Select(
+			"COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS pending, "+
+				"COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS in_flight",
+			store.FrontierStatusPending, store.FrontierStatusInFlight,
+		).
+		Scan(&row).Error
+	if err != nil {
+		return 0, 0, fmt.Errorf("frontier: counts: %w", err)
 	}
-	return pending, inFlight, nil
+	return row.Pending, row.InFlight, nil
 }

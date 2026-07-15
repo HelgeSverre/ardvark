@@ -77,6 +77,14 @@ type CrawlerConfig struct {
 // internal/frontier.WithWorkerShard and store.FrontierItem.HostShard).
 // Meaningless (and unvalidated beyond its own bounds) for a single-process
 // sqlite crawl, where Count defaults to 1 and sharding is a no-op.
+//
+// Shard assignment is static: hosts hash to shards, shards belong to a
+// fixed (Index, Count) partition. A worker that dies permanently strands
+// its partition's pending items (never leased, so lease-expiry reclaim
+// never touches them), and its surviving peers keep polling forever
+// because the global pending count stays non-zero. Recovery is
+// operational, not automatic: restart the missing worker (same Index and
+// Count), or restart the fleet with a new Count.
 type WorkerConfig struct {
 	// Index is this process's position among Count cooperating workers
 	// (0-based). Must be less than Count — validated at config load (see
