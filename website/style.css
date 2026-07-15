@@ -24,50 +24,6 @@ a:hover { text-decoration: underline; }
 
 code, pre { font-family: var(--font-mono); }
 
-/* ── Nav ─────────────────────────────────────────── */
-
-nav {
-  position: sticky;
-  top: 0;
-  z-index: 10;
-  background: color-mix(in srgb, var(--bg) 88%, transparent);
-  backdrop-filter: blur(8px);
-  border-bottom: 1px solid var(--border);
-}
-
-.nav-inner {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 24px;
-  max-width: 960px;
-  margin: 0 auto;
-}
-
-.nav-inner img { width: 34px; height: 34px; }
-
-.nav-brand {
-  font-family: var(--font-mono);
-  font-weight: 700;
-  font-size: var(--text-lg);
-  color: var(--text-bright);
-}
-
-.nav-pill {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  background: var(--brand-primary-fade);
-  color: var(--brand-primary-ink);
-  border: 1px solid var(--brand-primary);
-  border-radius: 999px;
-  padding: 1px 10px;
-}
-
-.nav-spacer { flex: 1; }
-
-.nav-inner a { color: var(--text-muted); font-size: var(--text-sm); }
-.nav-inner a:hover { color: var(--text); text-decoration: none; }
-
 /* ── Hero ────────────────────────────────────────── */
 
 .hero {
@@ -318,8 +274,6 @@ footer {
 /* ── Responsive ──────────────────────────────────── */
 
 @media (max-width: 760px) {
-  .nav-inner { flex-wrap: wrap; row-gap: 4px; padding: 10px 16px; }
-  .nav-inner a { font-size: var(--text-xs); }
   .hero { grid-template-columns: 1fr; padding-top: 40px; }
   .hero-mascot { order: -1; }
   .hero-mascot img { max-width: 180px; }
