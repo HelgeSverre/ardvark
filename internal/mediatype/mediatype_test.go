@@ -94,3 +94,27 @@ func TestProfile(t *testing.T) {
 		t.Errorf("Profile() = %q, want empty", got)
 	}
 }
+
+func TestFormat(t *testing.T) {
+	tests := []struct {
+		in   string
+		want Format
+	}{
+		{"application/ai-catalog+json", FormatJSON},
+		{"application/ai-skill+md", FormatMarkdown},
+		{"application/agent-skills+md", FormatMarkdown},
+		{"application/agent-skills+zip", FormatZip},
+		{"application/ai-skill-archive+gzip", FormatGzip},
+		{"text/markdown", FormatMarkdown},
+		{"text/html", FormatHTML},
+		{"text/plain", FormatText},
+		{"application/vnd.oai.openapi", FormatUnknown},
+		{"application/ai-skill", FormatUnknown},
+		{"garbage", FormatUnknown},
+	}
+	for _, tt := range tests {
+		if got := Parse(tt.in).Format(); got != tt.want {
+			t.Errorf("Parse(%q).Format() = %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}

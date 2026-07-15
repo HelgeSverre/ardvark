@@ -136,3 +136,62 @@ func (m MediaType) IsKnown() bool {
 func (m MediaType) Profile() string {
 	return m.Params["profile"]
 }
+
+// Format is the concrete serialization/encoding hint — how the artifact is
+// encoded — derived from the suffix, the base tail, or the top-level type.
+type Format int
+
+const (
+	FormatUnknown Format = iota
+	FormatJSON
+	FormatMarkdown
+	FormatZip
+	FormatGzip
+	FormatHTML
+	FormatText
+)
+
+func (f Format) String() string {
+	switch f {
+	case FormatJSON:
+		return "json"
+	case FormatMarkdown:
+		return "markdown"
+	case FormatZip:
+		return "zip"
+	case FormatGzip:
+		return "gzip"
+	case FormatHTML:
+		return "html"
+	case FormatText:
+		return "text"
+	default:
+		return "unknown"
+	}
+}
+
+// Format derives the encoding hint. Suffix wins; otherwise text/* subtypes
+// map to their obvious formats; otherwise Unknown.
+func (m MediaType) Format() Format {
+	switch m.Suffix {
+	case "json":
+		return FormatJSON
+	case "md":
+		return FormatMarkdown
+	case "zip":
+		return FormatZip
+	case "gzip":
+		return FormatGzip
+	}
+	if m.Type == "text" {
+		switch m.Base {
+		case "markdown":
+			return FormatMarkdown
+		case "html":
+			return FormatHTML
+		case "plain":
+			return FormatText
+		}
+	}
+	return FormatUnknown
+}
