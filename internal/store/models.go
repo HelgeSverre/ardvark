@@ -150,6 +150,17 @@ type FrontierItem struct {
 	LastError string `gorm:"type:text"`
 	DedupKey  string `gorm:"uniqueIndex;size:512"`
 
+	// HostShard is fnv32a(Host) % HostShardCount, computed once at enqueue
+	// time (see internal/frontier.Enqueue). It partitions the frontier by
+	// host for distributed crawling: N worker processes each configured
+	// with a distinct crawler.worker.index (0..count-1) can restrict
+	// Dequeue to "host_shard % count = index", so every host is owned by
+	// exactly one worker for the crawl's lifetime. This is what makes
+	// per-process politeness (internal/fetch's in-memory rate limiter)
+	// correct without any cross-process coordination — see internal/fetch's
+	// package doc.
+	HostShard int `gorm:"index"`
+
 	// -- Provenance columns -------------------------------------------------
 	//
 	// These carry the context a handler needs to attribute its result (which
@@ -200,6 +211,14 @@ type FrontierItem struct {
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
+
+// HostShardCount is the modulus FrontierItem.HostShard is computed against.
+// 8192 is large enough that even a huge worker count (far beyond any
+// realistic deployment) still gets a reasonably even distribution, while
+// staying a cheap, fixed, portable modulus across sqlite/mysql/postgres (the
+// '%' operator works identically on all three; MOD() does not exist on
+// sqlite).
+const HostShardCount = 8192
 
 // Domain is a discovered host and its ARD probing state.
 type Domain struct {

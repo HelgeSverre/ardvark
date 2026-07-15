@@ -3,6 +3,16 @@
 // redirect cap, http/https-only scheme enforcement, a custom User-Agent, and
 // a robots.txt gate (including exposure of the raw robots.txt body for
 // Agentmap directive scanning elsewhere in the codebase).
+//
+// Client's rate limiting is entirely in-process (a per-host token bucket
+// keyed in memory), which is only correct so long as a single process is
+// ever the one talking to a given host. Distributed crawling (internal/crawler
+// running as N worker processes sharing one mysql/postgres frontier) relies
+// on host-affinity sharding (store.FrontierItem.HostShard, applied via
+// internal/frontier.WithWorkerShard) to guarantee exactly that: every host
+// is dequeued by one worker for the crawl's lifetime, so each worker's
+// in-memory rate limiter sees the whole traffic to any host it owns and
+// politeness stays correct without any cross-process coordination.
 package fetch
 
 import (

@@ -1098,3 +1098,105 @@ func rootCatalogJSON(base string) string {
 		]
 	}`
 }
+
+// -- maxPagesPerDomain (DB-backed page budget) -------------------------------
+
+func TestHandlePageFetch_RespectsMaxPagesPerDomainBudget(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		var links strings.Builder
+		for i := 0; i < 10; i++ {
+			fmt.Fprintf(&links, `<a href="/link%d">link</a>`, i)
+		}
+		w.Write([]byte("<html><body>" + links.String() + "</body></html>"))
+	})
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(404) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := testCrawlerConfig()
+	cfg.Crawler.MaxDepth = 5
+	cfg.Crawler.MaxPagesPerDomain = 3
+	eng, st := newTestEngine(t, cfg)
+	host := strings.TrimPrefix(srv.URL, "http://")
+
+	item := store.FrontierItem{URL: srv.URL + "/", Host: host, Depth: 0}
+	if err := eng.handlePageFetch(context.Background(), item); err != nil {
+		t.Fatalf("handlePageFetch: %v", err)
+	}
+
+	var count int64
+	if err := st.DB.Model(&store.FrontierItem{}).
+		Where("kind = ? AND host = ?", store.KindPageFetch, host).
+		Count(&count).Error; err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("expected exactly maxPagesPerDomain=3 page_fetch items enqueued for %s despite 10 candidate links, got %d", host, count)
+	}
+}
+
+func TestHandlePageFetch_MaxPagesPerDomainIsPerHost(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<a href="https://host-a.example/1">a1</a>
+			<a href="https://host-a.example/2">a2</a>
+			<a href="https://host-b.example/1">b1</a>
+			<a href="https://host-b.example/2">b2</a>`))
+	})
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(404) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := testCrawlerConfig()
+	cfg.Crawler.MaxDepth = 5
+	cfg.Crawler.MaxPagesPerDomain = 1
+	eng, st := newTestEngine(t, cfg)
+	host := strings.TrimPrefix(srv.URL, "http://")
+
+	item := store.FrontierItem{URL: srv.URL + "/", Host: host, Depth: 0}
+	if err := eng.handlePageFetch(context.Background(), item); err != nil {
+		t.Fatalf("handlePageFetch: %v", err)
+	}
+
+	for _, h := range []string{"host-a.example", "host-b.example"} {
+		var count int64
+		if err := st.DB.Model(&store.FrontierItem{}).
+			Where("kind = ? AND host = ?", store.KindPageFetch, h).
+			Count(&count).Error; err != nil {
+			t.Fatalf("count(%s): %v", h, err)
+		}
+		if count != 1 {
+			t.Errorf("expected exactly 1 page_fetch enqueued for %s (budget is per-host, not shared), got %d", h, count)
+		}
+	}
+}
+
+func TestPageBudgetAvailable_FailsOpenAndClosesAtLimit(t *testing.T) {
+	cfg := testCrawlerConfig()
+	cfg.Crawler.MaxPagesPerDomain = 2
+	eng, st := newTestEngine(t, cfg)
+
+	if !eng.pageBudgetAvailable("fresh.example") {
+		t.Fatal("expected budget available for a host with no existing page_fetch rows")
+	}
+
+	fr := frontier.New(st.DB)
+	for i := 0; i < 2; i++ {
+		item := &store.FrontierItem{
+			Kind:     store.KindPageFetch,
+			Host:     "fresh.example",
+			URL:      fmt.Sprintf("https://fresh.example/%d", i),
+			DedupKey: fmt.Sprintf("page_fetch:https://fresh.example/%d", i),
+		}
+		if _, err := fr.Enqueue(item); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+	}
+
+	if eng.pageBudgetAvailable("fresh.example") {
+		t.Fatal("expected budget exhausted once maxPagesPerDomain rows exist for the host")
+	}
+}

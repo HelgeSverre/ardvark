@@ -88,26 +88,19 @@ func (e *Engine) handlePageFetch(ctx context.Context, item store.FrontierItem) e
 	}
 
 	if item.Depth < e.maxDepth() {
-		budget := e.maxPagesPerDomain()
 		for _, link := range result.Links {
 			linkHost, err := hostOf(link)
 			if err != nil {
 				continue
 			}
-			if !e.reservePage(linkHost, budget) {
+			if !e.pageBudgetAvailable(linkHost) {
 				continue
 			}
-			added, err := e.enqueue(store.KindPageFetch, link, linkHost, item.Depth+1, provenance{})
-			if err != nil {
-				e.releasePage(linkHost)
+			// A failed or deduped enqueue inserted no frontier_items row, so
+			// there is nothing to undo: the budget is counted straight from
+			// the table (see pageBudgetAvailable), not reserved in memory.
+			if _, err := e.enqueue(store.KindPageFetch, link, linkHost, item.Depth+1, provenance{}); err != nil {
 				continue
-			}
-			if !added {
-				// Dedup no-op: the link was already queued, so no new page
-				// was enqueued — free the budget unit we reserved, or
-				// repeated nav links would exhaust the per-domain budget
-				// without fetching that many distinct pages.
-				e.releasePage(linkHost)
 			}
 		}
 	}

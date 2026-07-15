@@ -67,6 +67,27 @@ type CrawlerConfig struct {
 	// unset) means "use the frontier package's own default" rather than
 	// "no lease" — see frontier.defaultLeaseSeconds.
 	LeaseSeconds int `json:"leaseSeconds"`
+	// Worker configures this process's slice of a distributed crawl. See
+	// WorkerConfig.
+	Worker WorkerConfig `json:"worker"`
+}
+
+// WorkerConfig identifies this process among N cooperating worker
+// processes sharing one mysql/postgres frontier (see
+// internal/frontier.WithWorkerShard and store.FrontierItem.HostShard).
+// Meaningless (and unvalidated beyond its own bounds) for a single-process
+// sqlite crawl, where Count defaults to 1 and sharding is a no-op.
+type WorkerConfig struct {
+	// Index is this process's position among Count cooperating workers
+	// (0-based). Must be less than Count — validated at config load (see
+	// Validate) rather than left for internal/frontier to discover, since
+	// an out-of-range index would silently dequeue nothing forever instead
+	// of failing fast at startup.
+	Index int `json:"index"`
+	// Count is the total number of cooperating worker processes sharing
+	// the frontier. 1 (the default) means "no distributed sharding" — every
+	// host is dequeued by this one process, matching today's behavior.
+	Count int `json:"count"`
 }
 
 // ARDConfig controls catalog resolution depth.
@@ -190,6 +211,7 @@ func Defaults() Config {
 			RespectRobotsTxt:         true,
 			RefreshAfterHours:        168,
 			LeaseSeconds:             300,
+			Worker:                   WorkerConfig{Index: 0, Count: 1},
 		},
 		ARD: ARDConfig{
 			MaxCatalogDepth: 3,
@@ -294,7 +316,23 @@ func LoadBytes(raw []byte) (Config, error) {
 		return Config{}, fmt.Errorf("config: decoding config: %w", err)
 	}
 
+	if err := validateSemantics(cfg); err != nil {
+		return Config{}, err
+	}
+
 	return cfg, nil
+}
+
+// validateSemantics checks cross-field constraints the JSON schema cannot
+// express on its own (the schema only bounds each field individually).
+func validateSemantics(cfg Config) error {
+	if cfg.Crawler.Worker.Index >= cfg.Crawler.Worker.Count {
+		return fmt.Errorf(
+			"config: crawler.worker.index (%d) must be less than crawler.worker.count (%d)",
+			cfg.Crawler.Worker.Index, cfg.Crawler.Worker.Count,
+		)
+	}
+	return nil
 }
 
 // Validate checks raw JSON config bytes against the embedded config schema,

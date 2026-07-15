@@ -7,6 +7,7 @@ package frontier
 import (
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"strings"
 	"time"
@@ -35,6 +36,17 @@ type Frontier struct {
 	db            *gorm.DB
 	leaseDuration time.Duration
 	workerID      string
+
+	// shardCount and shardIndex implement host-affinity sharding (see
+	// store.FrontierItem.HostShard's doc comment): when shardCount > 1,
+	// Dequeue restricts itself to rows whose host_shard falls in this
+	// worker's partition, so N cooperating worker processes each own a
+	// disjoint slice of hosts. shardCount <= 1 (the default) disables the
+	// filter entirely — a single worker naturally owns the whole frontier,
+	// and skipping the extra WHERE clause keeps the common (single-process)
+	// case's query plan unchanged.
+	shardCount int
+	shardIndex int
 }
 
 // Option configures a Frontier at construction time. See WithLeaseSeconds
@@ -62,6 +74,37 @@ func WithWorkerID(id string) Option {
 	return func(f *Frontier) {
 		f.workerID = id
 	}
+}
+
+// WithWorkerShard configures this Frontier to only dequeue items whose
+// store.FrontierItem.HostShard falls in this worker's partition of
+// count cooperating worker processes: "host_shard % count = index". index
+// must be in [0, count) — callers should validate this at config load
+// (see config.Config.Crawler.Worker) rather than relying on Dequeue to
+// catch a misconfiguration, since an out-of-range index would silently
+// dequeue nothing forever.
+//
+// count <= 1 is a no-op, leaving sharding disabled (the default: a single
+// worker owns the whole frontier) — config keys use 1/absent to mean "no
+// distributed sharding", so callers can pass cfg.Crawler.Worker.Count
+// straight through without a branch.
+func WithWorkerShard(index, count int) Option {
+	return func(f *Frontier) {
+		if count > 1 {
+			f.shardCount = count
+			f.shardIndex = index
+		}
+	}
+}
+
+// hostShard computes the store.FrontierItem.HostShard value for host: a
+// stable, portable partition key (fnv32a % store.HostShardCount) that every
+// item for the same host always maps to, regardless of which worker process
+// enqueues it. See store.FrontierItem.HostShard's doc comment.
+func hostShard(host string) int {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(host)) // fnv32a.Write never errors
+	return int(h.Sum32() % store.HostShardCount)
 }
 
 // New wraps a *gorm.DB (or Store.DB) in a Frontier. Without options the
@@ -115,6 +158,11 @@ func (f *Frontier) Enqueue(item *store.FrontierItem) (bool, error) {
 	if item.Status == "" {
 		item.Status = store.FrontierStatusPending
 	}
+	// HostShard is derived, never caller-supplied: computing it here (the
+	// one place every item passes through before being written) guarantees
+	// every row's shard reflects its own Host, regardless of which
+	// enqueuing call site (seed, page-fetch fan-out, ...) built the item.
+	item.HostShard = hostShard(item.Host)
 
 	err := f.db.Create(item).Error
 	if err == nil {
@@ -213,6 +261,12 @@ func (f *Frontier) Dequeue(n int) ([]store.FrontierItem, error) {
 		q := tx.Where("status = ?", store.FrontierStatusPending).
 			Order("priority desc, id asc").
 			Limit(n)
+
+		if f.shardCount > 1 {
+			// Portable across sqlite/mysql/postgres: '%' is a standard SQL
+			// operator on all three, unlike MOD() (no sqlite support).
+			q = q.Where("host_shard % ? = ?", f.shardCount, f.shardIndex)
+		}
 
 		if lockingSupported(tx) {
 			q = q.Clauses(clause.Locking{
@@ -393,6 +447,23 @@ func (f *Frontier) PendingCount() (int64, error) {
 		Where("status = ?", store.FrontierStatusPending).
 		Count(&count).Error; err != nil {
 		return 0, fmt.Errorf("frontier: pending count: %w", err)
+	}
+	return count, nil
+}
+
+// CountByHostKind returns how many frontier_items rows exist for host with
+// the given kind, across every status (pending, in_flight, done, failed).
+// The crawl engine uses this at enqueue time to enforce
+// crawler.maxPagesPerDomain against kind page_fetch: since Enqueue's dedup
+// key guarantees at most one row per distinct URL, this count is an exact
+// per-process page budget check (see the Engine doc comment on
+// maxPagesPerDomain for the cross-worker race this does not cover).
+func (f *Frontier) CountByHostKind(host, kind string) (int64, error) {
+	var count int64
+	if err := f.db.Model(&store.FrontierItem{}).
+		Where("host = ? AND kind = ?", host, kind).
+		Count(&count).Error; err != nil {
+		return 0, fmt.Errorf("frontier: count by host/kind: %w", err)
 	}
 	return count, nil
 }

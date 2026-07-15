@@ -2,6 +2,7 @@ package frontier
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -690,5 +691,153 @@ func TestEnqueueReenqueueRaceGuard(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("PendingCount = %d, want 1", count)
+	}
+}
+
+// -- Host-affinity sharding ---------------------------------------------
+
+// TestDequeueShardFilterPartitionsByHost verifies that WithWorkerShard
+// restricts Dequeue to items whose host_shard matches this worker's
+// partition, that two workers covering the full shard space (index 0 of 2,
+// index 1 of 2) between them drain every item with no overlap, and that a
+// single worker (count=1, sharding disabled) drains everything by itself.
+func TestDequeueShardFilterPartitionsByHost(t *testing.T) {
+	s, err := store.Open("sqlite", "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	// Enqueue with a plain (unsharded) frontier; HostShard is stamped by
+	// Enqueue regardless of which Frontier value's options are used to
+	// dequeue later.
+	seed := New(s.DB)
+	var hosts []string
+	for i := 0; i < 64; i++ {
+		host := fmt.Sprintf("shard%d.example", i)
+		hosts = append(hosts, host)
+		item := &store.FrontierItem{
+			Kind:     store.KindHostProbe,
+			Host:     host,
+			DedupKey: "hp:" + host,
+		}
+		if _, err := seed.Enqueue(item); err != nil {
+			t.Fatalf("Enqueue(%s): %v", host, err)
+		}
+	}
+
+	worker0 := New(s.DB, WithWorkerShard(0, 2))
+	worker1 := New(s.DB, WithWorkerShard(1, 2))
+
+	batch0, err := worker0.Dequeue(len(hosts))
+	if err != nil {
+		t.Fatalf("worker0 Dequeue: %v", err)
+	}
+	batch1, err := worker1.Dequeue(len(hosts))
+	if err != nil {
+		t.Fatalf("worker1 Dequeue: %v", err)
+	}
+
+	if len(batch0)+len(batch1) != len(hosts) {
+		t.Fatalf("expected the two shards to partition all %d items between them, got %d + %d = %d",
+			len(hosts), len(batch0), len(batch1), len(batch0)+len(batch1))
+	}
+
+	seen := make(map[string]int) // host -> which worker (0 or 1) claimed it
+	for _, it := range batch0 {
+		if it.HostShard%2 != 0 {
+			t.Fatalf("worker0 (index 0 of 2) dequeued item with host_shard=%d, want even", it.HostShard)
+		}
+		seen[it.Host]++
+	}
+	for _, it := range batch1 {
+		if it.HostShard%2 != 1 {
+			t.Fatalf("worker1 (index 1 of 2) dequeued item with host_shard=%d, want odd", it.HostShard)
+		}
+		seen[it.Host]++
+	}
+	for _, host := range hosts {
+		if seen[host] != 1 {
+			t.Fatalf("host %s claimed %d times across workers, want exactly 1 (no overlap, no gap)", host, seen[host])
+		}
+	}
+
+	// Requeue everything and verify a single unsharded worker (count=1)
+	// dequeues all of it by itself.
+	for _, it := range append(batch0, batch1...) {
+		if err := seed.Requeue(it.ID); err != nil {
+			t.Fatalf("Requeue(%d): %v", it.ID, err)
+		}
+	}
+	solo := New(s.DB, WithWorkerShard(0, 1))
+	batchAll, err := solo.Dequeue(len(hosts))
+	if err != nil {
+		t.Fatalf("solo Dequeue: %v", err)
+	}
+	if len(batchAll) != len(hosts) {
+		t.Fatalf("count=1 worker dequeued %d items, want all %d", len(batchAll), len(hosts))
+	}
+}
+
+// TestCountByHostKind verifies CountByHostKind counts only rows matching
+// both host and kind, across every status.
+func TestCountByHostKind(t *testing.T) {
+	f := newTestFrontier(t)
+
+	mk := func(host, kind, dedup string) *store.FrontierItem {
+		return &store.FrontierItem{Kind: kind, Host: host, URL: "https://" + host + "/x", DedupKey: dedup}
+	}
+
+	if _, err := f.Enqueue(mk("budget.example", store.KindPageFetch, "pf:1")); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := f.Enqueue(mk("budget.example", store.KindPageFetch, "pf:2")); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	// Different kind, same host: must not be counted.
+	if _, err := f.Enqueue(mk("budget.example", store.KindHostProbe, "hp:budget")); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	// Same kind, different host: must not be counted.
+	if _, err := f.Enqueue(mk("other.example", store.KindPageFetch, "pf:3")); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	count, err := f.CountByHostKind("budget.example", store.KindPageFetch)
+	if err != nil {
+		t.Fatalf("CountByHostKind: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("CountByHostKind(budget.example, page_fetch) = %d, want 2", count)
+	}
+
+	// A completed item still counts: the budget check must count every
+	// status, not just pending/in_flight, since a page already fetched
+	// still consumed its slot in the domain's budget.
+	items, err := f.Dequeue(10)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	for _, it := range items {
+		if it.Host == "budget.example" && it.Kind == store.KindPageFetch {
+			if err := f.Complete(it.ID); err != nil {
+				t.Fatalf("Complete: %v", err)
+			}
+		}
+	}
+	count, err = f.CountByHostKind("budget.example", store.KindPageFetch)
+	if err != nil {
+		t.Fatalf("CountByHostKind (after complete): %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("CountByHostKind after complete = %d, want 2 (all statuses counted)", count)
+	}
+
+	count, err = f.CountByHostKind("other.example", store.KindPageFetch)
+	if err != nil {
+		t.Fatalf("CountByHostKind: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("CountByHostKind(other.example, page_fetch) = %d, want 1", count)
 	}
 }

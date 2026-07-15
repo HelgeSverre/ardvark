@@ -18,7 +18,6 @@
 package crawler
 
 import (
-	"container/list"
 	"context"
 	"errors"
 	"fmt"
@@ -108,46 +107,18 @@ type Engine struct {
 
 	httpClientOnce sync.Once
 	httpClient     *http.Client
-
-	// pagesMu guards pageCounts/pageOrder/pageElems, an in-memory
-	// approximation of "pages fetched so far per domain" used to enforce
-	// maxPagesPerDomain without an extra store query per link. Unlike the
-	// provenance maps above, a host's entry cannot simply be dropped once
-	// "consumed" — the budget must hold for the domain's entire life in
-	// the crawl, and page_fetch items for a host can keep arriving as long
-	// as its budget isn't exhausted. So instead of per-entry release this
-	// is bounded with an LRU cap (maxTrackedDomains): once that many
-	// distinct hosts are tracked, the least-recently-touched host is
-	// evicted to make room. This is a deliberate, documented
-	// approximation (see reservePage) — an evicted host that reappears
-	// much later starts a fresh count, so it could exceed
-	// maxPagesPerDomain by a bounded amount. Given the cap is large
-	// relative to any single crawl's realistic per-run host cardinality,
-	// eviction is rare in practice; it exists purely to bound memory for
-	// very long-running crawls over huge seed sets (e.g. CT-log seeding).
-	pagesMu    sync.Mutex
-	pageCounts map[string]int
-	pageOrder  *list.List
-	pageElems  map[string]*list.Element
 }
-
-// maxTrackedDomains bounds the number of distinct hosts pageCounts (and its
-// LRU bookkeeping) will track at once. See the pagesMu doc comment.
-const maxTrackedDomains = 20000
 
 // New builds an Engine. logger must not be nil; pass eventlog.New's result
 // (or slog.Default() in tests).
 func New(cfg config.Config, st *store.Store, fr *frontier.Frontier, fetchClient *fetch.Client, logger *slog.Logger, opts Options) *Engine {
 	return &Engine{
-		cfg:        cfg,
-		store:      st,
-		frontier:   fr,
-		fetch:      fetchClient,
-		logger:     logger,
-		opts:       opts,
-		pageCounts: make(map[string]int),
-		pageOrder:  list.New(),
-		pageElems:  make(map[string]*list.Element),
+		cfg:      cfg,
+		store:    st,
+		frontier: fr,
+		fetch:    fetchClient,
+		logger:   logger,
+		opts:     opts,
 	}
 }
 
@@ -482,54 +453,41 @@ func (e *Engine) registryHTTPClient() *http.Client {
 
 // -- Page-count tracking for maxPagesPerDomain -----------------------------
 
-// reservePage atomically checks-and-reserves one unit of host's
-// maxPagesPerDomain budget, returning false without reserving if the budget
-// is already exhausted. Reservation happens at enqueue time (not fetch
-// time) so that a single page fan-out cannot enqueue far more page_fetch
-// items than the budget allows before any of them have actually been
-// fetched and counted.
-func (e *Engine) reservePage(host string, budget int) bool {
-	e.pagesMu.Lock()
-	defer e.pagesMu.Unlock()
-	e.touchPageLocked(host)
-	if e.pageCounts[host] >= budget {
-		return false
+// pageBudgetAvailable reports whether host still has room in its
+// maxPagesPerDomain budget for one more page_fetch item, by counting
+// existing page_fetch rows for host directly in the frontier
+// (frontier.CountByHostKind) rather than an in-memory approximation. The
+// dedup key guarantees at most one frontier_items row per distinct URL, so
+// within a single process this count is exact.
+//
+// The check happens at enqueue time (not fetch time) so that a single
+// page's link fan-out cannot enqueue far more page_fetch items than the
+// budget allows before any of them have actually been fetched and counted.
+// It is checked immediately before each enqueue call in the fan-out loop
+// (handlePageFetch), so the count reflects every item enqueued earlier in
+// the same loop.
+//
+// Under distributed crawling (mysql/postgres, multiple worker processes),
+// this check is exact per-process but not globally atomic: two workers
+// racing to enqueue page_fetch items for the same host could each observe
+// a budget count just under the limit and both enqueue, overshooting by a
+// small, bounded amount. Host-affinity sharding (store.FrontierItem.HostShard)
+// means this race is rare in practice — normally only one worker ever owns
+// a given host — but it is not eliminated for hosts discovered mid-crawl
+// before sharding routes their future items consistently. This is a
+// deliberate, documented tradeoff rather than a bug: closing it fully would
+// require a cross-process lock or a DB-side atomic counter for a budget
+// whose entire purpose is a soft cap, not an exact one.
+func (e *Engine) pageBudgetAvailable(host string) bool {
+	count, err := e.frontier.CountByHostKind(host, store.KindPageFetch)
+	if err != nil {
+		// Fail open: the budget is a politeness/scope guard, not a
+		// correctness requirement, so a broken count must not block the
+		// crawl — but it shouldn't be silent.
+		e.logger.Warn("crawler: page budget count failed", "host", host, "error", err)
+		return true
 	}
-	e.pageCounts[host]++
-	return true
-}
-
-// releasePage undoes a reservePage call, used when an enqueue attempt made
-// after a successful reservation ultimately fails (so the budget isn't
-// permanently consumed by dead reservations).
-func (e *Engine) releasePage(host string) {
-	e.pagesMu.Lock()
-	defer e.pagesMu.Unlock()
-	e.touchPageLocked(host)
-	if e.pageCounts[host] > 0 {
-		e.pageCounts[host]--
-	}
-}
-
-// touchPageLocked records host as the most-recently-used entry in the
-// pageCounts LRU, creating it (at count 0) if new. Callers must hold
-// pagesMu. If host is new and the tracker is already at maxTrackedDomains,
-// the least-recently-touched host is evicted first (see the pagesMu doc
-// comment on Engine for the correctness tradeoff this implies).
-func (e *Engine) touchPageLocked(host string) {
-	if el, ok := e.pageElems[host]; ok {
-		e.pageOrder.MoveToFront(el)
-		return
-	}
-	if e.pageOrder.Len() >= maxTrackedDomains {
-		if oldest := e.pageOrder.Back(); oldest != nil {
-			evicted := oldest.Value.(string)
-			e.pageOrder.Remove(oldest)
-			delete(e.pageElems, evicted)
-			delete(e.pageCounts, evicted)
-		}
-	}
-	e.pageElems[host] = e.pageOrder.PushFront(host)
+	return count < int64(e.maxPagesPerDomain())
 }
 
 // maxPagesPerDomain returns the configured page budget per domain.
