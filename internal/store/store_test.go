@@ -397,7 +397,7 @@ func TestSaveArtifact(t *testing.T) {
 		URL:         "https://example.com/agent-card.json",
 		HTTPStatus:  200,
 		ContentType: "application/json",
-		RawBody:     `{"name":"agent"}`,
+		RawBody:     []byte(`{"name":"agent"}`),
 		ContentHash: "cafebabe",
 		FetchStatus: FetchStatusOK,
 	}

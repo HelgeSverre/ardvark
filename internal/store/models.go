@@ -5,7 +5,26 @@
 // the focused methods the crawler needs.
 package store
 
-import "time"
+import (
+	"time"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
+)
+
+// LongText is a string column that maps to an effectively unbounded text
+// type on every supported dialect. A bare `type:text` caps at 64 KB on
+// MySQL/MariaDB, which real-world catalog documents and artifact bodies
+// exceed; Postgres and SQLite TEXT are unbounded.
+type LongText string
+
+// GormDBDataType implements schema.GormDBDataTypeInterface.
+func (LongText) GormDBDataType(db *gorm.DB, _ *schema.Field) string {
+	if db.Dialector.Name() == "mysql" {
+		return "LONGTEXT"
+	}
+	return "TEXT"
+}
 
 // Frontier item kinds.
 const (
@@ -172,7 +191,7 @@ type Catalog struct {
 	SpecVersion        string `gorm:"size:32"`
 	HostDisplayName    string `gorm:"size:255"`
 	HostIdentifier     string `gorm:"size:255"`
-	RawJSON            string `gorm:"type:text"`
+	RawJSON            LongText
 	ContentHash        string `gorm:"index;size:64"`
 	FetchedAt          time.Time
 	VerificationStatus string `gorm:"size:32"`
@@ -195,14 +214,14 @@ type CatalogEntry struct {
 	MediaType             string `gorm:"size:128"`
 	RefURL                string `gorm:"size:2048"`
 	HasEmbeddedData       bool
-	Description           string `gorm:"type:text"`
-	Version               string `gorm:"size:64"`
-	EntryUpdatedAt        string `gorm:"size:64"`
-	Tags                  string `gorm:"type:text"` // JSON
-	Capabilities          string `gorm:"type:text"` // JSON
-	RepresentativeQueries string `gorm:"type:text"` // JSON
-	TrustManifest         string `gorm:"type:text"` // JSON, verbatim
-	RawJSON               string `gorm:"type:text"`
+	Description           string   `gorm:"type:text"`
+	Version               string   `gorm:"size:64"`
+	EntryUpdatedAt        string   `gorm:"size:64"`
+	Tags                  string   `gorm:"type:text"` // JSON
+	Capabilities          string   `gorm:"type:text"` // JSON
+	RepresentativeQueries string   `gorm:"type:text"` // JSON
+	TrustManifest         LongText // JSON, verbatim
+	RawJSON               LongText
 	Source                string `gorm:"size:16"`
 	SourceRegistryID      *uint  `gorm:"index"`
 
@@ -218,7 +237,10 @@ type Artifact struct {
 	URL         string `gorm:"size:2048"`
 	HTTPStatus  int
 	ContentType string `gorm:"size:255"`
-	RawBody     string `gorm:"type:text"`
+	// RawBody holds the artifact verbatim. Artifacts can be binary (skill
+	// tarballs, gzip archives), so this must be a byte column: text columns
+	// reject non-UTF-8 on Postgres and MySQL (and cap at 64 KB on MySQL).
+	RawBody     []byte
 	ContentHash string `gorm:"index;size:64"`
 	FetchedAt   time.Time
 	FetchStatus string `gorm:"size:16"`
