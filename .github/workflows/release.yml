@@ -23,10 +23,14 @@ jobs:
       - name: Run tests
         run: go test ./...
 
+      # Pinned to 2.15.x: it's the last goreleaser that generates a
+      # traditional cross-platform Homebrew formula via `brews`. 2.16+ hard-
+      # deprecated it in favour of macOS-only casks, which would drop Linux
+      # `brew install` support. Revisit with a manual formula step to unpin.
       - uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
-          version: "~> v2"
+          version: "~> v2.15.0"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
