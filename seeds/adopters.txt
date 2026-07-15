@@ -1,0 +1,19 @@
+# Known ARD adopters — hosts confirmed to publish /.well-known/ai-catalog.json
+# (last verified 2026-07-15 with `ardvark probe`). Use as a starter frontier:
+#
+#   ardvark crawl --list seeds/adopters.txt
+#
+# Verdicts move as publishers update their catalogs; re-verify with
+# `ardvark verify https://<host>/.well-known/ai-catalog.json`.
+
+# valid
+huggingface.co
+unlimit.website
+
+# valid_with_warnings (unrecognized media types)
+clickhouse.com
+
+# published but failing schema validation at last check
+zapier.com
+neon.tech
+mcp.airshelf.ai

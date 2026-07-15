@@ -59,6 +59,12 @@ ardvark seed ct --count 1000
 ardvark crawl
 ```
 
+Or start from `seeds/adopters.txt`, the hosts already confirmed to publish ARD catalogs:
+
+```sh
+ardvark crawl --list seeds/adopters.txt
+```
+
 Results land in `ardvark.db` (SQLite) and `ardvark.jsonl`. See what you caught:
 
 ```sh
