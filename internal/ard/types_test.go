@@ -16,6 +16,27 @@ func TestParseURN(t *testing.T) {
 			name:  "no namespace",
 			input: "urn:air:example.com:my-agent",
 			want: URN{
+				NID:       "air",
+				Publisher: "example.com",
+				Namespace: []string{},
+				Name:      "my-agent",
+			},
+		},
+		{
+			name:  "ai NID (seen in the wild)",
+			input: "urn:ai:unlimit.website:tool:pagenode-cms",
+			want: URN{
+				NID:       "ai",
+				Publisher: "unlimit.website",
+				Namespace: []string{"tool"},
+				Name:      "pagenode-cms",
+			},
+		},
+		{
+			name:  "uppercase ai NID",
+			input: "URN:AI:example.com:my-agent",
+			want: URN{
+				NID:       "ai",
 				Publisher: "example.com",
 				Namespace: []string{},
 				Name:      "my-agent",
@@ -25,6 +46,7 @@ func TestParseURN(t *testing.T) {
 			name:  "multi-segment namespace",
 			input: "urn:air:example.com:tools:search:web-search",
 			want: URN{
+				NID:       "air",
 				Publisher: "example.com",
 				Namespace: []string{"tools", "search"},
 				Name:      "web-search",
@@ -34,6 +56,7 @@ func TestParseURN(t *testing.T) {
 			name:  "single-segment namespace",
 			input: "urn:air:acme.io:agents:helper",
 			want: URN{
+				NID:       "air",
 				Publisher: "acme.io",
 				Namespace: []string{"agents"},
 				Name:      "helper",
@@ -43,6 +66,7 @@ func TestParseURN(t *testing.T) {
 			name:  "uppercase urn scheme and NID (RFC 8141 case-insensitive)",
 			input: "URN:AIR:example.com:my-agent",
 			want: URN{
+				NID:       "air",
 				Publisher: "example.com",
 				Namespace: []string{},
 				Name:      "my-agent",
@@ -52,6 +76,7 @@ func TestParseURN(t *testing.T) {
 			name:  "mixed-case urn scheme and NID",
 			input: "Urn:Air:example.com:tools:my-agent",
 			want: URN{
+				NID:       "air",
 				Publisher: "example.com",
 				Namespace: []string{"tools"},
 				Name:      "my-agent",
@@ -116,7 +141,7 @@ func TestParseURN(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ParseURN(%q) unexpected error: %v", tt.input, err)
 			}
-			if got.Publisher != tt.want.Publisher || got.Name != tt.want.Name {
+			if got.NID != tt.want.NID || got.Publisher != tt.want.Publisher || got.Name != tt.want.Name {
 				t.Fatalf("ParseURN(%q) = %+v, want %+v", tt.input, got, tt.want)
 			}
 			if !reflect.DeepEqual(got.Namespace, tt.want.Namespace) {

@@ -75,10 +75,12 @@ type SeedConfig struct {
 }
 
 // CTSeedConfig controls Certificate Transparency log seeding
-// (`ardvark seed ct`).
+// (`ardvark seed ct`). Logs are resolved dynamically from LogListURL rather
+// than hardcoded, since CT shards rotate every few months.
 type CTSeedConfig struct {
-	LogURL     string `json:"logUrl"`
-	EntryCount int    `json:"entryCount"`
+	LogListURL string   `json:"logListUrl"`
+	Logs       []string `json:"logs"`
+	EntryCount int      `json:"entryCount"`
 }
 
 // CrtshSeedConfig controls crt.sh seeding (`ardvark seed crtsh`).
@@ -126,7 +128,11 @@ func Defaults() Config {
 		},
 		Seed: SeedConfig{
 			CT: CTSeedConfig{
-				LogURL:     "https://oak.ct.letsencrypt.org/2026h2/",
+				LogListURL: "https://www.gstatic.com/ct/log_list/v3/log_list.json",
+				// Several high-volume DV operators; whichever shards are
+				// usable and current get used, so seeding keeps working as
+				// individual logs are retired and rotated.
+				Logs:       []string{"oak", "argon", "nimbus"},
 				EntryCount: 1000,
 			},
 			Crtsh: CrtshSeedConfig{

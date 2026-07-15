@@ -216,7 +216,7 @@ Per catalog, in order, all results recorded to `verification_checks`:
 |----------|----------|------|
 | `catalog.spec_version` | error | `specVersion` must be `"1.0"` |
 | `entry.value_or_reference` | error | exactly one of `url` / `data` |
-| `urn.format` | error | `urn:air:<publisher>:<namespace…>:<name>` grammar, RFC 8141 |
+| `urn.format` | error | `urn:air:` or `urn:ai:` `<publisher>:<namespace…>:<name>` grammar, RFC 8141 (both NIDs accepted; `ai` appears on catalogs already published in the wild) |
 | `identifier.unique` | error | no duplicate URNs within a catalog |
 | `urn.publisher_matches` | warning | URN publisher domain ≠ serving domain (legit for aggregators, flagged) |
 | `queries.count` | warning | 2–5 `representativeQueries` recommended |
@@ -253,7 +253,7 @@ the binary. Validation failures produce precise, human-friendly messages
   "seed": {
     "ct": {
       "logListUrl": "https://www.gstatic.com/ct/log_list/v3/log_list.json",
-      "logs": ["oak"],
+      "logs": ["oak", "argon", "nimbus"],
       "entryCount": 1000
     },
     "crtsh": { "endpoint": "https://crt.sh" },
@@ -288,8 +288,11 @@ are resolved dynamically rather than hardcoded:
 
 1. Fetch the Google CT **log list** (`seed.ct.logListUrl`) — the same list
    Chrome/Firefox use. Select `usable` logs whose `temporal_interval` covers
-   now, filtered to the operators in `seed.ct.logs` (default `["oak"]`;
-   `"all"` uses every usable log).
+   now, filtered to the operators in `seed.ct.logs` (default
+   `["oak", "argon", "nimbus"]` — several high-volume DV operators so seeding
+   keeps working as individual logs are retired; `"all"` uses every usable
+   log). Operator tokens match the operator name or log description, so a
+   retired operator simply contributes nothing.
 2. For each selected log: `GET <log>/ct/v1/get-sth` → tree size, then
    `GET <log>/ct/v1/get-entries?start=<size-N>&end=<size-1>` in chunks
    (logs cap entries per response; paginate until N collected).

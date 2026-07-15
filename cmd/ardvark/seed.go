@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -30,43 +32,37 @@ var seedCmd = &cobra.Command{
 
 var seedCTCmd = &cobra.Command{
 	Use:   "ct",
-	Short: "Seed the frontier from Certificate Transparency log entries",
-	Long: "seed ct fetches the most recent N entries from a Certificate Transparency log " +
-		"(default: Let's Encrypt Oak, per config seed.ct.logUrl), extracts SAN domain names, " +
-		"sanitizes and dedupes them, upserts them as domains (discovery_source=ct_log), " +
-		"and enqueues a host_probe frontier item for each.",
+	Short: "Seed from Certificate Transparency logs",
+	Long: "Harvest domains from the newest Certificate Transparency log entries and queue them " +
+		"for probing. Logs are resolved live from the CT log list (Let's Encrypt Oak by default), " +
+		"so shard URLs never need updating as they rotate.",
 	RunE: runSeedCT,
 }
 
 var seedCrtshCmd = &cobra.Command{
 	Use:   "crtsh",
-	Short: "Seed the frontier from crt.sh certificate search",
-	Long: "seed crtsh queries crt.sh's JSON API for recent certificates (optionally narrowed " +
-		"to identities mentioning --match), extracts domain names, sanitizes and dedupes them, " +
-		"upserts them as domains (discovery_source=crtsh), and enqueues a host_probe frontier " +
-		"item for each.",
+	Short: "Seed from crt.sh certificate search",
+	Long: "Harvest domains from crt.sh's certificate search and queue them for probing. " +
+		"Use --match to narrow to certificates whose identity mentions a keyword (e.g. \"agent\", \"mcp\").",
 	RunE: runSeedCrtsh,
 }
 
 var seedTrancoCmd = &cobra.Command{
 	Use:   "tranco",
-	Short: "Seed the frontier from the Tranco top-domains list",
-	Long: "seed tranco downloads the Tranco top-domains list (per config seed.tranco.listUrl), " +
-		"sanitizes and dedupes the top N domains, upserts them as domains " +
-		"(discovery_source=tranco), and enqueues a host_probe frontier item for each. " +
-		"Complements seed ct: it covers the established web that CT-log seeding (which only " +
-		"sees freshly issued certs) misses.",
+	Short: "Seed from the Tranco top-domains list",
+	Long: "Queue the top N domains from the Tranco list for probing. Covers the established web " +
+		"that CT-log seeding, which only sees freshly issued certificates, misses.",
 	RunE: runSeedTranco,
 }
 
 func init() {
-	seedCTCmd.Flags().IntVar(&seedCTCount, "count", 0, "number of CT log entries to fetch (default: config seed.ct.entryCount)")
-	seedCTCmd.Flags().StringVar(&seedCTLog, "log", "", "CT log base URL (default: config seed.ct.logUrl)")
+	seedCTCmd.Flags().IntVar(&seedCTCount, "count", 0, "entries to harvest (default: config seed.ct.entryCount)")
+	seedCTCmd.Flags().StringVar(&seedCTLog, "log", "", "operator token (oak, argon, all) or explicit log URL (default: config seed.ct.logs)")
 
-	seedCrtshCmd.Flags().IntVar(&seedCrtshCount, "count", 0, "number of domains to enqueue (default: config seed.ct.entryCount)")
-	seedCrtshCmd.Flags().StringVar(&seedCrtshMatch, "match", "", "narrow crt.sh results to identities mentioning this keyword")
+	seedCrtshCmd.Flags().IntVar(&seedCrtshCount, "count", 0, "domains to enqueue (default: config seed.ct.entryCount)")
+	seedCrtshCmd.Flags().StringVar(&seedCrtshMatch, "match", "", "narrow to certificate identities mentioning this keyword")
 
-	seedTrancoCmd.Flags().IntVar(&seedTrancoTop, "top", 0, "number of top domains to enqueue (default: config seed.ct.entryCount)")
+	seedTrancoCmd.Flags().IntVar(&seedTrancoTop, "top", 0, "top domains to enqueue (default: config seed.ct.entryCount)")
 	seedTrancoCmd.Flags().StringVar(&seedTrancoURL, "url", "", "Tranco list URL (default: config seed.tranco.listUrl)")
 
 	seedCmd.AddCommand(seedCTCmd)
@@ -85,13 +81,27 @@ func runSeedCT(cmd *cobra.Command, args []string) error {
 	if seedCTCount > 0 {
 		count = seedCTCount
 	}
-	logURL := cfg.Seed.CT.LogURL
-	if seedCTLog != "" {
-		logURL = seedCTLog
+
+	// --log accepts either an explicit log URL or an operator token; config
+	// seed.ct.logs supplies the default operator filter.
+	operators := cfg.Seed.CT.Logs
+	var ctSeeder *seed.CTSeeder
+	var label string
+	if strings.Contains(seedCTLog, "://") {
+		ctSeeder = seed.NewCTSeeder(seedCTLog)
+		label = fmt.Sprintf("%d entries from %s", count, seedCTLog)
+	} else {
+		if seedCTLog != "" {
+			operators = strings.Split(seedCTLog, ",")
+		}
+		ctSeeder, err = seed.NewCTSeederFromLogList(cmd.Context(), nil, cfg.Seed.CT.LogListURL, operators, time.Now())
+		if err != nil {
+			return fmt.Errorf("seed ct: %w", err)
+		}
+		label = fmt.Sprintf("%d entries from %s log(s)", count, strings.Join(operators, ","))
 	}
 
-	return runSeeder(cmd, cfg, seed.NewCTSeeder(logURL), count,
-		fmt.Sprintf("%d domains from %s", count, logURL))
+	return runSeeder(cmd, cfg, ctSeeder, count, label)
 }
 
 func runSeedCrtsh(cmd *cobra.Command, args []string) error {

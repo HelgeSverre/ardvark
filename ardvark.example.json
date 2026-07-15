@@ -29,7 +29,8 @@
   },
   "seed": {
     "ct": {
-      "logUrl": "https://oak.ct.letsencrypt.org/2026h2/",
+      "logListUrl": "https://www.gstatic.com/ct/log_list/v3/log_list.json",
+      "logs": ["oak", "argon", "nimbus"],
       "entryCount": 1000
     },
     "crtsh": {

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -185,13 +186,26 @@ func collectSeeds(args []string, listFile string) ([]string, error) {
 	return seeds, nil
 }
 
-// seedOne enqueues a single seed: a URL (containing "://") is seeded as a
-// page_fetch at depth 0; a bare domain is seeded as a host_probe at depth 0.
+// seedOne enqueues a single seed. A bare domain is seeded as a host_probe. A
+// URL is seeded as a page_fetch and, additionally, as a host_probe of its
+// origin host — so a seed URL whose page 404s or has no anchors (an SPA, an
+// API root) still gets its well-known catalog checked. Deduping makes the
+// extra host_probe harmless when the page crawl reaches the same host.
 func seedOne(eng *crawler.Engine, seed string) (bool, error) {
-	if strings.Contains(seed, "://") {
-		return eng.EnqueueSeedURL(seed)
+	if !strings.Contains(seed, "://") {
+		return eng.EnqueueSeedHost(seed, store.DiscoverySourceSeed)
 	}
-	return eng.EnqueueSeedHost(seed, store.DiscoverySourceSeed)
+
+	added, err := eng.EnqueueSeedURL(seed)
+	if err != nil {
+		return added, err
+	}
+	if u, perr := url.Parse(seed); perr == nil && u.Hostname() != "" {
+		if _, herr := eng.EnqueueSeedHost(u.Hostname(), store.DiscoverySourceSeed); herr != nil {
+			return added, herr
+		}
+	}
+	return added, nil
 }
 
 // summarizeRun computes crawl_run summary counters for FinishRun. Pages

@@ -103,7 +103,12 @@ func (c *CrtshSeeder) Domains(ctx context.Context, n int) ([]string, error) {
 		return nil, fmt.Errorf("seed: crtsh: reading response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("seed: crtsh: %s returned status %d: %s", endpoint.String(), resp.StatusCode, string(body))
+		return nil, fmt.Errorf("seed: crtsh: %s returned status %d (crt.sh is often rate-limited; retry shortly)", endpoint.String(), resp.StatusCode)
+	}
+	// crt.sh serves an HTML page instead of JSON when overloaded; decoding
+	// that would spill markup into the error, so reject it up front.
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "json") && !looksLikeJSON(body) {
+		return nil, fmt.Errorf("seed: crtsh: %s returned %s, not JSON (crt.sh is often rate-limited; retry shortly)", endpoint.String(), ctOrUnknown(ct))
 	}
 
 	var records []crtshRecord
@@ -128,4 +133,21 @@ func (c *CrtshSeeder) Domains(ctx context.Context, n int) ([]string, error) {
 		sanitized = sanitized[:n]
 	}
 	return sanitized, nil
+}
+
+// looksLikeJSON reports whether body begins with a JSON array or object, after
+// leading whitespace — a cheap guard against HTML error pages.
+func looksLikeJSON(body []byte) bool {
+	trimmed := strings.TrimLeft(string(body), " \t\r\n")
+	return strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{")
+}
+
+func ctOrUnknown(contentType string) string {
+	if contentType == "" {
+		return "an unknown content type"
+	}
+	if i := strings.IndexByte(contentType, ';'); i >= 0 {
+		contentType = contentType[:i]
+	}
+	return contentType
 }

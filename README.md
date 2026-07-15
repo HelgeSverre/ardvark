@@ -21,7 +21,7 @@ Publishers advertise their AI agents, MCP servers, and skills in an `ai-catalog.
 - **Every ARD discovery mechanism** — `/.well-known/ai-catalog.json`, `Agentmap:` directives in robots.txt, and `<link rel="ai-catalog">` tags
 - **Full catalog resolution** — recurses into nested catalogs, fetches referenced artifact documents (agent cards, MCP server cards), and harvests discovered registries via `POST /search`, including registry referrals
 - **Spec verification** — official JSON Schema plus seven semantic checks (URN grammar, value-or-reference exclusivity, query counts, …), each recorded pass/fail with a message
-- **CT-log seeding** — bootstrap the frontier with fresh domains from Certificate Transparency logs (`ardvark seed ct`)
+- **Bootstrap seeding** — fill the frontier from Certificate Transparency logs, crt.sh, or the Tranco top list (`ardvark seed ct|crtsh|tranco`)
 - **Swappable storage** — SQLite by default; MySQL and Postgres via one config key; append-only JSONL event log alongside
 - **Resumable runs** — the crawl queue lives in the database; kill a run, start it again, it picks up where it stopped
 - **Polite by default** — per-host rate limiting, robots.txt compliance, body-size caps, redirect caps, backoff on transient failures
@@ -72,9 +72,9 @@ ardvark export --format jsonl --out resources.jsonl
 |---------|--------------|
 | `ardvark crawl [url\|domain]... [--list file] [--force]` | Seed the frontier and run the crawler until the queue is empty. Resumes pending work from earlier runs. |
 | `ardvark probe <host>...` | Probe specific hosts for ARD documents, no crawling. |
-| `ardvark seed ct [--count N] [--log URL]` | Pull the latest N entries from a Certificate Transparency log (default: Let's Encrypt Oak), extract domains, enqueue probes. |
-| `ardvark seed crtsh [--count N] [--match keyword]` | Query crt.sh's JSON API for recent certificates (optionally narrowed to identities mentioning `--match`), extract domains, enqueue probes. |
-| `ardvark seed tranco [--top N] [--url URL]` | Download the Tranco top-domains list and enqueue the top N. |
+| `ardvark seed ct [--count N] [--log oak\|argon\|all\|URL]` | Harvest domains from the newest Certificate Transparency log entries. Logs resolve live from the CT log list (Oak by default), so shard URLs never go stale. |
+| `ardvark seed crtsh [--count N] [--match keyword]` | Harvest domains from crt.sh, optionally narrowed to certificate identities mentioning `--match` (e.g. `agent`, `mcp`). |
+| `ardvark seed tranco [--top N] [--url URL]` | Queue the top N domains from the Tranco list — the established web CT seeding misses. |
 | `ardvark verify <path\|url>` | Verify one catalog — local file or remote URL — and print the check report. Exits 1 if invalid. `--stored` re-verifies everything in the database. |
 | `ardvark export [--format jsonl\|csv] [--out file]` | Dump discovered resources with their verification status. |
 | `ardvark stats` | Summarize the dataset: hosts probed, catalogs by verdict, entries by type. |
@@ -102,7 +102,7 @@ ardvark runs with sensible defaults and no config file. To change anything, drop
   "ard":      { "maxCatalogDepth": 3, "fetchArtifacts": true },
   "registry": { "harvest": true, "maxReferralDepth": 2, "pageLimit": 20 },
   "seed": {
-    "ct":     { "logUrl": "https://oak.ct.letsencrypt.org/2026h2/", "entryCount": 1000 },
+    "ct":     { "logListUrl": "https://www.gstatic.com/ct/log_list/v3/log_list.json", "logs": ["oak"], "entryCount": 1000 },
     "crtsh":  { "endpoint": "https://crt.sh" },
     "tranco": { "listUrl": "https://tranco-list.eu/top-1m.csv.zip" }
   }
@@ -138,7 +138,7 @@ Invalid catalogs are stored too, flagged `invalid` — "found but broken" is use
 A catalog's verdict is `valid`, `valid_with_warnings`, or `invalid`, rolled up from:
 
 1. JSON Schema validation against the official ARD schema (Draft 2020-12)
-2. Semantic checks the schema can't express — errors: `specVersion == "1.0"`, exactly one of `url`/`data` per entry, URN grammar (`urn:air:<publisher>:<namespace>:<name>`), unique identifiers; warnings: URN publisher matching the serving domain, 2–5 representative queries, recognized media types
+2. Semantic checks the schema can't express — errors: `specVersion == "1.0"`, exactly one of `url`/`data` per entry, URN grammar (`urn:air:` or `urn:ai:` `<publisher>:<namespace>:<name>`), unique identifiers; warnings: URN publisher matching the serving domain, 2–5 representative queries, recognized media types
 
 Run it standalone against anything:
 

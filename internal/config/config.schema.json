@@ -74,7 +74,8 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "logUrl": { "type": "string", "format": "uri", "minLength": 1 },
+            "logListUrl": { "type": "string", "format": "uri", "minLength": 1 },
+            "logs": { "type": "array", "items": { "type": "string", "minLength": 1 } },
             "entryCount": { "type": "integer", "minimum": 1 }
           }
         },

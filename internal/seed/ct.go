@@ -20,14 +20,15 @@ import (
 // response).
 const ctDefaultEntriesPerPage = 256
 
-// CTSeeder fetches domain names from a Certificate Transparency log's
-// get-sth / get-entries endpoints (RFC 6962). It implements Seeder with
+// CTSeeder fetches domain names from one or more Certificate Transparency
+// logs' get-sth / get-entries endpoints (RFC 6962). It implements Seeder with
 // Source() "ct_log".
 type CTSeeder struct {
-	// LogURL is the base URL of the CT log, e.g.
-	// "https://oak.ct.letsencrypt.org/2026h1/". A trailing slash is
-	// added if missing.
-	LogURL string
+	// Logs are the base URLs of the CT logs to read, e.g.
+	// "https://oak.ct.letsencrypt.org/2026h2/". Trailing slashes are added
+	// if missing. Domains draws from each log in turn until n names are
+	// collected.
+	Logs []string
 
 	// HTTPClient is used for all requests. Defaults to a client with a
 	// 30s timeout if nil.
@@ -38,9 +39,20 @@ type CTSeeder struct {
 	EntriesPerPage int
 }
 
-// NewCTSeeder returns a CTSeeder for the given CT log base URL.
-func NewCTSeeder(logURL string) *CTSeeder {
-	return &CTSeeder{LogURL: logURL}
+// NewCTSeeder returns a CTSeeder reading the given CT log base URL(s).
+func NewCTSeeder(logURLs ...string) *CTSeeder {
+	return &CTSeeder{Logs: logURLs}
+}
+
+// NewCTSeederFromLogList resolves usable current logs for the given operator
+// tokens from the CT log list at logListURL (empty = DefaultCTLogListURL) and
+// returns a CTSeeder reading them. See ResolveCTLogs for token semantics.
+func NewCTSeederFromLogList(ctx context.Context, httpClient *http.Client, logListURL string, operators []string, now time.Time) (*CTSeeder, error) {
+	urls, err := ResolveCTLogs(ctx, httpClient, logListURL, operators, now)
+	if err != nil {
+		return nil, err
+	}
+	return &CTSeeder{Logs: urls, HTTPClient: httpClient}, nil
 }
 
 // Source implements Seeder.
@@ -68,8 +80,8 @@ func (c *CTSeeder) entriesPerPage() int {
 	return ctDefaultEntriesPerPage
 }
 
-func (c *CTSeeder) endpoint(path string, query url.Values) (string, error) {
-	base := c.LogURL
+func (c *CTSeeder) endpoint(logURL, path string, query url.Values) (string, error) {
+	base := logURL
 	if !strings.HasSuffix(base, "/") {
 		base += "/"
 	}
@@ -108,8 +120,8 @@ func (c *CTSeeder) getJSON(ctx context.Context, endpoint string, out any) error 
 }
 
 // getSTH fetches the current tree size from the log's get-sth endpoint.
-func (c *CTSeeder) getSTH(ctx context.Context) (int64, error) {
-	endpoint, err := c.endpoint("ct/v1/get-sth", nil)
+func (c *CTSeeder) getSTH(ctx context.Context, logURL string) (int64, error) {
+	endpoint, err := c.endpoint(logURL, "ct/v1/get-sth", nil)
 	if err != nil {
 		return 0, err
 	}
@@ -127,8 +139,8 @@ func (c *CTSeeder) getSTH(ctx context.Context) (int64, error) {
 // the log's get-entries endpoint. Logs may return fewer entries than
 // requested (server-truncated responses); callers must paginate using the
 // returned entry count.
-func (c *CTSeeder) getEntries(ctx context.Context, start, end int64) ([]ct.LeafEntry, error) {
-	endpoint, err := c.endpoint("ct/v1/get-entries", url.Values{
+func (c *CTSeeder) getEntries(ctx context.Context, logURL string, start, end int64) ([]ct.LeafEntry, error) {
+	endpoint, err := c.endpoint(logURL, "ct/v1/get-entries", url.Values{
 		"start": {fmt.Sprintf("%d", start)},
 		"end":   {fmt.Sprintf("%d", end)},
 	})
@@ -142,28 +154,46 @@ func (c *CTSeeder) getEntries(ctx context.Context, start, end int64) ([]ct.LeafE
 	return resp.Entries, nil
 }
 
-// Domains implements Seeder: it fetches domain names harvested from the
-// most recent n entries of the CT log. It walks backward from the current
-// tree size, paginating get-entries in chunks, until n entries have been
-// collected or the log is exhausted. Returned domains are sanitized (see
-// Sanitize) but not yet deduped against any external store.
+// Domains implements Seeder: it harvests domain names from the most recent
+// entries across the configured CT logs, drawing from each in turn until n
+// names are collected or all logs are exhausted. Returned domains are
+// sanitized (see Sanitize) but not yet deduped against any external store.
 func (c *CTSeeder) Domains(ctx context.Context, n int) ([]string, error) {
 	if n <= 0 {
 		return nil, fmt.Errorf("seed: ct: n must be positive, got %d", n)
 	}
+	if len(c.Logs) == 0 {
+		return nil, fmt.Errorf("seed: ct: no logs configured")
+	}
 
-	treeSize, err := c.getSTH(ctx)
+	var names []string
+	for _, logURL := range c.Logs {
+		remaining := n - len(names)
+		if remaining <= 0 {
+			break
+		}
+		logNames, err := c.domainsFromLog(ctx, logURL, remaining)
+		if err != nil {
+			return nil, err
+		}
+		names = append(names, logNames...)
+	}
+
+	return Sanitize(names), nil
+}
+
+// domainsFromLog harvests up to n raw (unsanitized) SAN/CN names from the
+// latest entries of a single CT log. It reads the window
+// [treeSize-n, treeSize-1] forward in page-sized chunks; get-entries returns a
+// contiguous prefix of each requested [start, end] range (servers truncate
+// from the end at their per-response cap), so advancing the cursor by the
+// number of entries actually returned correctly handles truncation.
+func (c *CTSeeder) domainsFromLog(ctx context.Context, logURL string, n int) ([]string, error) {
+	treeSize, err := c.getSTH(ctx, logURL)
 	if err != nil {
 		return nil, fmt.Errorf("seed: ct: get-sth: %w", err)
 	}
 
-	// The log contains leaf indices [0, treeSize-1]. We want the latest n
-	// entries, i.e. the window [treeSize-n, treeSize-1], walked forward in
-	// page-sized chunks. get-entries responses are always a contiguous
-	// prefix of the requested [start, end] range (servers truncate from the
-	// end when the requested span exceeds their per-response cap), so
-	// advancing the cursor by the number of entries actually returned
-	// correctly handles truncation.
 	target := treeSize - 1
 	cursor := target - int64(n) + 1
 	if cursor < 0 {
@@ -178,12 +208,11 @@ func (c *CTSeeder) Domains(ctx context.Context, n int) ([]string, error) {
 			end = target
 		}
 
-		entries, err := c.getEntries(ctx, cursor, end)
+		entries, err := c.getEntries(ctx, logURL, cursor, end)
 		if err != nil {
 			return nil, fmt.Errorf("seed: ct: get-entries[%d:%d]: %w", cursor, end, err)
 		}
 		if len(entries) == 0 {
-			// Nothing more available; stop paginating.
 			break
 		}
 
@@ -191,8 +220,7 @@ func (c *CTSeeder) Domains(ctx context.Context, n int) ([]string, error) {
 			index := cursor + int64(i)
 			leafNames, err := domainsFromLeaf(index, &entry)
 			if err != nil {
-				// A single unparsable leaf shouldn't abort the whole
-				// fetch; skip it and continue.
+				// A single unparsable leaf shouldn't abort the fetch.
 				continue
 			}
 			names = append(names, leafNames...)
@@ -201,7 +229,7 @@ func (c *CTSeeder) Domains(ctx context.Context, n int) ([]string, error) {
 		cursor += int64(len(entries))
 	}
 
-	return Sanitize(names), nil
+	return names, nil
 }
 
 // domainsFromLeaf parses a single CT log leaf entry (X.509 or precert) and

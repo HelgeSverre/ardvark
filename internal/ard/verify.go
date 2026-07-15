@@ -95,6 +95,11 @@ var knownEntryMediaTypes = map[string]bool{
 	"application/ai-catalog+json":      true,
 	"application/ai-registry+json":     true,
 	"application/ai-skill+json":        true,
+	// Forms seen on catalogs published in the wild (e.g. unlimit.website),
+	// predating the "-card" suffix in the spec draft.
+	"application/mcp-server+json": true,
+	"application/a2a-agent+json":  true,
+	"application/ai-skill":        true,
 }
 
 // TransportChecks runs the verification pipeline's step-1 transport checks

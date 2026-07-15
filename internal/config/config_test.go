@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -13,7 +14,7 @@ func TestLoad_MissingFileUsesDefaults(t *testing.T) {
 		t.Fatalf("Load() unexpected error: %v", err)
 	}
 	want := Defaults()
-	if cfg != want {
+	if !reflect.DeepEqual(cfg, want) {
 		t.Fatalf("Load() = %+v, want defaults %+v", cfg, want)
 	}
 }

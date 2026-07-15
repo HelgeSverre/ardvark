@@ -78,24 +78,40 @@ type ProvenanceLink struct {
 	SourceDigest string `json:"sourceDigest,omitempty"`
 }
 
-// URN represents a parsed ARD URN: urn:air:<publisher>:<namespace...>:<name>.
+// URN represents a parsed ARD URN:
+// urn:<nid>:<publisher>:<namespace...>:<name>, where nid is "air" or "ai".
 type URN struct {
+	NID       string // "air" or "ai" (lowercased)
 	Publisher string
 	Namespace []string
 	Name      string
 }
 
+// urnNIDs are the accepted namespace identifiers. "air" is the identifier in
+// the ARD spec draft; "ai" appears on catalogs already published in the wild
+// (e.g. unlimit.website), so we accept both.
+var urnNIDs = []string{"air", "ai"}
+
 // ParseURN parses an ARD identifier URN of the grammar
-// urn:air:<publisher>:<namespace...>:<name>, where publisher is a FQDN,
-// namespace is zero or more colon-separated segments, and name is the
-// mandatory terminal segment.
+// urn:<nid>:<publisher>:<namespace...>:<name>, where nid is "air" or "ai",
+// publisher is a FQDN, namespace is zero or more colon-separated segments,
+// and name is the mandatory terminal segment.
 func ParseURN(s string) (URN, error) {
-	const prefix = "urn:air:"
-	// RFC 8141: the "urn:" scheme and the NID ("air") are case-insensitive.
-	if !strings.HasPrefix(strings.ToLower(s), prefix) {
-		return URN{}, fmt.Errorf("ard: invalid urn %q: must start with %q", s, prefix)
+	// RFC 8141: the "urn:" scheme and the NID are case-insensitive.
+	lower := strings.ToLower(s)
+	nid := ""
+	rest := ""
+	for _, candidate := range urnNIDs {
+		prefix := "urn:" + candidate + ":"
+		if strings.HasPrefix(lower, prefix) {
+			nid = candidate
+			rest = s[len(prefix):]
+			break
+		}
 	}
-	rest := s[len(prefix):]
+	if nid == "" {
+		return URN{}, fmt.Errorf("ard: invalid urn %q: must start with \"urn:air:\" or \"urn:ai:\"", s)
+	}
 	if rest == "" {
 		return URN{}, fmt.Errorf("ard: invalid urn %q: missing publisher and name", s)
 	}
@@ -120,6 +136,7 @@ func ParseURN(s string) (URN, error) {
 	}
 
 	return URN{
+		NID:       nid,
 		Publisher: publisher,
 		Namespace: namespace,
 		Name:      name,

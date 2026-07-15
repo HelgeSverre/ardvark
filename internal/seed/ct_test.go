@@ -119,7 +119,7 @@ func TestCTSeederDomains_SinglePage(t *testing.T) {
 	srv := fixture.server()
 	defer srv.Close()
 
-	seeder := &CTSeeder{LogURL: srv.URL}
+	seeder := &CTSeeder{Logs: []string{srv.URL}}
 	names, err := seeder.Domains(context.Background(), 3)
 	if err != nil {
 		t.Fatalf("Domains: %v", err)
@@ -154,7 +154,7 @@ func TestCTSeederDomains_PaginationWithServerTruncation(t *testing.T) {
 	srv := fixture.server()
 	defer srv.Close()
 
-	seeder := &CTSeeder{LogURL: srv.URL, EntriesPerPage: 7}
+	seeder := &CTSeeder{Logs: []string{srv.URL}, EntriesPerPage: 7}
 	names, err := seeder.Domains(context.Background(), 8)
 	if err != nil {
 		t.Fatalf("Domains: %v", err)
@@ -190,7 +190,7 @@ func TestCTSeederDomains_FewerEntriesThanRequested(t *testing.T) {
 	srv := fixture.server()
 	defer srv.Close()
 
-	seeder := &CTSeeder{LogURL: srv.URL}
+	seeder := &CTSeeder{Logs: []string{srv.URL}}
 	names, err := seeder.Domains(context.Background(), 100)
 	if err != nil {
 		t.Fatalf("Domains: %v", err)
@@ -201,7 +201,7 @@ func TestCTSeederDomains_FewerEntriesThanRequested(t *testing.T) {
 }
 
 func TestCTSeederDomains_RejectsNonPositiveN(t *testing.T) {
-	seeder := &CTSeeder{LogURL: "http://example.invalid"}
+	seeder := &CTSeeder{Logs: []string{"http://example.invalid"}}
 	if _, err := seeder.Domains(context.Background(), 0); err == nil {
 		t.Fatal("expected error for n=0")
 	}
