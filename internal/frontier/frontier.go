@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -140,6 +141,28 @@ func hostShard(host string) int {
 	return int(h.Sum32() % store.HostShardCount)
 }
 
+// fetchHost returns the host that will actually be dialed for item: the
+// hostname of item.URL when URL is non-empty and parses to a URL with a
+// non-empty hostname, falling back to item.Host otherwise (host_probe items
+// have no URL; a malformed URL should never panic sharding).
+//
+// This is deliberately NOT item.Host in general: entry follow-ups
+// (catalog_fetch/artifact_fetch/registry_harvest built in
+// internal/crawler/handlers.go from an entry's or ref's URL) set Host to the
+// *parent* catalog's host for attribution/budget purposes, even when URL
+// points at a different host entirely (e.g. an artifact served from a CDN
+// domain). Sharding must follow the fetch target, not the attribution
+// target, or the item ends up owned by a worker that never talks to that
+// host — see store.FrontierItem.HostShard's doc comment.
+func fetchHost(item *store.FrontierItem) string {
+	if item.URL != "" {
+		if u, err := url.Parse(item.URL); err == nil && u.Hostname() != "" {
+			return u.Hostname()
+		}
+	}
+	return item.Host
+}
+
 // New wraps a *gorm.DB (or Store.DB) in a Frontier. Without options the
 // lease duration is defaultLeaseSeconds and the worker id is a
 // best-effort hostname:pid string (see defaultWorkerID).
@@ -193,9 +216,22 @@ func (f *Frontier) Enqueue(item *store.FrontierItem) (bool, error) {
 	}
 	// HostShard is derived, never caller-supplied: computing it here (the
 	// one place every item passes through before being written) guarantees
-	// every row's shard reflects its own Host, regardless of which
-	// enqueuing call site (seed, page-fetch fan-out, ...) built the item.
-	item.HostShard = hostShard(item.Host)
+	// every row's shard reflects the host that will actually be fetched,
+	// regardless of which enqueuing call site (seed, page-fetch fan-out,
+	// entry follow-up, ...) built the item.
+	//
+	// Shard on URL's hostname when available, NOT item.Host: entry
+	// follow-ups (catalog_fetch/artifact_fetch/registry_harvest built in
+	// internal/crawler/handlers.go from an entry's or ref's URL) set Host to
+	// the *parent* catalog's host for attribution/budget purposes, even
+	// though URL may point at a completely different host (e.g. an artifact
+	// served from a CDN domain). If sharding used Host in that case, the
+	// item would be owned by the parent host's worker while the fetch goes
+	// to the foreign host, breaking the one-worker-per-host guarantee that
+	// makes in-process politeness correct (see store.FrontierItem.HostShard
+	// and internal/fetch's package doc). item.Host itself is left untouched
+	// here — it keeps its attribution/budget meaning.
+	item.HostShard = hostShard(fetchHost(item))
 
 	err := f.db.Create(item).Error
 	if err == nil {

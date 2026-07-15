@@ -62,6 +62,75 @@ func TestEnqueueRequiresDedupKey(t *testing.T) {
 	}
 }
 
+// TestEnqueueHostShardUsesURLHostNotAttributionHost verifies that HostShard
+// is derived from item.URL's hostname (the host that will actually be
+// fetched) rather than item.Host (which entry follow-ups set to the parent
+// catalog's host for attribution/budget purposes and may legitimately differ,
+// e.g. an artifact_fetch item for an artifact served from a CDN domain).
+func TestEnqueueHostShardUsesURLHostNotAttributionHost(t *testing.T) {
+	f := newTestFrontier(t)
+
+	item := &store.FrontierItem{
+		Kind:     store.KindArtifactFetch,
+		Host:     "parent.example",               // attribution: parent catalog's host
+		URL:      "https://cdn.other.com/a.json", // fetch target: a different host
+		DedupKey: "artifact:https://cdn.other.com/a.json",
+	}
+	ok, err := f.Enqueue(item)
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected enqueue to succeed")
+	}
+
+	if item.Host != "parent.example" {
+		t.Fatalf("Enqueue must not mutate item.Host, got %q", item.Host)
+	}
+	if want := hostShard("cdn.other.com"); item.HostShard != want {
+		t.Fatalf("HostShard = %d, want %d (fnv32a of URL host cdn.other.com, not Host parent.example)", item.HostShard, want)
+	}
+}
+
+// TestEnqueueHostShardFallsBackToHostWithoutURL verifies host_probe items
+// (which have no URL to fetch — the probe itself discovers the URLs) still
+// shard on Host, since there is no separate fetch target to prefer.
+func TestEnqueueHostShardFallsBackToHostWithoutURL(t *testing.T) {
+	f := newTestFrontier(t)
+
+	item := &store.FrontierItem{
+		Kind:     store.KindHostProbe,
+		Host:     "example.com",
+		DedupKey: "host_probe:example.com",
+	}
+	if _, err := f.Enqueue(item); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if want := hostShard("example.com"); item.HostShard != want {
+		t.Fatalf("HostShard = %d, want %d (fnv32a of Host, no URL present)", item.HostShard, want)
+	}
+}
+
+// TestEnqueueHostShardFallsBackToHostOnMalformedURL verifies that an
+// unparseable URL degrades gracefully to sharding on Host rather than
+// erroring or panicking.
+func TestEnqueueHostShardFallsBackToHostOnMalformedURL(t *testing.T) {
+	f := newTestFrontier(t)
+
+	item := &store.FrontierItem{
+		Kind:     store.KindArtifactFetch,
+		Host:     "example.com",
+		URL:      "://not a valid url", // malformed: url.Parse returns an error
+		DedupKey: "artifact:malformed",
+	}
+	if _, err := f.Enqueue(item); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if want := hostShard("example.com"); item.HostShard != want {
+		t.Fatalf("HostShard = %d, want %d (fallback to Host on malformed URL)", item.HostShard, want)
+	}
+}
+
 func TestDequeueMarksInFlight(t *testing.T) {
 	f := newTestFrontier(t)
 
@@ -906,6 +975,68 @@ func TestDequeueShardFilterPartitionsByHost(t *testing.T) {
 	}
 	if len(batchAll) != len(hosts) {
 		t.Fatalf("count=1 worker dequeued %d items, want all %d", len(batchAll), len(hosts))
+	}
+}
+
+// TestDequeueShardFilterPartitionsForeignHostByURL verifies that a foreign
+// -host item — one whose Host is set to the parent catalog's host for
+// attribution but whose URL points at a different host entirely, as entry
+// follow-ups (catalog_fetch/artifact_fetch/registry_harvest) do — is only
+// ever dequeued by the worker owning the URL's host shard, not the worker
+// owning Host's shard. This is the regression test for the bug where
+// HostShard was computed from Host and could route a foreign-host fetch to
+// the wrong worker, breaking the one-worker-per-host guarantee.
+func TestDequeueShardFilterPartitionsForeignHostByURL(t *testing.T) {
+	s, err := store.Open("sqlite", "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	const (
+		parentHost = "parent.example"
+		urlHost    = "assets.cdn1.io"
+	)
+	parentShard := hostShard(parentHost) % 2
+	urlShard := hostShard(urlHost) % 2
+	if parentShard == urlShard {
+		t.Fatalf("test fixture invalid: %s and %s fall in the same shard (%d); pick different hosts", parentHost, urlHost, parentShard)
+	}
+
+	seed := New(s.DB)
+	item := &store.FrontierItem{
+		Kind:     store.KindArtifactFetch,
+		Host:     parentHost,
+		URL:      "https://" + urlHost + "/a.json",
+		DedupKey: "artifact:https://" + urlHost + "/a.json",
+	}
+	if _, err := seed.Enqueue(item); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	ownerIdx := urlShard // the worker whose index matches the URL host's shard parity
+	otherIdx := parentShard
+
+	owner := New(s.DB, WithWorkerShard(ownerIdx, 2))
+	other := New(s.DB, WithWorkerShard(otherIdx, 2))
+
+	otherBatch, err := other.Dequeue(10)
+	if err != nil {
+		t.Fatalf("other Dequeue: %v", err)
+	}
+	if len(otherBatch) != 0 {
+		t.Fatalf("worker owning parent host's shard dequeued %d items, want 0 (item belongs to URL host's shard)", len(otherBatch))
+	}
+
+	ownerBatch, err := owner.Dequeue(10)
+	if err != nil {
+		t.Fatalf("owner Dequeue: %v", err)
+	}
+	if len(ownerBatch) != 1 {
+		t.Fatalf("worker owning URL host's shard dequeued %d items, want 1", len(ownerBatch))
+	}
+	if ownerBatch[0].DedupKey != item.DedupKey {
+		t.Fatalf("owner dequeued unexpected item %+v", ownerBatch[0])
 	}
 }
 

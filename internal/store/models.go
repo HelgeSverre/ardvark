@@ -150,15 +150,23 @@ type FrontierItem struct {
 	LastError string `gorm:"type:text"`
 	DedupKey  string `gorm:"uniqueIndex;size:512"`
 
-	// HostShard is fnv32a(Host) % HostShardCount, computed once at enqueue
-	// time (see internal/frontier.Enqueue). It partitions the frontier by
-	// host for distributed crawling: N worker processes each configured
-	// with a distinct crawler.worker.index (0..count-1) can restrict
-	// Dequeue to "host_shard % count = index", so every host is owned by
-	// exactly one worker for the crawl's lifetime. This is what makes
-	// per-process politeness (internal/fetch's in-memory rate limiter)
-	// correct without any cross-process coordination — see internal/fetch's
-	// package doc.
+	// HostShard is fnv32a(fetchHost) % HostShardCount, computed once at
+	// enqueue time (see internal/frontier.Enqueue), where fetchHost is the
+	// hostname of URL when URL is non-empty and parses, or Host otherwise.
+	// It must be derived from the host that will actually be dialed, not
+	// from Host: entry follow-ups (catalog_fetch/artifact_fetch/
+	// registry_harvest built from an entry or ref URL) set Host to the
+	// *parent* catalog's host for attribution purposes even when URL points
+	// at a completely different host (e.g. an artifact hosted on a CDN
+	// domain), so using Host for sharding would route the HTTP request to a
+	// worker that does not own that foreign host. HostShard partitions the
+	// frontier by fetch-target host for distributed crawling: N worker
+	// processes each configured with a distinct crawler.worker.index
+	// (0..count-1) can restrict Dequeue to "host_shard % count = index", so
+	// every host is owned by exactly one worker for the crawl's lifetime.
+	// This is what makes per-process politeness (internal/fetch's in-memory
+	// rate limiter) correct without any cross-process coordination — see
+	// internal/fetch's package doc.
 	HostShard int `gorm:"index"`
 
 	// -- Provenance columns -------------------------------------------------
