@@ -25,6 +25,7 @@ var rootCmd = &cobra.Command{
 	Long:          "ardvark discovers Agentic Resource Discovery (ARD) ai-catalog.json documents on the web, verifies them against the spec, and records every discovered agentic resource to a database and a JSONL event log.",
 	SilenceUsage:  true,
 	SilenceErrors: true,
+	Version:       version,
 }
 
 func init() {

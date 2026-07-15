@@ -66,12 +66,32 @@
         "pageLimit": { "type": "integer", "minimum": 1 }
       }
     },
-    "ctSeed": {
+    "seed": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "logUrl": { "type": "string", "format": "uri", "minLength": 1 },
-        "entryCount": { "type": "integer", "minimum": 1 }
+        "ct": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "logUrl": { "type": "string", "format": "uri", "minLength": 1 },
+            "entryCount": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "crtsh": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "endpoint": { "type": "string", "format": "uri", "minLength": 1 }
+          }
+        },
+        "tranco": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "listUrl": { "type": "string", "format": "uri", "minLength": 1 }
+          }
+        }
       }
     }
   }

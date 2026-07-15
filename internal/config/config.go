@@ -1,7 +1,7 @@
 // Package config loads and validates the ardvark.json configuration file:
 // storage, logging, crawler politeness, ARD verification depth, registry
-// harvesting, and Certificate Transparency seeding settings. All keys are
-// optional; missing values fall back to documented defaults.
+// harvesting, and pluggable seed-source settings (CT logs, crt.sh, Tranco).
+// All keys are optional; missing values fall back to documented defaults.
 package config
 
 import (
@@ -25,7 +25,7 @@ type Config struct {
 	Crawler  CrawlerConfig  `json:"crawler"`
 	ARD      ARDConfig      `json:"ard"`
 	Registry RegistryConfig `json:"registry"`
-	CTSeed   CTSeedConfig   `json:"ctSeed"`
+	Seed     SeedConfig     `json:"seed"`
 }
 
 // StorageConfig selects the database backend.
@@ -66,10 +66,30 @@ type RegistryConfig struct {
 	PageLimit        int  `json:"pageLimit"`
 }
 
-// CTSeedConfig controls Certificate Transparency log seeding.
+// SeedConfig groups settings for every pluggable seed source under
+// internal/seed (see the design doc's "Seeding" section).
+type SeedConfig struct {
+	CT     CTSeedConfig     `json:"ct"`
+	Crtsh  CrtshSeedConfig  `json:"crtsh"`
+	Tranco TrancoSeedConfig `json:"tranco"`
+}
+
+// CTSeedConfig controls Certificate Transparency log seeding
+// (`ardvark seed ct`).
 type CTSeedConfig struct {
 	LogURL     string `json:"logUrl"`
 	EntryCount int    `json:"entryCount"`
+}
+
+// CrtshSeedConfig controls crt.sh seeding (`ardvark seed crtsh`).
+type CrtshSeedConfig struct {
+	Endpoint string `json:"endpoint"`
+}
+
+// TrancoSeedConfig controls Tranco top-domains list seeding
+// (`ardvark seed tranco`).
+type TrancoSeedConfig struct {
+	ListURL string `json:"listUrl"`
 }
 
 // Defaults returns a Config populated with the documented defaults from the
@@ -104,9 +124,17 @@ func Defaults() Config {
 			MaxReferralDepth: 2,
 			PageLimit:        20,
 		},
-		CTSeed: CTSeedConfig{
-			LogURL:     "https://oak.ct.letsencrypt.org/2026h2/",
-			EntryCount: 1000,
+		Seed: SeedConfig{
+			CT: CTSeedConfig{
+				LogURL:     "https://oak.ct.letsencrypt.org/2026h2/",
+				EntryCount: 1000,
+			},
+			Crtsh: CrtshSeedConfig{
+				Endpoint: "https://crt.sh",
+			},
+			Tranco: TrancoSeedConfig{
+				ListURL: "https://tranco-list.eu/top-1m.csv.zip",
+			},
 		},
 	}
 }

@@ -73,6 +73,8 @@ ardvark export --format jsonl --out resources.jsonl
 | `ardvark crawl [url\|domain]... [--list file] [--force]` | Seed the frontier and run the crawler until the queue is empty. Resumes pending work from earlier runs. |
 | `ardvark probe <host>...` | Probe specific hosts for ARD documents, no crawling. |
 | `ardvark seed ct [--count N] [--log URL]` | Pull the latest N entries from a Certificate Transparency log (default: Let's Encrypt Oak), extract domains, enqueue probes. |
+| `ardvark seed crtsh [--count N] [--match keyword]` | Query crt.sh's JSON API for recent certificates (optionally narrowed to identities mentioning `--match`), extract domains, enqueue probes. |
+| `ardvark seed tranco [--top N] [--url URL]` | Download the Tranco top-domains list and enqueue the top N. |
 | `ardvark verify <path\|url>` | Verify one catalog — local file or remote URL — and print the check report. Exits 1 if invalid. `--stored` re-verifies everything in the database. |
 | `ardvark export [--format jsonl\|csv] [--out file]` | Dump discovered resources with their verification status. |
 | `ardvark stats` | Summarize the dataset: hosts probed, catalogs by verdict, entries by type. |
@@ -99,7 +101,11 @@ ardvark runs with sensible defaults and no config file. To change anything, drop
   },
   "ard":      { "maxCatalogDepth": 3, "fetchArtifacts": true },
   "registry": { "harvest": true, "maxReferralDepth": 2, "pageLimit": 20 },
-  "ctSeed":   { "logUrl": "https://oak.ct.letsencrypt.org/2026h2/", "entryCount": 1000 }
+  "seed": {
+    "ct":     { "logUrl": "https://oak.ct.letsencrypt.org/2026h2/", "entryCount": 1000 },
+    "crtsh":  { "endpoint": "https://crt.sh" },
+    "tranco": { "listUrl": "https://tranco-list.eu/top-1m.csv.zip" }
+  }
 }
 ```
 

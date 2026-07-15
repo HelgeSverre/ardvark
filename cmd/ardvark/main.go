@@ -7,6 +7,10 @@ package main
 
 import "os"
 
+// version is stamped at build time by goreleaser via
+// -X main.version={{.Version}}. It stays "dev" for local `go build`/`go run`.
+var version = "dev"
+
 func main() {
 	if err := Execute(); err != nil {
 		os.Exit(1)

@@ -62,6 +62,12 @@ type Options struct {
 	// retries of transient failures (doubled per attempt, capped at 30s).
 	// Zero disables the sleep entirely, which is useful in tests.
 	BackoffBase time.Duration
+	// OnProbe, if non-nil, is invoked with a ProbeEvent for each per-host
+	// crawl result as it happens: a miss or error from a host probe, and a
+	// fetched catalog once it has been verified. It is called from worker
+	// goroutines, so the callback must be goroutine-safe. Nil disables
+	// progress reporting; the event log is unaffected either way.
+	OnProbe func(ProbeEvent)
 }
 
 // Engine drains the frontier with a bounded worker pool, dispatching each
@@ -81,6 +87,11 @@ type Engine struct {
 	parentCatalogByURL map[string]uint
 	artifactEntryByURL map[string]uint
 	registryCtxByURL   map[string]registryContext
+	// catalogMethodByURL remembers which probe method (well_known,
+	// robots_agentmap, link_tag) discovered each enqueued catalog URL, so
+	// the verified-catalog ProbeEvent can report it. Same in-memory
+	// provenance caveat as the maps above.
+	catalogMethodByURL map[string]string
 
 	// pagesMu guards pageCounts, an in-memory approximation of "pages
 	// fetched so far per domain" used to enforce maxPagesPerDomain without
@@ -112,6 +123,7 @@ func New(cfg config.Config, st *store.Store, fr *frontier.Frontier, fetchClient 
 		parentCatalogByURL: make(map[string]uint),
 		artifactEntryByURL: make(map[string]uint),
 		registryCtxByURL:   make(map[string]registryContext),
+		catalogMethodByURL: make(map[string]string),
 		pageCounts:         make(map[string]int),
 	}
 }
@@ -338,6 +350,18 @@ func (e *Engine) artifactEntry(url string) uint {
 	e.provMu.Lock()
 	defer e.provMu.Unlock()
 	return e.artifactEntryByURL[url]
+}
+
+func (e *Engine) setCatalogMethod(url, method string) {
+	e.provMu.Lock()
+	defer e.provMu.Unlock()
+	e.catalogMethodByURL[url] = method
+}
+
+func (e *Engine) catalogMethodFor(url string) string {
+	e.provMu.Lock()
+	defer e.provMu.Unlock()
+	return e.catalogMethodByURL[url]
 }
 
 func (e *Engine) setRegistryContext(url string, entryID, catalogID, regRowID uint) {

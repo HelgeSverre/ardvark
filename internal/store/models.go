@@ -32,6 +32,8 @@ const (
 	DiscoverySourceCatalogRef       = "catalog_ref"
 	DiscoverySourceRegistryReferral = "registry_referral"
 	DiscoverySourceCTLog            = "ct_log"
+	DiscoverySourceCrtsh            = "crtsh"
+	DiscoverySourceTranco           = "tranco"
 )
 
 // Domain ARD status.

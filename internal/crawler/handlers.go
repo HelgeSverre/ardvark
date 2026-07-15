@@ -92,6 +92,7 @@ func (e *Engine) handlePageFetch(ctx context.Context, item store.FrontierItem) e
 		}); err != nil {
 			e.logger.Warn("crawler: failed to record link_tag probe", "url", hintURL, "error", err)
 		}
+		e.setCatalogMethod(hintURL, store.ProbeMethodLinkTag)
 		if _, err := e.frontier.Enqueue(&store.FrontierItem{
 			RunID:    e.opts.RunID,
 			Kind:     store.KindCatalogFetch,
@@ -168,10 +169,12 @@ func (e *Engine) handleHostProbe(ctx context.Context, item store.FrontierItem) e
 		}
 
 		if r.Outcome != probe.OutcomeHit {
+			e.emit(ProbeEvent{Host: item.Host, Method: r.Method, Outcome: r.Outcome, Detail: probeDetail(r)})
 			continue
 		}
 		hadHit = true
 		for _, catalogURL := range r.CatalogURLs {
+			e.setCatalogMethod(catalogURL, r.Method)
 			if _, err := e.frontier.Enqueue(&store.FrontierItem{
 				RunID:    e.opts.RunID,
 				Kind:     store.KindCatalogFetch,
@@ -238,6 +241,13 @@ func (e *Engine) processCatalog(ctx context.Context, raw []byte, contentHash, ho
 	if !e.opts.Force {
 		if prior, err := e.store.LatestCatalogBySource(domain.ID, sourceURL); err == nil && prior.ContentHash == contentHash {
 			e.logger.Debug("crawler: catalog unchanged since last fetch, skipping re-save", "url", sourceURL, "host", host)
+			e.emit(ProbeEvent{
+				Host:    host,
+				Method:  e.catalogMethodFor(sourceURL),
+				Outcome: probe.OutcomeHit,
+				Verdict: prior.VerificationStatus,
+				Detail:  "unchanged",
+			})
 			return nil
 		}
 	}
@@ -271,6 +281,7 @@ func (e *Engine) processCatalog(ctx context.Context, raw []byte, contentHash, ho
 	}
 
 	e.logger.Info("crawler: catalog verified", "url", sourceURL, "host", host, "verdict", report.Verdict, "entries", len(parsed.Entries))
+	e.emit(catalogEvent(host, e.catalogMethodFor(sourceURL), report, len(parsed.Entries)))
 
 	if depth >= e.maxCatalogDepth() {
 		return nil

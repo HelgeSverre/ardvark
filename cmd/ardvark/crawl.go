@@ -7,14 +7,18 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/helgesverre/ardvark/internal/ard"
 	"github.com/helgesverre/ardvark/internal/crawler"
 	"github.com/helgesverre/ardvark/internal/frontier"
+	"github.com/helgesverre/ardvark/internal/probe"
 	"github.com/helgesverre/ardvark/internal/store"
+	"github.com/helgesverre/ardvark/internal/ui"
 )
 
 var (
@@ -69,15 +73,24 @@ func runCrawl(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	p := printer(cmd)
+
 	fr := frontier.New(st.DB)
 	fc := newFetchClient(cfg)
+	// The engine's worker pool fires OnProbe from multiple goroutines, and
+	// ui.Printer is not goroutine-safe, so serialize the row writes.
+	var rowMu sync.Mutex
 	eng := crawler.New(cfg, st, fr, fc, logger, crawler.Options{
 		RunID:       run.ID,
 		Force:       crawlForce,
 		BackoffBase: time.Second,
+		OnProbe: func(ev crawler.ProbeEvent) {
+			rowMu.Lock()
+			defer rowMu.Unlock()
+			status, result, extra := probeRow(ev)
+			p.Row(status, ev.Host, ev.Method, result, extra)
+		},
 	})
-
-	p := printer(cmd)
 
 	seeded := 0
 	for _, s := range seeds {
@@ -115,6 +128,31 @@ func runCrawl(cmd *cobra.Command, args []string) error {
 		fmt.Sprintf("%d errors", errCount),
 	)
 	return nil
+}
+
+// probeRow maps a live crawler.ProbeEvent onto the status, result, and
+// extra columns of a ui.Printer row, matching the canonical demo output:
+//
+//	hit   acme.com            well-known       catalog valid          14 entries
+//	hit   tools.example.dev   robots_agentmap  valid_with_warnings    queries.count
+//	miss  blog.someone.net    well-known       404
+//	hit   broken.startup.ai   well-known       invalid                urn.format ×3
+func probeRow(ev crawler.ProbeEvent) (status ui.Status, result, extra string) {
+	switch ev.Outcome {
+	case probe.OutcomeHit:
+		switch ev.Verdict {
+		case ard.VerdictValidWithWarnings:
+			return ui.StatusWarnHit, ev.Verdict, ev.Detail
+		case ard.VerdictInvalid:
+			return ui.StatusInvalid, ev.Verdict, ev.Detail
+		default:
+			return ui.StatusHit, "catalog valid", ev.Detail
+		}
+	case probe.OutcomeMiss:
+		return ui.StatusMiss, ev.Detail, ""
+	default:
+		return ui.StatusError, ev.Detail, ""
+	}
 }
 
 // collectSeeds merges positional seed arguments with lines from a --list

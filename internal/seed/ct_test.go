@@ -1,4 +1,4 @@
-package ctseed
+package seed
 
 import (
 	"context"
@@ -83,7 +83,7 @@ func (f *ctLogFixture) server() *httptest.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ct/v1/get-sth", func(w http.ResponseWriter, r *http.Request) {
 		f.requests = append(f.requests, r.URL.String())
-		_ = json.NewEncoder(w).Encode(getSTHResponse{TreeSize: int64(len(f.entries))})
+		_ = json.NewEncoder(w).Encode(ctGetSTHResponse{TreeSize: int64(len(f.entries))})
 	})
 	mux.HandleFunc("/ct/v1/get-entries", func(w http.ResponseWriter, r *http.Request) {
 		f.requests = append(f.requests, r.URL.String())
@@ -92,7 +92,7 @@ func (f *ctLogFixture) server() *httptest.Server {
 		fmt.Sscanf(r.URL.Query().Get("end"), "%d", &end)
 
 		if start < 0 || start >= int64(len(f.entries)) || end < start {
-			_ = json.NewEncoder(w).Encode(getEntriesResponse{})
+			_ = json.NewEncoder(w).Encode(ctGetEntriesResponse{})
 			return
 		}
 		if end >= int64(len(f.entries)) {
@@ -104,12 +104,12 @@ func (f *ctLogFixture) server() *httptest.Server {
 			count = int64(f.pageCap)
 		}
 		out := f.entries[start : start+count]
-		_ = json.NewEncoder(w).Encode(getEntriesResponse{Entries: out})
+		_ = json.NewEncoder(w).Encode(ctGetEntriesResponse{Entries: out})
 	})
 	return httptest.NewServer(mux)
 }
 
-func TestFetchLatest_SinglePage(t *testing.T) {
+func TestCTSeederDomains_SinglePage(t *testing.T) {
 	entries := []ct.LeafEntry{
 		makeLeafEntry(t, "one.example.com", []string{"one.example.com"}),
 		makeLeafEntry(t, "two.example.com", []string{"two.example.com", "*.two.example.com"}),
@@ -119,10 +119,10 @@ func TestFetchLatest_SinglePage(t *testing.T) {
 	srv := fixture.server()
 	defer srv.Close()
 
-	client := &Client{LogURL: srv.URL}
-	names, err := client.FetchLatest(context.Background(), 3)
+	seeder := &CTSeeder{LogURL: srv.URL}
+	names, err := seeder.Domains(context.Background(), 3)
 	if err != nil {
-		t.Fatalf("FetchLatest: %v", err)
+		t.Fatalf("Domains: %v", err)
 	}
 
 	want := map[string]bool{"one.example.com": true, "two.example.com": true, "three.example.com": true}
@@ -134,9 +134,13 @@ func TestFetchLatest_SinglePage(t *testing.T) {
 			t.Errorf("unexpected domain %q", n)
 		}
 	}
+
+	if seeder.Source() != "ct_log" {
+		t.Errorf("Source() = %q, want ct_log", seeder.Source())
+	}
 }
 
-func TestFetchLatest_PaginationWithServerTruncation(t *testing.T) {
+func TestCTSeederDomains_PaginationWithServerTruncation(t *testing.T) {
 	const total = 10
 	entries := make([]ct.LeafEntry, total)
 	for i := 0; i < total; i++ {
@@ -150,10 +154,10 @@ func TestFetchLatest_PaginationWithServerTruncation(t *testing.T) {
 	srv := fixture.server()
 	defer srv.Close()
 
-	client := &Client{LogURL: srv.URL, EntriesPerPage: 7}
-	names, err := client.FetchLatest(context.Background(), 8)
+	seeder := &CTSeeder{LogURL: srv.URL, EntriesPerPage: 7}
+	names, err := seeder.Domains(context.Background(), 8)
 	if err != nil {
-		t.Fatalf("FetchLatest: %v", err)
+		t.Fatalf("Domains: %v", err)
 	}
 
 	if len(names) != 8 {
@@ -178,7 +182,7 @@ func TestFetchLatest_PaginationWithServerTruncation(t *testing.T) {
 	}
 }
 
-func TestFetchLatest_FewerEntriesThanRequested(t *testing.T) {
+func TestCTSeederDomains_FewerEntriesThanRequested(t *testing.T) {
 	entries := []ct.LeafEntry{
 		makeLeafEntry(t, "only.example.com", []string{"only.example.com"}),
 	}
@@ -186,106 +190,23 @@ func TestFetchLatest_FewerEntriesThanRequested(t *testing.T) {
 	srv := fixture.server()
 	defer srv.Close()
 
-	client := &Client{LogURL: srv.URL}
-	names, err := client.FetchLatest(context.Background(), 100)
+	seeder := &CTSeeder{LogURL: srv.URL}
+	names, err := seeder.Domains(context.Background(), 100)
 	if err != nil {
-		t.Fatalf("FetchLatest: %v", err)
+		t.Fatalf("Domains: %v", err)
 	}
 	if len(names) != 1 || names[0] != "only.example.com" {
 		t.Fatalf("got %v, want [only.example.com]", names)
 	}
 }
 
-func TestFetchLatest_RejectsNonPositiveN(t *testing.T) {
-	client := &Client{LogURL: "http://example.invalid"}
-	if _, err := client.FetchLatest(context.Background(), 0); err == nil {
+func TestCTSeederDomains_RejectsNonPositiveN(t *testing.T) {
+	seeder := &CTSeeder{LogURL: "http://example.invalid"}
+	if _, err := seeder.Domains(context.Background(), 0); err == nil {
 		t.Fatal("expected error for n=0")
 	}
-	if _, err := client.FetchLatest(context.Background(), -1); err == nil {
+	if _, err := seeder.Domains(context.Background(), -1); err == nil {
 		t.Fatal("expected error for negative n")
-	}
-}
-
-func TestSanitize(t *testing.T) {
-	tests := []struct {
-		name  string
-		input []string
-		want  []string
-	}{
-		{
-			name:  "strips wildcard prefix",
-			input: []string{"*.example.com"},
-			want:  []string{"example.com"},
-		},
-		{
-			name:  "lowercases",
-			input: []string{"WWW.Example.COM"},
-			want:  []string{"www.example.com"},
-		},
-		{
-			name:  "drops IPv4 addresses",
-			input: []string{"192.168.1.1"},
-			want:  []string{},
-		},
-		{
-			name:  "drops IPv6 addresses",
-			input: []string{"2001:db8::1"},
-			want:  []string{},
-		},
-		{
-			name:  "drops names without a dot",
-			input: []string{"localhost"},
-			want:  []string{},
-		},
-		{
-			name:  "drops names with invalid characters",
-			input: []string{"exa mple.com", "foo_bar.com/path"},
-			want:  []string{},
-		},
-		{
-			name:  "dedupes preserving first-seen order",
-			input: []string{"b.example.com", "a.example.com", "b.example.com"},
-			want:  []string{"b.example.com", "a.example.com"},
-		},
-		{
-			name:  "dedupes after normalization",
-			input: []string{"*.Example.com", "example.com", "EXAMPLE.COM"},
-			want:  []string{"example.com"},
-		},
-		{
-			name:  "trims trailing dot",
-			input: []string{"example.com."},
-			want:  []string{"example.com"},
-		},
-		{
-			name:  "allows hyphenated labels",
-			input: []string{"my-app.example.com"},
-			want:  []string{"my-app.example.com"},
-		},
-		{
-			name:  "drops labels starting or ending with hyphen",
-			input: []string{"-foo.example.com", "foo-.example.com"},
-			want:  []string{},
-		},
-		{
-			name:  "empty input",
-			input: nil,
-			want:  []string{},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := Sanitize(tt.input)
-			if len(got) != len(tt.want) {
-				t.Fatalf("Sanitize(%v) = %v, want %v", tt.input, got, tt.want)
-			}
-			for i := range got {
-				if got[i] != tt.want[i] {
-					t.Fatalf("Sanitize(%v) = %v, want %v", tt.input, got, tt.want)
-				}
-			}
-		})
 	}
 }
 

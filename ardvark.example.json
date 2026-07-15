@@ -27,8 +27,16 @@
     "maxReferralDepth": 2,
     "pageLimit": 20
   },
-  "ctSeed": {
-    "logUrl": "https://oak.ct.letsencrypt.org/2026h2/",
-    "entryCount": 1000
+  "seed": {
+    "ct": {
+      "logUrl": "https://oak.ct.letsencrypt.org/2026h2/",
+      "entryCount": 1000
+    },
+    "crtsh": {
+      "endpoint": "https://crt.sh"
+    },
+    "tranco": {
+      "listUrl": "https://tranco-list.eu/top-1m.csv.zip"
+    }
   }
 }
