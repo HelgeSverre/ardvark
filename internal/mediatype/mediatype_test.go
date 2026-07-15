@@ -7,10 +7,10 @@ import (
 
 func TestParse_Fields(t *testing.T) {
 	tests := []struct {
-		in                        string
+		in                             string
 		wantType, wantBase, wantSuffix string
-		wantParams                map[string]string
-		wantFullType              string
+		wantParams                     map[string]string
+		wantFullType                   string
 	}{
 		{"application/ai-catalog+json", "application", "ai-catalog", "json", map[string]string{}, "application/ai-catalog"},
 		{"application/ai-registry", "application", "ai-registry", "", map[string]string{}, "application/ai-registry"},
