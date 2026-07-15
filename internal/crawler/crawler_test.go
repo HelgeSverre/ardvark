@@ -1391,3 +1391,34 @@ func TestHandlePageFetch_ReCrawlReactivatesCappedHostPages(t *testing.T) {
 		t.Fatalf("re-crawl must re-activate the capped host's done pages: want 3 pending, got %d", pending)
 	}
 }
+
+func TestEnqueueFollowups_UnsuffixedRegistryPointerIsFollowed(t *testing.T) {
+	mux := http.NewServeMux()
+	catalog := `{"specVersion":"1.0","host":{"displayName":"H"},"entries":[
+		{"identifier":"urn:air:example.com:registry:r","displayName":"R","type":"application/ai-registry","url":"https://registry.example/api"}
+	]}`
+	mux.HandleFunc("/reg.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/ai-catalog+json")
+		w.Write([]byte(catalog))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	host := strings.TrimPrefix(srv.URL, "http://")
+	item := store.FrontierItem{URL: srv.URL + "/reg.json", Host: host, Depth: 0}
+	if err := eng.handleCatalogFetch(context.Background(), item); err != nil {
+		t.Fatalf("handleCatalogFetch: %v", err)
+	}
+
+	var harvests int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ?", store.KindRegistryHarvest).Count(&harvests)
+	if harvests != 1 {
+		t.Fatalf("expected 1 registry_harvest for unsuffixed application/ai-registry, got %d", harvests)
+	}
+	var regRows int64
+	st.DB.Model(&store.Registry{}).Count(&regRows)
+	if regRows != 1 {
+		t.Fatalf("expected 1 registries row, got %d", regRows)
+	}
+}

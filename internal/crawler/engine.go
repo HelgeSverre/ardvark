@@ -64,13 +64,6 @@ const globalCountsCheckInterval = time.Second
 // legitimately in-flight item must not be reclaimed out from under it.
 const expiredLeaseReclaimInterval = 30 * time.Second
 
-// ARD entry media types the engine treats specially (see
-// processCatalog).
-const (
-	mediaTypeAICatalog  = "application/ai-catalog+json"
-	mediaTypeAIRegistry = "application/ai-registry+json"
-)
-
 // Options configures an Engine run.
 type Options struct {
 	// RunID associates enqueued frontier items and crawl_runs bookkeeping

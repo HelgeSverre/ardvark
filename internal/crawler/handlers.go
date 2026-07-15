@@ -14,6 +14,7 @@ import (
 	"github.com/helgesverre/ardvark/internal/ard"
 	"github.com/helgesverre/ardvark/internal/fetch"
 	"github.com/helgesverre/ardvark/internal/harvest"
+	"github.com/helgesverre/ardvark/internal/mediatype"
 	"github.com/helgesverre/ardvark/internal/probe"
 	"github.com/helgesverre/ardvark/internal/registry"
 	"github.com/helgesverre/ardvark/internal/store"
@@ -272,13 +273,14 @@ func (e *Engine) processCatalog(ctx context.Context, raw []byte, contentHash, ho
 func (e *Engine) enqueueEntryFollowups(ctx context.Context, cat *store.Catalog, entries []ard.Entry, host, sourceURL string, depth int) {
 	for i, en := range entries {
 		entryID := cat.Entries[i].ID
+		kind := mediatype.Parse(en.Type).Kind()
 
 		switch {
-		case en.Type == mediaTypeAICatalog && en.URL != "":
+		case kind == mediatype.KindCatalog && en.URL != "":
 			catID := cat.ID
 			e.enqueue(store.KindCatalogFetch, en.URL, host, depth+1, provenance{ParentCatalogID: &catID})
 
-		case en.Type == mediaTypeAICatalog && hasEmbeddedData(en.Data):
+		case kind == mediatype.KindCatalog && hasEmbeddedData(en.Data):
 			sum := sha256.Sum256(en.Data)
 			nestedSource := sourceURL + "#" + en.Identifier
 			catID := cat.ID
@@ -286,7 +288,7 @@ func (e *Engine) enqueueEntryFollowups(ctx context.Context, cat *store.Catalog, 
 				e.logger.Warn("crawler: failed to process embedded nested catalog", "identifier", en.Identifier, "error", err)
 			}
 
-		case en.Type == mediaTypeAIRegistry && en.URL != "" && e.cfg.Registry.Harvest:
+		case kind == mediatype.KindRegistry && en.URL != "" && e.cfg.Registry.Harvest:
 			regRow := &store.Registry{
 				EntryID:       entryID,
 				BaseURL:       en.URL,
