@@ -331,13 +331,10 @@ func (f *Frontier) enqueue(item *store.FrontierItem, maxRowsForHostKind int) (bo
 	// race and must not report success.
 	res := f.db.Model(&store.FrontierItem{}).
 		Where("id = ? AND status IN ?", existing.ID, []string{store.FrontierStatusDone, store.FrontierStatusFailed}).
-		Updates(map[string]any{
-			"status":       store.FrontierStatusPending,
-			"attempts":     0,
-			"last_error":   "",
-			"run_id":       item.RunID,
-			"leased_until": nil,
-			"worker_id":    "",
+		Updates(leaseReleaseUpdates(store.FrontierStatusPending, map[string]any{
+			"attempts":   0,
+			"last_error": "",
+			"run_id":     item.RunID,
 			// Adopt the re-enqueue's depth. Without this a reference cycle
 			// (e.g. two registries referring to each other) keeps re-activating
 			// a done item at its original shallow depth, so the depth guard
@@ -354,7 +351,7 @@ func (f *Frontier) enqueue(item *store.FrontierItem, maxRowsForHostKind int) (bo
 			"registry_catalog_id": item.RegistryCatalogID,
 			"registry_row_id":     item.RegistryRowID,
 			"probe_method":        item.ProbeMethod,
-		})
+		}))
 	if res.Error != nil {
 		return false, fmt.Errorf("frontier: re-enqueue: %w", res.Error)
 	}
@@ -364,6 +361,29 @@ func (f *Frontier) enqueue(item *store.FrontierItem, maxRowsForHostKind int) (bo
 		return false, nil
 	}
 	return true, nil
+}
+
+// leaseReleaseUpdates builds the GORM Updates() map for a mutation that
+// takes an item out of in_flight: it always clears leased_until and
+// worker_id (an item that is no longer in_flight must never keep looking
+// leased — a stale worker_id/leased_until pair left behind would make
+// ReclaimExpired think a peer still owns a row nobody is working on) and
+// sets status to newStatus. extra carries any additional columns the
+// specific caller also needs to set (e.g. Fail's attempts/last_error, or
+// enqueue's re-activation provenance columns); its keys must not collide
+// with status/leased_until/worker_id. Centralizing this here means the
+// "leaving in_flight always clears the lease" invariant has exactly one
+// place to change, instead of six near-identical map literals.
+func leaseReleaseUpdates(newStatus string, extra map[string]any) map[string]any {
+	updates := map[string]any{
+		"status":       newStatus,
+		"leased_until": nil,
+		"worker_id":    "",
+	}
+	for k, v := range extra {
+		updates[k] = v
+	}
+	return updates
 }
 
 // isUniqueConstraintErr reports whether err looks like a unique-constraint
@@ -490,11 +510,7 @@ func (f *Frontier) ownershipLost(id uint) error {
 func (f *Frontier) Requeue(id uint) error {
 	res := f.db.Model(&store.FrontierItem{}).
 		Where("id = ? AND status = ? AND worker_id = ?", id, store.FrontierStatusInFlight, f.workerID).
-		Updates(map[string]any{
-			"status":       store.FrontierStatusPending,
-			"leased_until": nil,
-			"worker_id":    "",
-		})
+		Updates(leaseReleaseUpdates(store.FrontierStatusPending, nil))
 	if res.Error != nil {
 		return fmt.Errorf("frontier: requeue %d: %w", id, res.Error)
 	}
@@ -516,11 +532,7 @@ func (f *Frontier) Requeue(id uint) error {
 func (f *Frontier) ReclaimInFlight() (int64, error) {
 	res := f.db.Model(&store.FrontierItem{}).
 		Where("status = ?", store.FrontierStatusInFlight).
-		Updates(map[string]any{
-			"status":       store.FrontierStatusPending,
-			"leased_until": nil,
-			"worker_id":    "",
-		})
+		Updates(leaseReleaseUpdates(store.FrontierStatusPending, nil))
 	if res.Error != nil {
 		return 0, fmt.Errorf("frontier: reclaim in-flight: %w", res.Error)
 	}
@@ -537,11 +549,7 @@ func (f *Frontier) ReclaimInFlight() (int64, error) {
 func (f *Frontier) ReclaimExpired() (int64, error) {
 	res := f.db.Model(&store.FrontierItem{}).
 		Where("status = ? AND leased_until < ?", store.FrontierStatusInFlight, time.Now()).
-		Updates(map[string]any{
-			"status":       store.FrontierStatusPending,
-			"leased_until": nil,
-			"worker_id":    "",
-		})
+		Updates(leaseReleaseUpdates(store.FrontierStatusPending, nil))
 	if res.Error != nil {
 		return 0, fmt.Errorf("frontier: reclaim expired: %w", res.Error)
 	}
@@ -558,11 +566,7 @@ func (f *Frontier) ReclaimExpired() (int64, error) {
 func (f *Frontier) Complete(id uint) error {
 	res := f.db.Model(&store.FrontierItem{}).
 		Where("id = ? AND status = ? AND worker_id = ?", id, store.FrontierStatusInFlight, f.workerID).
-		Updates(map[string]any{
-			"status":       store.FrontierStatusDone,
-			"leased_until": nil,
-			"worker_id":    "",
-		})
+		Updates(leaseReleaseUpdates(store.FrontierStatusDone, nil))
 	if res.Error != nil {
 		return fmt.Errorf("frontier: complete %d: %w", id, res.Error)
 	}
@@ -609,13 +613,10 @@ func (f *Frontier) Fail(id uint, cause error, maxAttempts int) (permanent bool, 
 
 	res := f.db.Model(&store.FrontierItem{}).
 		Where("id = ? AND status = ? AND worker_id = ?", id, store.FrontierStatusInFlight, f.workerID).
-		Updates(map[string]any{
-			"attempts":     attempts,
-			"last_error":   errMsg,
-			"status":       status,
-			"leased_until": nil,
-			"worker_id":    "",
-		})
+		Updates(leaseReleaseUpdates(status, map[string]any{
+			"attempts":   attempts,
+			"last_error": errMsg,
+		}))
 	if res.Error != nil {
 		return false, fmt.Errorf("frontier: fail %d: %w", id, res.Error)
 	}

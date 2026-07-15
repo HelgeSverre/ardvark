@@ -6,15 +6,12 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 
 	"github.com/spf13/cobra"
 
-	"github.com/helgesverre/ardvark/internal/crawler"
 	"github.com/helgesverre/ardvark/internal/frontier"
 	"github.com/helgesverre/ardvark/internal/jsonout"
-	"github.com/helgesverre/ardvark/internal/ui"
 )
 
 var (
@@ -87,18 +84,7 @@ func runWork(cmd *cobra.Command, args []string) error {
 	// suppressed; only the final run summary object is emitted.
 	var cb jsonout.CrawlCallbacks
 	if !jsonOut {
-		p := printer(cmd)
-		// The engine's worker pool fires OnProbe from multiple goroutines,
-		// and ui.Printer is not goroutine-safe, so serialize the row writes.
-		var rowMu sync.Mutex
-		cb = jsonout.CrawlCallbacks{
-			OnProbe: func(ev crawler.ProbeEvent) {
-				rowMu.Lock()
-				defer rowMu.Unlock()
-				status, result, extra := probeRow(ev)
-				p.Row(status, ev.Host, ev.Method, result, extra)
-			},
-		}
+		cb = crawlCallbacks(printer(cmd))
 	}
 
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
@@ -113,13 +99,7 @@ func runWork(cmd *cobra.Command, args []string) error {
 		return printJSON(cmd, res)
 	}
 
-	printer(cmd).Summary("run complete",
-		ui.Count(res.PagesFetched, "page fetched", "pages fetched"),
-		ui.Count(res.HostsProbed, "host probed", "hosts probed"),
-		ui.Count(res.CatalogsFound, "catalog found", "catalogs found"),
-		fmt.Sprintf("%d valid", res.CatalogsValid),
-		ui.Count(res.Errors, "error", "errors"),
-	)
+	printCrawlSummary(printer(cmd), res)
 	return nil
 }
 
