@@ -40,3 +40,57 @@ func TestParse_Fields(t *testing.T) {
 		}
 	}
 }
+
+func TestKindClassification(t *testing.T) {
+	tests := []struct {
+		in       string
+		wantKind Kind
+		pointer  bool
+		known    bool
+	}{
+		{"application/ai-catalog+json", KindCatalog, true, true},
+		{"application/ai-catalog", KindCatalog, true, true},
+		{"application/ai-registry+json", KindRegistry, true, true},
+		{"application/ai-registry", KindRegistry, true, true},
+		{"application/ai-skill", KindSkill, false, true},
+		{"application/ai-skill+md", KindSkill, false, true},
+		{"application/agent-skills+md", KindSkill, false, true},
+		{"application/agent-skills+gzip", KindSkill, false, true},
+		{"application/ai-skill-archive+gzip", KindSkill, false, true},
+		{`text/markdown; profile="urn:air:agent-skills"`, KindSkill, false, true},
+		{"application/mcp-server-card+json", KindMCPServer, false, true},
+		{"application/mcp-server+json", KindMCPServer, false, true},
+		{"application/a2a-agent-card+json", KindA2AAgent, false, true},
+		{"application/a2a-agent+json", KindA2AAgent, false, true},
+		{"application/json", KindGeneric, false, true},
+		{"application/vnd.oai.openapi", KindGeneric, false, true},
+		{"application/linkset+json", KindGeneric, false, true},
+		{"text/markdown", KindGeneric, false, true},
+		{"text/plain", KindGeneric, false, true},
+		{"text/html", KindGeneric, false, true},
+		{"application/octet-stream", KindUnknown, false, false},
+		{"garbage", KindUnknown, false, false},
+		{"", KindUnknown, false, false},
+	}
+	for _, tt := range tests {
+		m := Parse(tt.in)
+		if got := m.Kind(); got != tt.wantKind {
+			t.Errorf("Parse(%q).Kind() = %v, want %v", tt.in, got, tt.wantKind)
+		}
+		if got := m.IsPointer(); got != tt.pointer {
+			t.Errorf("Parse(%q).IsPointer() = %v, want %v", tt.in, got, tt.pointer)
+		}
+		if got := m.IsKnown(); got != tt.known {
+			t.Errorf("Parse(%q).IsKnown() = %v, want %v", tt.in, got, tt.known)
+		}
+	}
+}
+
+func TestProfile(t *testing.T) {
+	if got := Parse(`text/markdown; profile="urn:air:agent-skills"`).Profile(); got != "urn:air:agent-skills" {
+		t.Errorf("Profile() = %q, want urn:air:agent-skills", got)
+	}
+	if got := Parse("application/ai-skill").Profile(); got != "" {
+		t.Errorf("Profile() = %q, want empty", got)
+	}
+}

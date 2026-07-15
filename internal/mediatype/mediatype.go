@@ -55,3 +55,84 @@ func Parse(s string) MediaType {
 func (m MediaType) FullType() string {
 	return m.Type + "/" + m.Base
 }
+
+// Kind is the semantic category of a media type — what the resource is,
+// independent of how it's serialized.
+type Kind int
+
+const (
+	KindUnknown   Kind = iota
+	KindCatalog        // application/ai-catalog[...]  — pointer to a nested catalog
+	KindRegistry       // application/ai-registry[...] — pointer to a registry endpoint
+	KindSkill          // ai-skill, agent-skills, ai-skill-archive
+	KindMCPServer      // mcp-server-card, mcp-server
+	KindA2AAgent       // a2a-agent-card, a2a-agent
+	KindGeneric        // recognized non-ARD artifact (openapi, linkset, json, markdown, …)
+)
+
+func (k Kind) String() string {
+	switch k {
+	case KindCatalog:
+		return "catalog"
+	case KindRegistry:
+		return "registry"
+	case KindSkill:
+		return "skill"
+	case KindMCPServer:
+		return "mcp-server"
+	case KindA2AAgent:
+		return "a2a-agent"
+	case KindGeneric:
+		return "generic"
+	default:
+		return "unknown"
+	}
+}
+
+// kindByFullType maps a normalized "type/base" to its Kind. Strict allowlist:
+// anything absent is KindUnknown. Adding a newly-observed base is a one-line
+// edit here.
+var kindByFullType = map[string]Kind{
+	"application/ai-skill":         KindSkill,
+	"application/agent-skills":     KindSkill,
+	"application/ai-skill-archive": KindSkill,
+	"application/mcp-server-card":  KindMCPServer,
+	"application/mcp-server":       KindMCPServer,
+	"application/a2a-agent-card":   KindA2AAgent,
+	"application/a2a-agent":        KindA2AAgent,
+	"application/ai-catalog":       KindCatalog,
+	"application/ai-registry":      KindRegistry,
+	"application/json":             KindGeneric,
+	"application/vnd.oai.openapi":  KindGeneric,
+	"application/linkset":          KindGeneric,
+	"text/markdown":                KindGeneric,
+	"text/plain":                   KindGeneric,
+	"text/html":                    KindGeneric,
+}
+
+// Kind classifies the media type. A profile parameter of "urn:air:agent-skills"
+// marks a skill regardless of the carrier type (e.g. text/markdown).
+func (m MediaType) Kind() Kind {
+	if m.Profile() == "urn:air:agent-skills" {
+		return KindSkill
+	}
+	return kindByFullType[m.FullType()]
+}
+
+// IsPointer reports whether the entry points at another ARD document to crawl
+// (a nested catalog or a registry endpoint).
+func (m MediaType) IsPointer() bool {
+	k := m.Kind()
+	return k == KindCatalog || k == KindRegistry
+}
+
+// IsKnown reports whether the media type classified to any recognized Kind
+// (KindGeneric counts as known).
+func (m MediaType) IsKnown() bool {
+	return m.Kind() != KindUnknown
+}
+
+// Profile returns the "profile" media-type parameter, or "".
+func (m MediaType) Profile() string {
+	return m.Params["profile"]
+}
