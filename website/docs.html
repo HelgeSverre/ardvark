@@ -69,7 +69,20 @@
       max-height: calc(100vh - 60px);
       overflow-y: auto;
       font-size: var(--text-sm);
+      scrollbar-width: thin;                                /* Firefox */
+      scrollbar-color: var(--n-300) transparent;
     }
+
+    /* Branded scrollbar (WebKit): thin sand-toned thumb that warms to
+       terracotta while in use, invisible track. */
+    .docs-sidebar::-webkit-scrollbar { width: 6px; }
+    .docs-sidebar::-webkit-scrollbar-track { background: transparent; }
+    .docs-sidebar::-webkit-scrollbar-thumb {
+      background: var(--n-300);
+      border-radius: 3px;
+    }
+    .docs-sidebar::-webkit-scrollbar-thumb:hover { background: var(--brand-peach); }
+    .docs-sidebar::-webkit-scrollbar-thumb:active { background: var(--brand-primary); }
 
     .docs-sidebar-inner .docs-home-side { margin-bottom: 20px; }
 
@@ -365,6 +378,7 @@
           <li><a href="#cmd-verify">verify</a></li>
           <li><a href="#cmd-export">export</a></li>
           <li><a href="#cmd-stats">stats</a></li>
+          <li><a href="#cmd-info">info</a></li>
           <li><a href="#cmd-migrate">migrate</a></li>
           <li><a href="#cmd-mcp">mcp</a></li>
         </ul>
@@ -729,7 +743,7 @@ ardvark verify https://example.com/.well-known/ai-catalog.json">copy</button>
 
       <article id="json-output">
         <h3>JSON output (--json)</h3>
-        <p><code>crawl</code>, <code>probe</code>, every <code>seed</code> source, <code>verify</code> (including <code>--stored</code>), and <code>stats</code> accept a <code>--json</code> flag: the command runs exactly as before but emits one pretty-printed JSON document on stdout instead of human-readable rows. <code>export</code> has no <code>--json</code> because its output is already machine-readable — pick JSONL or CSV with <code>--format</code>.</p>
+        <p><code>crawl</code>, <code>probe</code>, every <code>seed</code> source, <code>verify</code> (including <code>--stored</code>), <code>stats</code>, and <code>info</code> accept a <code>--json</code> flag: the command runs exactly as before but emits one pretty-printed JSON document on stdout instead of human-readable rows. <code>export</code> has no <code>--json</code> because its output is already machine-readable — pick JSONL or CSV with <code>--format</code>.</p>
         <ul>
           <li><b>stdout is the document</b> — live per-host rows are suppressed and diagnostics go to stderr, so piping stdout into <code>jq</code> is always safe.</li>
           <li><b>Exit codes are unchanged</b> — <code>verify --json</code> still exits 1 when the verdict is <code>invalid</code>. See <a href="#exit-codes">exit codes</a>.</li>
@@ -781,6 +795,7 @@ ardvark verify https://example.com/.well-known/ai-catalog.json">copy</button>
             <tr><td><code>ardvark_crawl</code></td><td><code>seeds</code>, <code>force</code> (both optional)</td><td>Seed the frontier, run the crawler until it's empty, and return the run summary. Pending work from prior runs is resumed automatically.</td></tr>
             <tr><td><code>ardvark_seed</code></td><td><code>source</code>, <code>count</code>, <code>offset</code></td><td>Bootstrap the frontier from <code>ct</code>, <code>crtsh</code>, <code>tranco</code>, <code>github</code> (needs <code>GITHUB_TOKEN</code>), <code>mcp</code>, <code>curated</code>, or <code>commoncrawl</code>.</td></tr>
             <tr><td><code>ardvark_stats</code></td><td>—</td><td>Summarize the indexed dataset. Read-only and fast — a good first call.</td></tr>
+            <tr><td><code>ardvark_info</code></td><td>—</td><td>Report installation metadata: version, resolved config path, storage backend (with absolute sqlite path, existence, size), and event log location. Read-only and instant; never opens the database or the network, so it works even when storage is misconfigured.</td></tr>
             <tr><td><code>ardvark_export</code></td><td><code>format</code>, <code>out</code></td><td>Dump every indexed entry to a file as JSONL or CSV and return the row count. Writes to a file, not stdout — stdout carries the protocol.</td></tr>
           </tbody>
         </table>
@@ -930,7 +945,7 @@ ardvark verify https://example.com/.well-known/ai-catalog.json">copy</button>
 
     <section id="commands">
       <h2>Commands</h2>
-      <p class="section-sub-docs">Every command accepts the global flags <code>--config &lt;path&gt;</code> (default: <code>./ardvark.json</code>, then <code>~/.config/ardvark/ardvark.json</code> on Unix/macOS or <code>%AppData%\ardvark\ardvark.json</code> on Windows) and <code>--color auto|always|never</code>. <code>crawl</code>, <code>probe</code>, every <code>seed</code> source, <code>verify</code>, and <code>stats</code> also accept <code>--json</code> — see <a href="#json-output">JSON output</a>.</p>
+      <p class="section-sub-docs">Every command accepts the global flags <code>--config &lt;path&gt;</code> (default: <code>./ardvark.json</code>, then <code>~/.config/ardvark/ardvark.json</code> on Unix/macOS or <code>%AppData%\ardvark\ardvark.json</code> on Windows) and <code>--color auto|always|never</code>. <code>crawl</code>, <code>probe</code>, every <code>seed</code> source, <code>verify</code>, <code>stats</code>, and <code>info</code> also accept <code>--json</code> — see <a href="#json-output">JSON output</a>.</p>
 
       <article id="cmd-crawl">
         <h3>crawl</h3>
@@ -1041,6 +1056,30 @@ ardvark verify https://example.com/.well-known/ai-catalog.json">copy</button>
   <span class="c-m">  application/mcp-server-card+json</span> 18
   <span class="c-m">  application/a2a-agent-card+json</span> 15
   <span class="c-m">  application/ai-skill+md</span>    8</pre>
+        </div>
+      </article>
+
+      <article id="cmd-info">
+        <h3>info</h3>
+        <p>Reports the running installation's metadata: binary version, the resolved config file path (and whether it exists — see <a href="#configuration">configuration</a> for the resolution order), the storage backend with the absolute sqlite database location and size, and the event log file. It never opens the database, so it works even when storage is misconfigured — a good first call when something looks off.</p>
+        <pre class="docs-synopsis">ardvark info [flags]</pre>
+        <div class="term docs-term">
+          <div class="term-bar"><span></span><span></span><span></span><span class="term-title">ardvark info</span></div>
+          <pre><span class="c-p">$</span> ardvark info
+ardvark
+<span class="c-m">  version</span>                      0.2.0
+config
+<span class="c-m">  path</span>                         /Users/you/ardvark.json
+<span class="c-m">  exists</span>                       false
+storage
+<span class="c-m">  driver</span>                       sqlite
+<span class="c-m">  dsn</span>                          ardvark.db
+<span class="c-m">  path</span>                         /Users/you/ardvark.db
+<span class="c-m">  exists</span>                       true
+<span class="c-m">  size</span>                         139264
+log
+<span class="c-m">  file</span>                         /Users/you/ardvark.jsonl
+<span class="c-m">  level</span>                        info</pre>
         </div>
       </article>
 
