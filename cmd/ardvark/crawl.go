@@ -95,11 +95,11 @@ func runCrawl(cmd *cobra.Command, args []string) error {
 	}
 
 	printer(cmd).Summary("run complete",
-		fmt.Sprintf("%d pages fetched", res.PagesFetched),
-		fmt.Sprintf("%d hosts probed", res.HostsProbed),
-		fmt.Sprintf("%d catalogs found", res.CatalogsFound),
+		ui.Count(res.PagesFetched, "page fetched", "pages fetched"),
+		ui.Count(res.HostsProbed, "host probed", "hosts probed"),
+		ui.Count(res.CatalogsFound, "catalog found", "catalogs found"),
 		fmt.Sprintf("%d valid", res.CatalogsValid),
-		fmt.Sprintf("%d errors", res.Errors),
+		ui.Count(res.Errors, "error", "errors"),
 	)
 	return nil
 }

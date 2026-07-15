@@ -85,6 +85,9 @@ func entriesLabel(n int) string {
 	if n == 1 {
 		return "1 entry"
 	}
+	if n == 1 {
+		return "1 entry"
+	}
 	return fmt.Sprintf("%d entries", n)
 }
 

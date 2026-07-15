@@ -161,6 +161,17 @@ func (p *Printer) Summary(label string, parts ...string) {
 	fmt.Fprintln(p.w, p.Paint(StyleMuted, label+": "+strings.Join(parts, " · ")))
 }
 
+// Count formats a count with the grammatically matching noun form, so
+// summaries read "1 hit" rather than "1 hits". Both forms are passed
+// explicitly because English pluralization isn't mechanical (miss/misses,
+// entry/entries).
+func Count(n int, singular, plural string) string {
+	if n == 1 {
+		return fmt.Sprintf("1 %s", singular)
+	}
+	return fmt.Sprintf("%d %s", n, plural)
+}
+
 // Check prints one verification check line for `ardvark verify`:
 //
 //	✓ catalog.spec_version

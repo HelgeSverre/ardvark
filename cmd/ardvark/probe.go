@@ -52,9 +52,9 @@ func runProbe(cmd *cobra.Command, args []string) error {
 	})
 
 	p.Summary("probe complete",
-		fmt.Sprintf("%d hits", report.Summary.Hits),
-		fmt.Sprintf("%d misses", report.Summary.Misses),
-		fmt.Sprintf("%d errors", report.Summary.Errors),
+		ui.Count(report.Summary.Hits, "hit", "hits"),
+		ui.Count(report.Summary.Misses, "miss", "misses"),
+		ui.Count(report.Summary.Errors, "error", "errors"),
 	)
 	return nil
 }

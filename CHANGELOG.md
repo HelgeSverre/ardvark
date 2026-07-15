@@ -27,6 +27,9 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Summary counts pluralize correctly** — `probe`, `crawl`, and `stats`
+  summaries now say "1 hit", "1 page fetched", "1 entry" instead of "1 hits",
+  "1 pages fetched", "1 entries".
 - **`verify` on local files** — the `urn.publisher_matches` check is now
   skipped when the catalog wasn't fetched from a host (a local file has no
   serving domain to compare against). Catalogs that previously rolled up as
