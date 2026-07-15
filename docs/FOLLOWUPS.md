@@ -34,12 +34,21 @@ review are already fixed; what remains is listed here.
 - ~~**Official MCP registry**.~~ Done: `ardvark seed mcp`. Public **A2A
   registries** remain open — no stable public registry endpoint identified
   yet; revisit when one exists.
-- **Curated lists** (`awesome-mcp-servers` and similar) — parse for candidate
-  domains. Still open.
+- ~~**Curated lists** (`awesome-mcp-servers` and similar) — parse for candidate
+  domains.~~ Done: `ardvark seed curated` scans the three largest
+  awesome-mcp-servers lists (or `--url` overrides), extracts every absolute
+  URL's host, and drops hosting/badge/social infrastructure
+  (`seed.CuratedInfraDomains`).
 - ~~**Tune CT/crt.sh matching toward `agent`/`mcp`/`ai` identities**.~~ Done:
   `DefaultCrtshMatches = agent/mcp/ai-catalog` curated set.
 - **Common Crawl columnar URL index** — find `/.well-known/ai-catalog.json`
-  across all crawled hosts. Heavy but exhaustive. Still open.
+  across all crawled hosts. Addressed differently: `ardvark seed commoncrawl`
+  ships the web-graph **domain-ranks** source (~121M ranked domains, streamed
+  with early stop), which covers "established web at Common Crawl scale".
+  True columnar path-search remains a batch job outside the crawler; the
+  DuckDB one-liner is
+  `SELECT url_host_registered_domain FROM read_parquet('s3://commoncrawl/cc-index/table/cc-main/warc/crawl=CC-MAIN-*/subset=warc/*.parquet') WHERE url_path = '/.well-known/ai-catalog.json'`
+  and its output can be fed to `ardvark crawl --list`.
 - ~~**CT `coversNow` shard selection**.~~ Done: shard resolution also
   considers the near-future shard window (`ctFreshCertWindow` in
   `internal/seed/ctloglist.go`) so freshly issued certs near shard boundaries

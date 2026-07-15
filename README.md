@@ -21,7 +21,7 @@ Publishers advertise their AI agents, MCP servers, and skills in an `ai-catalog.
 - **Every ARD discovery mechanism** — `/.well-known/ai-catalog.json`, `Agentmap:` directives in robots.txt, and `<link rel="ai-catalog">` tags
 - **Full catalog resolution** — recurses into nested catalogs, fetches referenced artifact documents (agent cards, MCP server cards), and harvests discovered registries via `POST /search`, including registry referrals
 - **Spec verification** — official JSON Schema plus seven semantic checks (URN grammar, value-or-reference exclusivity, query counts, …), each recorded pass/fail with a message
-- **Bootstrap seeding** — fill the frontier from Certificate Transparency logs, crt.sh, or the Tranco top list (`ardvark seed ct|crtsh|tranco`)
+- **Bootstrap seeding** — fill the frontier from Certificate Transparency logs, crt.sh, the Tranco top list, GitHub code search, the MCP registry, curated awesome-lists, or Common Crawl domain ranks (`ardvark seed ct|crtsh|tranco|github|mcp|curated|commoncrawl`)
 - **Swappable storage** — SQLite by default; MySQL and Postgres via one config key; append-only JSONL event log alongside
 - **Resumable runs** — the crawl queue lives in the database; kill a run, start it again, it picks up where it stopped
 - **Polite by default** — per-host rate limiting, robots.txt compliance, body-size caps, redirect caps, backoff on transient failures
@@ -77,6 +77,8 @@ ardvark export --format jsonl --out resources.jsonl
 | `ardvark seed tranco [--top N] [--url URL]` | Queue the top N domains from the Tranco list — the established web CT seeding misses. |
 | `ardvark seed github [--count N] [--query q]` | Search GitHub code search for well-known ARD catalog files and queue the owning repositories' domains. Highest-precision source — a hit is a real deployed catalog. Requires `GITHUB_TOKEN`. |
 | `ardvark seed mcp [--count N] [--registry URL]` | Harvest domains from the official MCP server registry: each server's remote endpoint host plus a domain decoded from its reverse-DNS-style name. |
+| `ardvark seed curated [--count N] [--url U]...` | Extract candidate domains from curated awesome-lists (community MCP server lists by default), dropping hosting/badge/social infrastructure so only real product domains remain. Repeated `--url` replaces the default list set. |
+| `ardvark seed commoncrawl [--top N] [--offset M] [--graph ID]` | Queue the top N domains from the latest Common Crawl web-graph domain ranks (~121M ranked domains vs Tranco's 1M). Streams the gzipped ranks file and stops reading as soon as N domains are collected; `--offset` skips the first M ranks to sample deeper slices. |
 | `ardvark verify <path\|url>` | Verify one catalog — local file or remote URL — and print the check report. Exits 1 if invalid. `--stored` re-verifies everything in the database. |
 | `ardvark export [--format jsonl\|csv] [--out file]` | Dump discovered resources with their verification status. |
 | `ardvark stats` | Summarize the dataset: hosts probed, catalogs by verdict, entries by type. |
@@ -108,7 +110,17 @@ ardvark runs with sensible defaults and no config file. To change anything, drop
     "crtsh":  { "endpoint": "https://crt.sh", "count": 1000 },
     "tranco": { "listUrl": "https://tranco-list.eu/top-1m.csv.zip", "top": 1000 },
     "github": { "query": "filename:ai-catalog.json path:.well-known", "count": 100 },
-    "mcp":    { "registryUrl": "https://registry.modelcontextprotocol.io", "count": 1000 }
+    "mcp":    { "registryUrl": "https://registry.modelcontextprotocol.io", "count": 1000 },
+    "curated": {
+      "urls": ["https://raw.githubusercontent.com/punkpeye/awesome-mcp-servers/main/README.md"],
+      "count": 500
+    },
+    "commoncrawl": {
+      "graphInfoUrl": "https://index.commoncrawl.org/graphinfo.json",
+      "graph": "",
+      "top": 1000,
+      "offset": 0
+    }
   }
 }
 ```
@@ -131,6 +143,11 @@ ardvark runs with sensible defaults and no config file. To change anything, drop
 | `seed.github.count` | `100` | Default `seed github` domain count |
 | `seed.mcp.registryUrl` | `https://registry.modelcontextprotocol.io` | MCP registry API base URL for `seed mcp` |
 | `seed.mcp.count` | `1000` | Default `seed mcp` domain count |
+| `seed.curated.urls` | three awesome-mcp-servers READMEs | List documents scanned by `seed curated` |
+| `seed.curated.count` | `500` | Default `seed curated` domain count |
+| `seed.commoncrawl.graph` | `""` (latest) | Common Crawl web-graph release id for `seed commoncrawl` |
+| `seed.commoncrawl.top` | `1000` | Default `seed commoncrawl` domain count |
+| `seed.commoncrawl.offset` | `0` | Ranked domains skipped before collecting |
 
 ## What gets stored
 

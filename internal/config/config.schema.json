@@ -110,6 +110,24 @@
             "registryUrl": { "type": "string", "format": "uri", "minLength": 1 },
             "count": { "type": "integer", "minimum": 1 }
           }
+        },
+        "curated": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "urls": { "type": "array", "items": { "type": "string", "format": "uri", "minLength": 1 } },
+            "count": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "commoncrawl": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "graphInfoUrl": { "type": "string", "format": "uri", "minLength": 1 },
+            "graph": { "type": "string" },
+            "top": { "type": "integer", "minimum": 1 },
+            "offset": { "type": "integer", "minimum": 0 }
+          }
         }
       }
     }

@@ -148,6 +148,32 @@ func TestLoadBytes_SeedSourceConfigParses(t *testing.T) {
 	}
 }
 
+func TestLoadBytes_CuratedAndCommonCrawlConfigParses(t *testing.T) {
+	cfg, err := LoadBytes([]byte(`{
+		"seed": {
+			"curated":     {"urls": ["https://example.com/list.md"], "count": 25},
+			"commoncrawl": {"graphInfoUrl": "https://example.com/graphinfo.json", "graph": "cc-test-2026", "top": 10, "offset": 5}
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("LoadBytes() unexpected error: %v", err)
+	}
+	if len(cfg.Seed.Curated.URLs) != 1 || cfg.Seed.Curated.URLs[0] != "https://example.com/list.md" {
+		t.Errorf("Seed.Curated.URLs = %v, want [https://example.com/list.md]", cfg.Seed.Curated.URLs)
+	}
+	if cfg.Seed.Curated.Count != 25 {
+		t.Errorf("Seed.Curated.Count = %d, want 25", cfg.Seed.Curated.Count)
+	}
+	cc := cfg.Seed.CommonCrawl
+	if cc.GraphInfoURL != "https://example.com/graphinfo.json" || cc.Graph != "cc-test-2026" || cc.Top != 10 || cc.Offset != 5 {
+		t.Errorf("Seed.CommonCrawl = %+v, want graphInfoUrl=https://example.com/graphinfo.json graph=cc-test-2026 top=10 offset=5", cc)
+	}
+	// Untouched sibling keys keep their defaults.
+	if cfg.Seed.Tranco.Top != Defaults().Seed.Tranco.Top {
+		t.Errorf("Seed.Tranco.Top = %d, want default %d", cfg.Seed.Tranco.Top, Defaults().Seed.Tranco.Top)
+	}
+}
+
 func TestDefaults_SeedSourcesHaveOwnCounts(t *testing.T) {
 	d := Defaults()
 	if d.Seed.Crtsh.Count <= 0 {
@@ -161,6 +187,12 @@ func TestDefaults_SeedSourcesHaveOwnCounts(t *testing.T) {
 	}
 	if d.Seed.MCPRegistry.Count <= 0 || d.Seed.MCPRegistry.RegistryURL == "" {
 		t.Errorf("Seed.MCPRegistry = %+v, want positive count and non-empty registry URL", d.Seed.MCPRegistry)
+	}
+	if d.Seed.Curated.Count <= 0 || len(d.Seed.Curated.URLs) == 0 {
+		t.Errorf("Seed.Curated = %+v, want positive count and non-empty URL set", d.Seed.Curated)
+	}
+	if d.Seed.CommonCrawl.Top <= 0 || d.Seed.CommonCrawl.GraphInfoURL == "" {
+		t.Errorf("Seed.CommonCrawl = %+v, want positive top and non-empty graphinfo URL", d.Seed.CommonCrawl)
 	}
 }
 

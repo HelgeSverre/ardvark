@@ -1,6 +1,7 @@
 // Package seed bootstraps the crawl frontier from external domain sources
 // when there is no seed list to start from: Certificate Transparency logs,
-// crt.sh, Tranco, GitHub code search, and the MCP server registry. Every
+// crt.sh, Tranco, GitHub code search, the MCP server registry, curated
+// awesome-lists, and Common Crawl web-graph domain ranks. Every
 // source implements the Seeder interface and shares the same tail:
 // sanitize domains (strip a leading "*.", lowercase, drop IPs and invalid
 // hostnames, dedupe), leaving the caller (cmd/ardvark's seed subcommands)
@@ -86,6 +87,28 @@ func fetchJSON(client *http.Client, req *http.Request, limitBytes int64, errBody
 		return fmt.Errorf("decoding response from %s: %w", req.URL, err)
 	}
 	return nil
+}
+
+// fetchBody runs req and returns up to limitBytes of the response body with
+// the same politeness as fetchJSON (context via the request, limit reader,
+// status check) but no JSON guard — for sources whose payloads are markdown
+// or plain text (curated awesome-lists). Errors are unprefixed; wrap with the
+// caller's own "seed: <source>: " prefix.
+func fetchBody(client *http.Client, req *http.Request, limitBytes int64) ([]byte, error) {
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request to %s: %w", req.URL, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limitBytes))
+	if err != nil {
+		return nil, fmt.Errorf("reading response from %s: %w", req.URL, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s returned status %d", req.URL, resp.StatusCode)
+	}
+	return body, nil
 }
 
 // ctOrUnknown renders a Content-Type header for an error message, stripping

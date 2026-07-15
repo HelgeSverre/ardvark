@@ -39,7 +39,24 @@ var (
 
 	seedMCPCount       int
 	seedMCPRegistryURL string
+
+	seedCuratedCount int
+	seedCuratedURLs  []string
+
+	seedCommonCrawlTop    int
+	seedCommonCrawlOffset int
+	seedCommonCrawlGraph  string
 )
+
+// orDefaultSlice returns flag when non-empty, else def — the slice-valued
+// counterpart of orDefault (a repeatable flag REPLACES the configured set,
+// it doesn't append to it).
+func orDefaultSlice[T any](flag, def []T) []T {
+	if len(flag) > 0 {
+		return flag
+	}
+	return def
+}
 
 // seedCmd is the parent command for pluggable seed sources.
 var seedCmd = &cobra.Command{
@@ -93,6 +110,27 @@ var seedMCPCmd = &cobra.Command{
 	RunE: runSeedMCP,
 }
 
+var seedCuratedCmd = &cobra.Command{
+	Use:   "curated",
+	Short: "Seed from curated awesome-list documents",
+	Long: "Fetch curated awesome-list documents (community-maintained MCP server lists by default), " +
+		"extract every absolute http(s) URL, and queue the unique domains for probing. Hosting, badge, " +
+		"and social infrastructure (github.com, shields.io, glama.ai, …) is dropped so the output is " +
+		"the real product domains the lists link to. --url replaces the default list set.",
+	RunE: runSeedCurated,
+}
+
+var seedCommonCrawlCmd = &cobra.Command{
+	Use:   "commoncrawl",
+	Short: "Seed from Common Crawl web-graph domain ranks",
+	Long: "Stream the domain-level ranks file of the latest Common Crawl web-graph release and queue " +
+		"the top N domains for probing, best harmonic-centrality rank first. Covers the established web " +
+		"at Common Crawl scale (~121M ranked domains vs Tranco's 1M); --offset skips the first M ranks " +
+		"so runs can sample deeper slices. Reading stops as soon as N domains are collected — the full " +
+		"~1 GB file is never downloaded.",
+	RunE: runSeedCommonCrawl,
+}
+
 func init() {
 	seedCTCmd.Flags().IntVar(&seedCTCount, "count", 0, "entries to harvest (default: config seed.ct.entryCount)")
 	seedCTCmd.Flags().StringVar(&seedCTLog, "log", "", "operator token (oak, argon, all) or explicit log URL (default: config seed.ct.logs)")
@@ -109,11 +147,20 @@ func init() {
 	seedMCPCmd.Flags().IntVar(&seedMCPCount, "count", 0, "domains to enqueue (default: config seed.mcp.count)")
 	seedMCPCmd.Flags().StringVar(&seedMCPRegistryURL, "registry", "", "MCP registry base URL (default: config seed.mcp.registryUrl)")
 
+	seedCuratedCmd.Flags().IntVar(&seedCuratedCount, "count", 0, "domains to enqueue (default: config seed.curated.count)")
+	seedCuratedCmd.Flags().StringArrayVar(&seedCuratedURLs, "url", nil, "list document URL, repeatable; replaces the default set (default: config seed.curated.urls)")
+
+	seedCommonCrawlCmd.Flags().IntVar(&seedCommonCrawlTop, "top", 0, "top domains to enqueue (default: config seed.commoncrawl.top)")
+	seedCommonCrawlCmd.Flags().IntVar(&seedCommonCrawlOffset, "offset", 0, "ranked domains to skip before collecting (default: config seed.commoncrawl.offset)")
+	seedCommonCrawlCmd.Flags().StringVar(&seedCommonCrawlGraph, "graph", "", "web-graph release id (default: config seed.commoncrawl.graph, else the latest release)")
+
 	seedCmd.AddCommand(seedCTCmd)
 	seedCmd.AddCommand(seedCrtshCmd)
 	seedCmd.AddCommand(seedTrancoCmd)
 	seedCmd.AddCommand(seedGitHubCmd)
 	seedCmd.AddCommand(seedMCPCmd)
+	seedCmd.AddCommand(seedCuratedCmd)
+	seedCmd.AddCommand(seedCommonCrawlCmd)
 	rootCmd.AddCommand(seedCmd)
 }
 
@@ -214,6 +261,44 @@ func runSeedMCP(cmd *cobra.Command, args []string) error {
 
 	return runSeeder(cmd, cfg, st, seed.NewMCPRegistrySeeder(registryURL), count,
 		fmt.Sprintf("%d domains from MCP registry %s", count, registryURL))
+}
+
+func runSeedCurated(cmd *cobra.Command, args []string) error {
+	cfg, st, err := openApp()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	count := orDefault(seedCuratedCount, cfg.Seed.Curated.Count)
+	urls := orDefaultSlice(seedCuratedURLs, cfg.Seed.Curated.URLs)
+
+	return runSeeder(cmd, cfg, st, seed.NewCuratedSeeder(urls), count,
+		fmt.Sprintf("%d domains from %d curated list(s)", count, len(urls)))
+}
+
+func runSeedCommonCrawl(cmd *cobra.Command, args []string) error {
+	cfg, st, err := openApp()
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	top := orDefault(seedCommonCrawlTop, cfg.Seed.CommonCrawl.Top)
+	offset := orDefault(seedCommonCrawlOffset, cfg.Seed.CommonCrawl.Offset)
+	graph := orDefault(seedCommonCrawlGraph, cfg.Seed.CommonCrawl.Graph)
+
+	graphLabel := graph
+	if graphLabel == "" {
+		graphLabel = "latest"
+	}
+	label := fmt.Sprintf("top %d domains from Common Crawl graph %s", top, graphLabel)
+	if offset > 0 {
+		label = fmt.Sprintf("%s (offset %d)", label, offset)
+	}
+
+	seeder := seed.NewCommonCrawlSeeder(cfg.Seed.CommonCrawl.GraphInfoURL, graph, offset)
+	return runSeeder(cmd, cfg, st, seeder, top, label)
 }
 
 // runSeeder drives a seed.Seeder to completion: fetch up to n candidate

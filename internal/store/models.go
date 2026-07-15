@@ -36,6 +36,8 @@ const (
 	DiscoverySourceTranco           = "tranco"
 	DiscoverySourceGitHub           = "github"
 	DiscoverySourceMCPRegistry      = "mcp_registry"
+	DiscoverySourceCurated          = "curated_list"
+	DiscoverySourceCommonCrawl      = "commoncrawl"
 )
 
 // Domain ARD status.

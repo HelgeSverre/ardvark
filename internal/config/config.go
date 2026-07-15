@@ -1,7 +1,8 @@
 // Package config loads and validates the ardvark.json configuration file:
 // storage, logging, crawler politeness, ARD verification depth, registry
 // harvesting, and pluggable seed-source settings (CT logs, crt.sh, Tranco,
-// GitHub code search, the MCP registry). All keys are optional; missing
+// GitHub code search, the MCP registry, curated lists, Common Crawl). All
+// keys are optional; missing
 // values fall back to documented defaults.
 package config
 
@@ -80,6 +81,8 @@ type SeedConfig struct {
 	Tranco      TrancoSeedConfig      `json:"tranco"`
 	GitHub      GitHubSeedConfig      `json:"github"`
 	MCPRegistry MCPRegistrySeedConfig `json:"mcp"`
+	Curated     CuratedSeedConfig     `json:"curated"`
+	CommonCrawl CommonCrawlSeedConfig `json:"commoncrawl"`
 }
 
 // CTSeedConfig controls Certificate Transparency log seeding
@@ -127,6 +130,32 @@ type MCPRegistrySeedConfig struct {
 	// Count is the default number of domains to enqueue, overridden by
 	// --count.
 	Count int `json:"count"`
+}
+
+// CuratedSeedConfig controls curated awesome-list seeding
+// (`ardvark seed curated`).
+type CuratedSeedConfig struct {
+	// URLs are the list documents scanned for candidate domains. Overridden
+	// (replaced, not appended to) by repeated --url flags.
+	URLs []string `json:"urls"`
+	// Count is the default number of domains to enqueue, overridden by
+	// --count.
+	Count int `json:"count"`
+}
+
+// CommonCrawlSeedConfig controls Common Crawl web-graph domain-ranks seeding
+// (`ardvark seed commoncrawl`).
+type CommonCrawlSeedConfig struct {
+	// GraphInfoURL lists available web-graph releases (newest first).
+	GraphInfoURL string `json:"graphInfoUrl"`
+	// Graph pins a release id (e.g. "cc-main-2026-apr-may-jun"); empty uses
+	// the newest release. Overridden by --graph.
+	Graph string `json:"graph"`
+	// Top is the default number of top-ranked domains to enqueue,
+	// overridden by --top.
+	Top int `json:"top"`
+	// Offset skips the first Offset ranked domains, overridden by --offset.
+	Offset int `json:"offset"`
 }
 
 // Defaults returns a Config populated with the documented defaults from the
@@ -185,6 +214,20 @@ func Defaults() Config {
 			MCPRegistry: MCPRegistrySeedConfig{
 				RegistryURL: "https://registry.modelcontextprotocol.io",
 				Count:       1000,
+			},
+			Curated: CuratedSeedConfig{
+				URLs: []string{
+					"https://raw.githubusercontent.com/punkpeye/awesome-mcp-servers/main/README.md",
+					"https://raw.githubusercontent.com/wong2/awesome-mcp-servers/main/README.md",
+					"https://raw.githubusercontent.com/appcypher/awesome-mcp-servers/main/README.md",
+				},
+				Count: 500,
+			},
+			CommonCrawl: CommonCrawlSeedConfig{
+				GraphInfoURL: "https://index.commoncrawl.org/graphinfo.json",
+				Graph:        "",
+				Top:          1000,
+				Offset:       0,
 			},
 		},
 	}
