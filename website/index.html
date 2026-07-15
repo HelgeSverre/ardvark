@@ -3,21 +3,21 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ardvark — crawler &amp; indexer for the agentic web</title>
-  <meta name="description" content="ardvark crawls the web for ARD ai-catalog.json documents, verifies them against the spec, and indexes every discovered agent, MCP server, and skill into SQLite, MySQL, or Postgres.">
+  <title>ardvark — the crawler for AI catalogs</title>
+  <meta name="description" content="ardvark is the crawler for AI catalogs — it discovers ai-catalog.json documents across the web, verifies them against the ARD spec, and indexes every agent, MCP server, and skill into an SQLite database.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://ardvark.no/">
-  <meta property="og:title" content="ardvark — crawler &amp; indexer for the agentic web">
-  <meta property="og:description" content="Crawls the web for ARD ai-catalog.json documents, verifies them against the spec, and indexes every discovered agent, MCP server, and skill.">
+  <meta property="og:title" content="ardvark — the crawler for AI catalogs">
+  <meta property="og:description" content="The crawler for AI catalogs — discover, verify, index. Finds ai-catalog.json across the web and indexes every agent, MCP server, and skill.">
   <meta property="og:image" content="https://ardvark.no/og.png">
   <meta property="og:image:width" content="2400">
   <meta property="og:image:height" content="1260">
-  <meta property="og:image:alt" content="ardvark — crawler &amp; indexer for the agentic web">
+  <meta property="og:image:alt" content="ardvark — the crawler for AI catalogs">
   <meta property="og:site_name" content="ardvark">
   <meta property="og:locale" content="en_US">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="ardvark — crawler &amp; indexer for the agentic web">
-  <meta name="twitter:description" content="Crawls the web for ARD ai-catalog.json documents, verifies them against the spec, and indexes every discovered agent, MCP server, and skill.">
+  <meta name="twitter:title" content="ardvark — the crawler for AI catalogs">
+  <meta name="twitter:description" content="The crawler for AI catalogs — discover, verify, index. Finds ai-catalog.json across the web and indexes every agent, MCP server, and skill.">
   <meta name="twitter:image" content="https://ardvark.no/og.png">
   <meta name="robots" content="index, follow">
   <meta name="theme-color" content="#FDF8F1">
@@ -34,7 +34,7 @@
     "@type": "SoftwareApplication",
     "name": "ardvark",
     "url": "https://ardvark.no/",
-    "description": "ardvark crawls the web for ARD ai-catalog.json documents, verifies them against the spec, and indexes every discovered agent, MCP server, and skill into SQLite, MySQL, or Postgres.",
+    "description": "ardvark is the crawler for AI catalogs — it discovers ai-catalog.json documents across the web, verifies them against the ARD spec, and indexes every agent, MCP server, and skill into an SQLite database.",
     "applicationCategory": "DeveloperApplication",
     "operatingSystem": "macOS, Linux, Windows",
     "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
@@ -47,14 +47,14 @@
 
 <header class="hero wrap">
   <div>
-    <h1>The agentic web is publishing catalogs.<br><em>ardvark digs them up.</em></h1>
-    <p class="sub">Sites are starting to advertise their AI agents, MCP servers, and skills in <code>/.well-known/ai-catalog.json</code>. ardvark crawls for those catalogs, verifies them against the ARD spec, and indexes every resource into a SQLite database you can build on.</p>
+    <h1>The crawler for AI catalogs.<br><em>Discover, verify, index.</em></h1>
+    <p class="sub">Sites are starting to advertise their AI agents, MCP servers, and skills in <code>/.well-known/ai-catalog.json</code>. ardvark crawls for those catalogs, verifies them against the ARD spec, and indexes every resource into an SQLite database.</p>
     <div class="install">
       <span class="prompt">$</span>
       <code id="install-cmd">brew install helgesverre/tap/ardvark</code>
       <button class="copy" data-copy="brew install helgesverre/tap/ardvark">copy</button>
     </div>
-    <p class="reqs">macOS · Linux · Windows — single binary, no runtime</p>
+    <p class="reqs">macOS · Linux · Windows</p>
     <div class="ctas">
       <a class="btn btn-primary" href="#quickstart">Get started</a>
       <a class="btn btn-ghost" href="docs.html">Read docs</a>

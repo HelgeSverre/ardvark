@@ -229,7 +229,7 @@ h2 {
 
 .steps { display: grid; gap: 20px; }
 
-.step { display: grid; grid-template-columns: 200px 1fr; gap: 20px; align-items: start; }
+.step { display: grid; grid-template-columns: 200px 1fr; gap: 20px; align-items: end; }
 
 .step-label { padding-top: 10px; }
 .step-label .num { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--brand-primary); }

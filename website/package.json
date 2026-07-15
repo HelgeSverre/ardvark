@@ -7,6 +7,6 @@
     "dev": "python3 -m http.server 8321"
   },
   "devDependencies": {
-    "playwright-core": "^1.54.0"
+    "playwright-core": "^1.61.1"
   }
 }
