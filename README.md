@@ -89,14 +89,15 @@ ardvark export --format jsonl --out resources.jsonl
 | `ardvark verify <path\|url>` | Verify one catalog — local file or remote URL — and print the check report. Exits 1 if invalid. `--stored` re-verifies everything in the database. |
 | `ardvark export [--format jsonl\|csv] [--out file]` | Dump discovered resources with their verification status. |
 | `ardvark stats` | Summarize the dataset: hosts probed, catalogs by verdict, entries by type. |
+| `ardvark info` | Show installation metadata: version, resolved config path, database and log locations. Never opens the database. |
 | `ardvark migrate` | Create/update the database schema. |
-| `ardvark mcp` | Serve ardvark's commands as MCP tools over stdio: `ardvark_probe`, `ardvark_verify`, `ardvark_crawl`, `ardvark_seed`, `ardvark_stats`, `ardvark_export`. |
+| `ardvark mcp` | Serve ardvark's commands as MCP tools over stdio: `ardvark_probe`, `ardvark_verify`, `ardvark_crawl`, `ardvark_seed`, `ardvark_stats`, `ardvark_info`, `ardvark_export`. |
 
 `crawl`, `probe`, every `seed` source, `verify`, and `stats` also take `--json` to emit the result as pretty-printed JSON on stdout (diagnostics go to stderr; exit codes are unchanged) — the same typed structures the MCP tools return.
 
 ## Configuration
 
-ardvark runs with sensible defaults and no config file. To change anything, drop an `ardvark.json` in the working directory (or pass `--config path`). The file is schema-validated — a typo'd key or bad value gets a precise error, not silent misbehavior.
+ardvark runs with sensible defaults and no config file. To change anything, drop an `ardvark.json` in the working directory, in your user config dir (`~/.config/ardvark/ardvark.json` on Linux/macOS — `$XDG_CONFIG_HOME` respected — or `%AppData%\ardvark\ardvark.json` on Windows), or pass `--config path`. Explicit `--config` wins, then the working directory, then the user config dir. The file is schema-validated — a typo'd key or bad value gets a precise error, not silent misbehavior.
 
 ```json
 {
