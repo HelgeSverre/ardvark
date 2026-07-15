@@ -495,9 +495,9 @@ func TestHandleArtifactFetch_SavesArtifact(t *testing.T) {
 	defer srv.Close()
 
 	eng, st := newTestEngine(t, testCrawlerConfig())
-	eng.setArtifactEntry(srv.URL+"/card.json", 42)
+	entryID := uint(42)
 
-	item := store.FrontierItem{URL: srv.URL + "/card.json"}
+	item := store.FrontierItem{URL: srv.URL + "/card.json", ArtifactEntryID: &entryID}
 	if err := eng.handleArtifactFetch(context.Background(), item); err != nil {
 		t.Fatalf("handleArtifactFetch: %v", err)
 	}
@@ -518,9 +518,9 @@ func TestHandleArtifactFetch_PermanentFailureRecordsErrorArtifact(t *testing.T) 
 	defer srv.Close()
 
 	eng, st := newTestEngine(t, testCrawlerConfig())
-	eng.setArtifactEntry(srv.URL+"/missing.json", 7)
+	entryID := uint(7)
 
-	item := store.FrontierItem{URL: srv.URL + "/missing.json"}
+	item := store.FrontierItem{URL: srv.URL + "/missing.json", ArtifactEntryID: &entryID}
 	if err := eng.handleArtifactFetch(context.Background(), item); err != nil {
 		t.Fatalf("expected permanent failure to be swallowed as an errored artifact, got %v", err)
 	}
@@ -565,9 +565,9 @@ func TestProcess_CompletesSuccessfulItem(t *testing.T) {
 	defer srv.Close()
 
 	eng, st := newTestEngine(t, testCrawlerConfig())
-	eng.setArtifactEntry(srv.URL+"/ok.json", 1)
+	entryID := uint(1)
 
-	item := store.FrontierItem{Kind: store.KindArtifactFetch, URL: srv.URL + "/ok.json", DedupKey: "x", Status: store.FrontierStatusInFlight}
+	item := store.FrontierItem{Kind: store.KindArtifactFetch, URL: srv.URL + "/ok.json", DedupKey: "x", Status: store.FrontierStatusInFlight, ArtifactEntryID: &entryID}
 	if err := st.DB.Create(&item).Error; err != nil {
 		t.Fatalf("seed item: %v", err)
 	}
@@ -601,68 +601,13 @@ func TestProcess_FailsPermanentlyOnUnknownKind(t *testing.T) {
 	}
 }
 
-// -- provenance map housekeeping ------------------------------------------
+// -- provenance persistence ------------------------------------------------
 
-// TestProcess_ReleasesProvenanceOnCompletion is the regression test for the
-// FOLLOWUPS.md housekeeping item: once a catalog_fetch/artifact_fetch item
-// finishes successfully (so it will never be dispatched again), its
-// in-memory provenance entry (parentCatalogByURL / catalogMethodByURL /
-// artifactEntryByURL) must be dropped rather than retained for the rest of
-// the crawl.
-func TestProcess_ReleasesProvenanceOnCompletion(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/catalog.json", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/ai-catalog+json")
-		w.Write([]byte(`{"specVersion":"1.0","host":{"displayName":"C"},"entries":[]}`))
-	})
-	mux.HandleFunc("/artifact.json", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"ok":true}`))
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	eng, st := newTestEngine(t, testCrawlerConfig())
-	host := strings.TrimPrefix(srv.URL, "http://")
-	catalogURL := srv.URL + "/catalog.json"
-	artifactURL := srv.URL + "/artifact.json"
-
-	eng.setParentCatalog(catalogURL, 99)
-	eng.setCatalogMethod(catalogURL, "well_known")
-	eng.setArtifactEntry(artifactURL, 42)
-
-	catalogItem := store.FrontierItem{
-		Kind: store.KindCatalogFetch, URL: catalogURL, Host: host,
-		DedupKey: dedupKey(store.KindCatalogFetch, catalogURL), Status: store.FrontierStatusInFlight,
-	}
-	if err := st.DB.Create(&catalogItem).Error; err != nil {
-		t.Fatalf("seed catalog_fetch item: %v", err)
-	}
-	artifactItem := store.FrontierItem{
-		Kind: store.KindArtifactFetch, URL: artifactURL, Host: host,
-		DedupKey: dedupKey(store.KindArtifactFetch, artifactURL), Status: store.FrontierStatusInFlight,
-	}
-	if err := st.DB.Create(&artifactItem).Error; err != nil {
-		t.Fatalf("seed artifact_fetch item: %v", err)
-	}
-
-	eng.process(context.Background(), catalogItem)
-	eng.process(context.Background(), artifactItem)
-
-	if _, ok := eng.parentCatalogByURL.get(catalogURL); ok {
-		t.Error("expected parentCatalogByURL entry to be released after the catalog_fetch item completed")
-	}
-	if _, ok := eng.catalogMethodByURL.get(catalogURL); ok {
-		t.Error("expected catalogMethodByURL entry to be released after the catalog_fetch item completed")
-	}
-	if _, ok := eng.artifactEntryByURL.get(artifactURL); ok {
-		t.Error("expected artifactEntryByURL entry to be released after the artifact_fetch item completed")
-	}
-}
-
-// TestProcess_RetainsProvenanceAcrossTransientRetry ensures a transient
-// failure (retries remaining) does NOT release the provenance entry: the
-// next retry of the same item still needs it.
-func TestProcess_RetainsProvenanceAcrossTransientRetry(t *testing.T) {
+// TestProcess_PersistsProvenanceAcrossRetry ensures a transient failure
+// (retries remaining) leaves the frontier row's provenance columns intact:
+// the next attempt at the same item — possibly dequeued by a different
+// worker process — still needs them to attribute its result.
+func TestProcess_PersistsProvenanceAcrossRetry(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/flaky.json", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -672,11 +617,12 @@ func TestProcess_RetainsProvenanceAcrossTransientRetry(t *testing.T) {
 
 	eng, st := newTestEngine(t, testCrawlerConfig())
 	artifactURL := srv.URL + "/flaky.json"
-	eng.setArtifactEntry(artifactURL, 7)
+	entryID := uint(7)
 
 	item := store.FrontierItem{
 		Kind: store.KindArtifactFetch, URL: artifactURL,
 		DedupKey: dedupKey(store.KindArtifactFetch, artifactURL), Status: store.FrontierStatusInFlight,
+		ArtifactEntryID: &entryID,
 	}
 	if err := st.DB.Create(&item).Error; err != nil {
 		t.Fatalf("seed item: %v", err)
@@ -691,9 +637,139 @@ func TestProcess_RetainsProvenanceAcrossTransientRetry(t *testing.T) {
 	if reloaded.Status != store.FrontierStatusPending {
 		t.Fatalf("expected item still pending (retry remaining), got %q", reloaded.Status)
 	}
+	if reloaded.ArtifactEntryID == nil || *reloaded.ArtifactEntryID != 7 {
+		t.Errorf("expected artifact_entry_id to survive a retryable failure, got %v", reloaded.ArtifactEntryID)
+	}
+}
 
-	if got := eng.artifactEntry(artifactURL); got != 7 {
-		t.Errorf("expected artifactEntryByURL to survive a retryable failure, got %d", got)
+// TestProvenance_SurvivesFreshEngineInstance is the regression test for
+// cross-process provenance (see internal/crawler's package doc): a
+// catalog_fetch/artifact_fetch/registry_harvest item enqueued by one
+// worker's *Engine must still carry full provenance when dequeued and
+// processed by a completely different *Engine instance sharing the same
+// store/frontier — simulating a second worker process — rather than only
+// the instance that enqueued it.
+func TestProvenance_SurvivesFreshEngineInstance(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/nested-catalog.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/ai-catalog+json")
+		w.Write([]byte(`{"specVersion":"1.0","host":{"displayName":"Nested"},"entries":[]}`))
+	})
+	mux.HandleFunc("/artifact.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok":true}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := testCrawlerConfig()
+	st := newTestStore(t)
+	fr := frontier.New(st.DB)
+	fc := fetch.New(cfg.Crawler)
+	host := strings.TrimPrefix(srv.URL, "http://")
+
+	// "Worker A" enqueues the items with provenance set, as
+	// enqueueEntryFollowups/handleHostProbe would.
+	workerA := New(cfg, st, fr, fc, discardLogger(), Options{MaxAttempts: 2})
+
+	parentCatalogID := uint(99)
+	if _, err := workerA.enqueue(store.KindCatalogFetch, srv.URL+"/nested-catalog.json", host, 1, provenance{
+		ParentCatalogID: &parentCatalogID,
+		ProbeMethod:     store.ProbeMethodWellKnown,
+	}); err != nil {
+		t.Fatalf("enqueue catalog_fetch: %v", err)
+	}
+
+	artifactEntryID := uint(42)
+	if _, err := workerA.enqueue(store.KindArtifactFetch, srv.URL+"/artifact.json", host, 0, provenance{
+		ArtifactEntryID: &artifactEntryID,
+	}); err != nil {
+		t.Fatalf("enqueue artifact_fetch: %v", err)
+	}
+
+	// Seed a store.Catalog and a registries row for the registry_harvest
+	// item to attribute its harvested entries to.
+	cat := &store.Catalog{SourceURL: "https://registry.example/parent", VerificationStatus: "valid"}
+	if err := st.DB.Create(cat).Error; err != nil {
+		t.Fatalf("seed catalog: %v", err)
+	}
+	regRow := &store.Registry{EntryID: 1, BaseURL: "https://registry.invalid/api", HarvestStatus: store.HarvestStatusPending}
+	if err := st.DB.Create(regRow).Error; err != nil {
+		t.Fatalf("seed registry row: %v", err)
+	}
+	regEntryID := uint(1)
+	regCatalogID := cat.ID
+	if _, err := workerA.enqueue(store.KindRegistryHarvest, "https://registry.invalid/api", host, 0, provenance{
+		RegistryEntryID:   &regEntryID,
+		RegistryCatalogID: &regCatalogID,
+		RegistryRowID:     &regRow.ID,
+	}); err != nil {
+		t.Fatalf("enqueue registry_harvest: %v", err)
+	}
+
+	// "Worker B" is a brand new Engine over the same store/frontier — it
+	// shares no in-process state with workerA whatsoever, unlike the old
+	// in-memory maps.
+	workerB := New(cfg, st, fr, fc, discardLogger(), Options{MaxAttempts: 2})
+
+	items, err := fr.Dequeue(3)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("expected 3 dequeued items, got %d", len(items))
+	}
+
+	for _, item := range items {
+		switch item.Kind {
+		case store.KindCatalogFetch:
+			if item.ParentCatalogID == nil || *item.ParentCatalogID != parentCatalogID {
+				t.Errorf("catalog_fetch item missing ParentCatalogID, got %v", item.ParentCatalogID)
+			}
+			if item.ProbeMethod != store.ProbeMethodWellKnown {
+				t.Errorf("catalog_fetch item missing ProbeMethod, got %q", item.ProbeMethod)
+			}
+			if err := workerB.handleCatalogFetch(context.Background(), item); err != nil {
+				t.Fatalf("handleCatalogFetch: %v", err)
+			}
+			var nested store.Catalog
+			if err := st.DB.Where("source_url = ?", srv.URL+"/nested-catalog.json").First(&nested).Error; err != nil {
+				t.Fatalf("expected nested catalog persisted: %v", err)
+			}
+			if nested.ParentCatalogID == nil || *nested.ParentCatalogID != parentCatalogID {
+				t.Errorf("expected nested catalog's parent_catalog_id %d, got %v", parentCatalogID, nested.ParentCatalogID)
+			}
+
+		case store.KindArtifactFetch:
+			if item.ArtifactEntryID == nil || *item.ArtifactEntryID != artifactEntryID {
+				t.Errorf("artifact_fetch item missing ArtifactEntryID, got %v", item.ArtifactEntryID)
+			}
+			if err := workerB.handleArtifactFetch(context.Background(), item); err != nil {
+				t.Fatalf("handleArtifactFetch: %v", err)
+			}
+			var artifact store.Artifact
+			if err := st.DB.Where("entry_id = ?", artifactEntryID).First(&artifact).Error; err != nil {
+				t.Fatalf("expected artifact row attributed to entry %d: %v", artifactEntryID, err)
+			}
+
+		case store.KindRegistryHarvest:
+			if item.RegistryEntryID == nil || *item.RegistryEntryID != regEntryID {
+				t.Errorf("registry_harvest item missing RegistryEntryID, got %v", item.RegistryEntryID)
+			}
+			if item.RegistryCatalogID == nil || *item.RegistryCatalogID != regCatalogID {
+				t.Errorf("registry_harvest item missing RegistryCatalogID, got %v", item.RegistryCatalogID)
+			}
+			if item.RegistryRowID == nil || *item.RegistryRowID != regRow.ID {
+				t.Errorf("registry_harvest item missing RegistryRowID, got %v", item.RegistryRowID)
+			}
+			// registry.invalid does not resolve to a real server; the
+			// assertions above are what this test cares about (provenance
+			// surviving to a fresh engine instance), so the resulting fetch
+			// error is expected and ignored.
+			_ = workerB.handleRegistryHarvest(context.Background(), item)
+
+		default:
+			t.Fatalf("unexpected item kind %q", item.Kind)
+		}
 	}
 }
 
@@ -784,13 +860,14 @@ func TestRun_SlowItemDoesNotBlockWorkers(t *testing.T) {
 	for i := 0; i < fastCount; i++ {
 		urls = append(urls, fmt.Sprintf("%s/fast/%d.json", srv.URL, i))
 	}
+	entryID := uint(1)
 	for _, u := range urls {
-		eng.setArtifactEntry(u, 1)
 		if _, err := eng.frontier.Enqueue(&store.FrontierItem{
-			Kind:     store.KindArtifactFetch,
-			URL:      u,
-			Host:     host,
-			DedupKey: dedupKey(store.KindArtifactFetch, u),
+			Kind:            store.KindArtifactFetch,
+			URL:             u,
+			Host:            host,
+			DedupKey:        dedupKey(store.KindArtifactFetch, u),
+			ArtifactEntryID: &entryID,
 		}); err != nil {
 			t.Fatalf("Enqueue %s: %v", u, err)
 		}

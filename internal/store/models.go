@@ -150,6 +150,40 @@ type FrontierItem struct {
 	LastError string `gorm:"type:text"`
 	DedupKey  string `gorm:"uniqueIndex;size:512"`
 
+	// -- Provenance columns -------------------------------------------------
+	//
+	// These carry the context a handler needs to attribute its result (which
+	// catalog a nested catalog_fetch belongs to, which entry an
+	// artifact_fetch/registry_harvest was declared by, ...). They are set by
+	// the enqueuing side immediately before the item is written to the
+	// frontier and read by the dequeuing side's handler, so this data
+	// survives both process restarts and, critically, a different worker
+	// process dequeuing the item than the one that enqueued it (see
+	// internal/crawler's package doc).
+
+	// ParentCatalogID is the catalogs.id of the catalog that referenced this
+	// catalog_fetch item's URL as a nested catalog entry. Nil for
+	// top-level catalogs (discovered via host_probe or a link_tag hint).
+	ParentCatalogID *uint `gorm:"index"`
+	// ArtifactEntryID is the catalog_entries.id that declared this
+	// artifact_fetch item's URL.
+	ArtifactEntryID *uint `gorm:"index"`
+	// RegistryEntryID is the catalog_entries.id that declared this
+	// registry_harvest item's registry (the entry whose media type is
+	// application/ai-registry+json).
+	RegistryEntryID *uint `gorm:"index"`
+	// RegistryCatalogID is the catalogs.id that harvested registry entries
+	// should be attributed to.
+	RegistryCatalogID *uint `gorm:"index"`
+	// RegistryRowID is the registries.id row for this registry_harvest
+	// item's registry (or referral), whose harvest_status/last_harvested_at
+	// the handler updates.
+	RegistryRowID *uint `gorm:"index"`
+	// ProbeMethod is which probe method (well_known, robots_agentmap,
+	// link_tag) discovered this catalog_fetch item's URL, reported on the
+	// verified-catalog ProbeEvent.
+	ProbeMethod string `gorm:"size:32"`
+
 	// LeasedUntil is set when a worker dequeues an item (status moves to
 	// in_flight): it is now plus the frontier's configured lease duration.
 	// A distributed reclaimer (frontier.ReclaimExpired) resets any in_flight

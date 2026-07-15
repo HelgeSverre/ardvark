@@ -8,15 +8,13 @@
 // Two recursion sources are bounded by config and dedup keys: nested
 // catalogs (ard.maxCatalogDepth, reusing FrontierItem.Depth with
 // catalog_fetch-specific meaning) and registry referrals
-// (registry.maxReferralDepth, same mechanism). Because FrontierItem does
-// not carry a parent-catalog or declaring-entry foreign key, the engine
-// tracks that provenance in an in-memory map keyed by URL, populated at
-// enqueue time. This is a known limitation: if the process restarts with
-// items still pending in the frontier, resumed catalog_fetch /
-// registry_harvest items whose provenance was only in memory will fall
-// back to sensible defaults (no parent, catalog id 0) rather than losing
-// data outright. A future iteration could add explicit foreign-key columns
-// to the frontier_items table to make this fully resumable.
+// (registry.maxReferralDepth, same mechanism). Provenance a handler needs
+// to attribute its result (parent catalog, declaring entry, probe method,
+// ...) is persisted directly on the frontier_items row by the enqueuing
+// side and read back by the dequeuing side's handler — see the
+// "Provenance columns" doc comment on store.FrontierItem — so it survives
+// process restarts and is visible to whichever worker process ends up
+// dequeuing the item, not just the one that enqueued it.
 package crawler
 
 import (
@@ -111,15 +109,6 @@ type Engine struct {
 	httpClientOnce sync.Once
 	httpClient     *http.Client
 
-	parentCatalogByURL *lockedMap[string, uint]
-	artifactEntryByURL *lockedMap[string, uint]
-	registryCtxByURL   *lockedMap[string, registryContext]
-	// catalogMethodByURL remembers which probe method (well_known,
-	// robots_agentmap, link_tag) discovered each enqueued catalog URL, so
-	// the verified-catalog ProbeEvent can report it. Same in-memory
-	// provenance caveat as the maps above.
-	catalogMethodByURL *lockedMap[string, string]
-
 	// pagesMu guards pageCounts/pageOrder/pageElems, an in-memory
 	// approximation of "pages fetched so far per domain" used to enforce
 	// maxPagesPerDomain without an extra store query per link. Unlike the
@@ -146,33 +135,19 @@ type Engine struct {
 // LRU bookkeeping) will track at once. See the pagesMu doc comment.
 const maxTrackedDomains = 20000
 
-// registryContext carries the provenance an in-flight registry_harvest
-// item needs: which catalog entry declared the registry, which catalog its
-// harvested entries should be attributed to, and the registries-table row
-// id for the registry itself.
-type registryContext struct {
-	entryID   uint
-	catalogID uint
-	regRowID  uint
-}
-
 // New builds an Engine. logger must not be nil; pass eventlog.New's result
 // (or slog.Default() in tests).
 func New(cfg config.Config, st *store.Store, fr *frontier.Frontier, fetchClient *fetch.Client, logger *slog.Logger, opts Options) *Engine {
 	return &Engine{
-		cfg:                cfg,
-		store:              st,
-		frontier:           fr,
-		fetch:              fetchClient,
-		logger:             logger,
-		opts:               opts,
-		parentCatalogByURL: newLockedMap[string, uint](),
-		artifactEntryByURL: newLockedMap[string, uint](),
-		registryCtxByURL:   newLockedMap[string, registryContext](),
-		catalogMethodByURL: newLockedMap[string, string](),
-		pageCounts:         make(map[string]int),
-		pageOrder:          list.New(),
-		pageElems:          make(map[string]*list.Element),
+		cfg:        cfg,
+		store:      st,
+		frontier:   fr,
+		fetch:      fetchClient,
+		logger:     logger,
+		opts:       opts,
+		pageCounts: make(map[string]int),
+		pageOrder:  list.New(),
+		pageElems:  make(map[string]*list.Element),
 	}
 }
 
@@ -183,7 +158,7 @@ func (e *Engine) EnqueueSeedURL(rawURL string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("crawler: enqueue seed url: %w", err)
 	}
-	return e.enqueue(store.KindPageFetch, rawURL, host, 0)
+	return e.enqueue(store.KindPageFetch, rawURL, host, 0, provenance{})
 }
 
 // EnqueueSeedHost enqueues a host_probe item at depth 0 for host, the entry
@@ -192,27 +167,48 @@ func (e *Engine) EnqueueSeedHost(host, discoverySource string) (bool, error) {
 	if _, err := e.store.UpsertDomain(host, discoverySource); err != nil {
 		return false, fmt.Errorf("crawler: enqueue seed host: %w", err)
 	}
-	return e.enqueue(store.KindHostProbe, "", host, 0)
+	return e.enqueue(store.KindHostProbe, "", host, 0, provenance{})
+}
+
+// provenance carries the frontier_items provenance columns (see
+// store.FrontierItem's "Provenance columns" doc comment) that a handler
+// will need once the item it is attached to is dequeued. Callers fill in
+// only the fields relevant to the item's kind; the rest are left zero.
+type provenance struct {
+	ParentCatalogID   *uint
+	ArtifactEntryID   *uint
+	RegistryEntryID   *uint
+	RegistryCatalogID *uint
+	RegistryRowID     *uint
+	ProbeMethod       string
 }
 
 // enqueue builds and enqueues a frontier item for kind, deriving the dedup
 // key from the item's natural key (host for host_probe, URL otherwise) in
-// one place so keys cannot drift across call sites. An enqueue failure is
+// one place so keys cannot drift across call sites, and stamping prov onto
+// the row so a handler can read it back after this item is dequeued
+// (possibly by a different worker process). An enqueue failure is
 // warn-logged here — the crawl always continues without the item — and
 // also returned for the callers that must react to it (seed enqueues,
 // page-budget release).
-func (e *Engine) enqueue(kind, url, host string, depth int) (bool, error) {
+func (e *Engine) enqueue(kind, url, host string, depth int, prov provenance) (bool, error) {
 	natural := url
 	if kind == store.KindHostProbe {
 		natural = host
 	}
 	added, err := e.frontier.Enqueue(&store.FrontierItem{
-		RunID:    e.opts.RunID,
-		Kind:     kind,
-		URL:      url,
-		Host:     host,
-		Depth:    depth,
-		DedupKey: dedupKey(kind, natural),
+		RunID:             e.opts.RunID,
+		Kind:              kind,
+		URL:               url,
+		Host:              host,
+		Depth:             depth,
+		DedupKey:          dedupKey(kind, natural),
+		ParentCatalogID:   prov.ParentCatalogID,
+		ArtifactEntryID:   prov.ArtifactEntryID,
+		RegistryEntryID:   prov.RegistryEntryID,
+		RegistryCatalogID: prov.RegistryCatalogID,
+		RegistryRowID:     prov.RegistryRowID,
+		ProbeMethod:       prov.ProbeMethod,
 	})
 	if err != nil {
 		e.logger.Warn("crawler: failed to enqueue item", "kind", kind, "url", url, "host", host, "error", err)
@@ -381,11 +377,6 @@ func (e *Engine) process(ctx context.Context, item store.FrontierItem) {
 			e.logger.Error("crawler: failed to mark item complete", "item_id", item.ID, "kind", item.Kind, "error", cerr)
 			return
 		}
-		// The item will never be dispatched again (barring a future
-		// re-enqueue of the same dedup key, which always calls the
-		// matching setXxx before re-enqueueing — see releaseProvenance's
-		// doc comment), so its in-memory provenance entry can be dropped.
-		e.releaseProvenance(item)
 		e.logger.Info("crawler: item complete", "item_id", item.ID, "kind", item.Kind, "url", item.URL, "host", item.Host)
 		return
 	}
@@ -409,15 +400,9 @@ func (e *Engine) process(ctx context.Context, item store.FrontierItem) {
 		}
 	}
 
-	permanent, ferr := e.frontier.Fail(item.ID, err, max)
-	if ferr != nil {
+	if _, ferr := e.frontier.Fail(item.ID, err, max); ferr != nil {
 		e.logger.Error("crawler: failed to record item failure", "item_id", item.ID, "kind", item.Kind, "error", ferr)
 		return
-	}
-	// A still-pending item (more retries left) still needs its provenance
-	// entry for the next attempt; a permanently failed one never will.
-	if permanent {
-		e.releaseProvenance(item)
 	}
 	e.logger.Warn("crawler: item failed", "item_id", item.ID, "kind", item.Kind, "url", item.URL, "host", item.Host, "transient", transient, "error", err.Error())
 }
@@ -493,110 +478,6 @@ func (e *Engine) registryHTTPClient() *http.Client {
 		e.httpClient = &http.Client{Timeout: timeout}
 	})
 	return e.httpClient
-}
-
-// -- Provenance tracking (see package doc for the resumability caveat) ----
-//
-// Lifecycle: each entry is written by a setXxx call immediately before the
-// frontier item that will consume it is enqueued, and read once by the
-// item's handler while it is being processed. Once process() learns the
-// item will never be dispatched again — it completed successfully, or it
-// failed permanently (attempts exhausted) — releaseProvenance drops the
-// entry so these maps do not grow for the lifetime of a long crawl,
-// retaining only entries for work still pending or in flight (including
-// items with retries remaining, which still need their entry for the next
-// attempt).
-//
-// A reference cycle (catalog A -> B -> A, or registry referrals pointing
-// back at each other) re-enqueues an already-completed dedup key at a
-// deeper depth (frontier.Enqueue's doc comment); the corresponding setXxx
-// call always happens again before that re-enqueue, so the entry exists by
-// the time the item is redispatched even though it was dropped after the
-// first completion. This ordering — set-then-enqueue, dequeue-then-read,
-// complete-then-release — is what makes eager release safe.
-
-// lockedMap is a mutex-guarded map: the minimal get/set/delete shape the
-// provenance tracking needs, shared across the four maps instead of four
-// hand-rolled accessor pairs.
-type lockedMap[K comparable, V any] struct {
-	mu sync.Mutex
-	m  map[K]V
-}
-
-func newLockedMap[K comparable, V any]() *lockedMap[K, V] {
-	return &lockedMap[K, V]{m: make(map[K]V)}
-}
-
-func (l *lockedMap[K, V]) get(k K) (V, bool) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	v, ok := l.m[k]
-	return v, ok
-}
-
-func (l *lockedMap[K, V]) set(k K, v V) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.m[k] = v
-}
-
-func (l *lockedMap[K, V]) delete(k K) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	delete(l.m, k)
-}
-
-func (e *Engine) setParentCatalog(url string, catalogID uint) {
-	e.parentCatalogByURL.set(url, catalogID)
-}
-
-func (e *Engine) parentCatalogFor(url string) *uint {
-	if id, ok := e.parentCatalogByURL.get(url); ok {
-		return &id
-	}
-	return nil
-}
-
-func (e *Engine) setArtifactEntry(url string, entryID uint) {
-	e.artifactEntryByURL.set(url, entryID)
-}
-
-func (e *Engine) artifactEntry(url string) uint {
-	id, _ := e.artifactEntryByURL.get(url)
-	return id
-}
-
-func (e *Engine) setCatalogMethod(url, method string) {
-	e.catalogMethodByURL.set(url, method)
-}
-
-func (e *Engine) catalogMethodFor(url string) string {
-	method, _ := e.catalogMethodByURL.get(url)
-	return method
-}
-
-func (e *Engine) setRegistryContext(url string, entryID, catalogID, regRowID uint) {
-	e.registryCtxByURL.set(url, registryContext{entryID: entryID, catalogID: catalogID, regRowID: regRowID})
-}
-
-func (e *Engine) registryContextFor(url string) (registryContext, bool) {
-	return e.registryCtxByURL.get(url)
-}
-
-// releaseProvenance drops item's in-memory provenance entry (parent
-// catalog, artifact entry, catalog discovery method, or registry context)
-// once process() knows item will never be dispatched again. See the
-// "Provenance tracking" doc comment above for why this is safe.
-func (e *Engine) releaseProvenance(item store.FrontierItem) {
-	switch item.Kind {
-	case store.KindCatalogFetch:
-		e.parentCatalogByURL.delete(item.URL)
-		e.catalogMethodByURL.delete(item.URL)
-	case store.KindArtifactFetch:
-		e.artifactEntryByURL.delete(item.URL)
-	case store.KindRegistryHarvest:
-		e.registryCtxByURL.delete(item.URL)
-	}
 }
 
 // -- Page-count tracking for maxPagesPerDomain -----------------------------

@@ -300,6 +300,58 @@ func TestEnqueueResetAdoptsDeeperDepth(t *testing.T) {
 	}
 }
 
+// TestEnqueueResetAdoptsNewProvenance ensures that when Enqueue reactivates
+// a done/failed row, it also adopts the re-enqueue's provenance columns
+// (parent catalog, artifact entry, registry context, probe method) rather
+// than leaving the prior row's stale values in place: a re-activated item
+// must be attributed to whoever is referencing it *this* time, not
+// whichever caller happened to enqueue it originally.
+func TestEnqueueResetAdoptsNewProvenance(t *testing.T) {
+	f := newTestFrontier(t)
+
+	oldParent := uint(1)
+	item := &store.FrontierItem{
+		Kind: store.KindCatalogFetch, URL: "https://c.example/nested.json", Depth: 0,
+		DedupKey: "catalog_fetch:https://c.example/nested.json", ParentCatalogID: &oldParent,
+		ProbeMethod: "well_known",
+	}
+	if _, err := f.Enqueue(item); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := f.Complete(item.ID); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	newParent := uint(2)
+	reenq := &store.FrontierItem{
+		Kind: store.KindCatalogFetch, URL: "https://c.example/nested.json", Depth: 1,
+		DedupKey: "catalog_fetch:https://c.example/nested.json", ParentCatalogID: &newParent,
+		ProbeMethod: "link_tag",
+	}
+	ok, err := f.Enqueue(reenq)
+	if err != nil {
+		t.Fatalf("re-Enqueue: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected re-enqueue of a done item to reset it to pending")
+	}
+
+	items, err := f.Dequeue(1)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 dequeued item, got %d", len(items))
+	}
+	got := items[0]
+	if got.ParentCatalogID == nil || *got.ParentCatalogID != newParent {
+		t.Errorf("expected reactivated item to adopt new parent_catalog_id %d, got %v", newParent, got.ParentCatalogID)
+	}
+	if got.ProbeMethod != "link_tag" {
+		t.Errorf("expected reactivated item to adopt new probe_method %q, got %q", "link_tag", got.ProbeMethod)
+	}
+}
+
 // ReclaimInFlight returns items stranded in_flight by a killed process back to
 // pending so a resumed crawl picks them up.
 func TestReclaimInFlight(t *testing.T) {

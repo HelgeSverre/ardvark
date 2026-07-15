@@ -154,6 +154,17 @@ func (f *Frontier) Enqueue(item *store.FrontierItem) (bool, error) {
 			// a done item at its original shallow depth, so the depth guard
 			// never trips and the crawl loops forever.
 			"depth": item.Depth,
+			// Adopt the re-enqueue's provenance too: the prior (done/failed)
+			// row's columns describe who referenced it *last time*, which may
+			// no longer be accurate (e.g. a different parent catalog now
+			// references the same URL), and a stale value here would silently
+			// misattribute the re-activated item's result.
+			"parent_catalog_id":   item.ParentCatalogID,
+			"artifact_entry_id":   item.ArtifactEntryID,
+			"registry_entry_id":   item.RegistryEntryID,
+			"registry_catalog_id": item.RegistryCatalogID,
+			"registry_row_id":     item.RegistryRowID,
+			"probe_method":        item.ProbeMethod,
 		})
 	if res.Error != nil {
 		return false, fmt.Errorf("frontier: re-enqueue: %w", res.Error)
