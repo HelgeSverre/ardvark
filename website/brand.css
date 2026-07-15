@@ -19,10 +19,15 @@
   --n-900: #3D2C29;
   --n-950: #2B1E1B;
 
+  /* Desaturated neutrals — gray first, a hint of the brand warmth.
+     For surfaces/chrome that should recede rather than read as sand. */
+  --gray-100: #F4F2EF;
+  --gray-300: #DEDAD5;
+
   /* Semantic aliases — light, warm theme */
   --bg:          var(--n-50);
   --surface:     #FFFFFF;
-  --surface-alt: var(--n-100);
+  --surface-alt: var(--gray-100);
   --border:      var(--n-200);
   --text:        var(--n-900);
   --text-muted:  var(--n-500);
