@@ -27,6 +27,10 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`export` streams** — rows flow from the database cursor straight to the
+  output through a hand-rolled JSON serializer (byte-identical to
+  `encoding/json`, equivalence pinned by test). On a 7.75M-entry dataset:
+  134s / 9.6 GB peak memory before, 55s / 36 MB after. Output is unchanged.
 - **Summary counts pluralize correctly** — `probe`, `crawl`, and `stats`
   summaries now say "1 hit", "1 page fetched", "1 entry" instead of "1 hits",
   "1 pages fetched", "1 entries".
