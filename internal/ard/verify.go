@@ -104,12 +104,15 @@ const (
 	mediaTypeMCPServerCard = "application/mcp-server-card+json"
 	mediaTypeAICatalog     = "application/ai-catalog+json"
 	mediaTypeAIRegistry    = "application/ai-registry+json"
-	mediaTypeAISkillCard   = "application/ai-skill+json"
-	// Forms seen on catalogs published in the wild (e.g. unlimit.website),
-	// predating the "-card" suffix in the spec draft.
-	mediaTypeMCPServer = "application/mcp-server+json"
-	mediaTypeA2AAgent  = "application/a2a-agent+json"
-	mediaTypeAISkill   = "application/ai-skill"
+	mediaTypeAISkill       = "application/ai-skill"
+	mediaTypeAISkillMD     = "application/ai-skill+md"
+	// Forms seen on catalogs published in the wild, predating or deviating
+	// from the spec draft: "-card"-less agent/server types (e.g.
+	// unlimit.website), and a +json skill form (the spec defines only
+	// application/ai-skill and application/ai-skill+md).
+	mediaTypeMCPServer   = "application/mcp-server+json"
+	mediaTypeA2AAgent    = "application/a2a-agent+json"
+	mediaTypeAISkillJSON = "application/ai-skill+json"
 )
 
 // knownEntryMediaTypes are the ARD media types recognized by entry.type. The
@@ -120,10 +123,11 @@ var knownEntryMediaTypes = map[string]bool{
 	mediaTypeMCPServerCard: true,
 	mediaTypeAICatalog:     true,
 	mediaTypeAIRegistry:    true,
-	mediaTypeAISkillCard:   true,
+	mediaTypeAISkill:       true,
+	mediaTypeAISkillMD:     true,
 	mediaTypeMCPServer:     true,
 	mediaTypeA2AAgent:      true,
-	mediaTypeAISkill:       true,
+	mediaTypeAISkillJSON:   true,
 }
 
 // TransportChecks runs the verification pipeline's step-1 transport checks
@@ -179,7 +183,8 @@ func (r Report) MergeChecks(extra []Check) Report {
 // Verify runs the ARD verification pipeline over a raw ai-catalog.json
 // document: JSON Schema validation against the vendored spec schema,
 // followed by the seven semantic checks. servingDomain is the host the
-// catalog was fetched from, used by the urn.publisher_matches check.
+// catalog was fetched from, used by the urn.publisher_matches check; when
+// empty (e.g. a local file), that check is skipped.
 //
 // Transport-level checks (content type, size, UTF-8 validity) are the
 // caller's responsibility and are not repeated here.
@@ -412,7 +417,10 @@ func semanticChecks(c Catalog, servingDomain string, schemaFailed bool) []Check 
 		if !schemaFailed {
 			checks = append(checks, checkURNFormat(urnErr, subject))
 		}
-		if urnErr == nil {
+		// An empty servingDomain means the catalog wasn't fetched from a
+		// host (e.g. a local file), so there is nothing to compare the URN
+		// publisher against and the check is skipped rather than warned.
+		if urnErr == nil && servingDomain != "" {
 			checks = append(checks, checkPublisherMatches(urn, servingDomain, subject))
 		}
 

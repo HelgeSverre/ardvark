@@ -2,14 +2,14 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/helgesverre/ardvark/internal/probe"
-	"github.com/helgesverre/ardvark/internal/store"
 	"github.com/helgesverre/ardvark/internal/ui"
 )
 
@@ -131,144 +131,73 @@ func TestColorOptions(t *testing.T) {
 	}
 }
 
-func TestWriteJSONLAndCSV(t *testing.T) {
-	rows := []exportRow{
-		{Host: "example.com", URN: "urn:air:example.com:skills:x", DisplayName: "X", MediaType: "application/ai-skill+json"},
-		{Host: "other.net", URN: "urn:air:other.net:skills:y", DisplayName: "Y, with comma", MediaType: "application/ai-skill+json"},
-	}
-
-	var jsonlBuf bytes.Buffer
-	if err := writeJSONL(&jsonlBuf, rows); err != nil {
-		t.Fatalf("writeJSONL() error = %v", err)
-	}
-	lines := strings.Split(strings.TrimRight(jsonlBuf.String(), "\n"), "\n")
-	if len(lines) != len(rows) {
-		t.Fatalf("writeJSONL() produced %d lines, want %d", len(lines), len(rows))
-	}
-	if !strings.Contains(lines[0], "example.com") {
-		t.Fatalf("writeJSONL() line 0 = %q, want to contain host", lines[0])
-	}
-
-	var csvBuf bytes.Buffer
-	if err := writeCSV(&csvBuf, rows); err != nil {
-		t.Fatalf("writeCSV() error = %v", err)
-	}
-	csvOut := csvBuf.String()
-	if !strings.HasPrefix(csvOut, "host,catalog_source_url") {
-		t.Fatalf("writeCSV() missing header, got %q", csvOut)
-	}
-	if !strings.Contains(csvOut, `"Y, with comma"`) {
-		t.Fatalf("writeCSV() did not quote field containing a comma, got %q", csvOut)
-	}
-}
-
-func TestGroupCount(t *testing.T) {
-	st := newTestStore(t)
-
-	if _, err := st.UpsertDomain("a.com", store.DiscoverySourceSeed); err != nil {
-		t.Fatalf("UpsertDomain: %v", err)
-	}
-	if _, err := st.UpsertDomain("b.com", store.DiscoverySourceSeed); err != nil {
-		t.Fatalf("UpsertDomain: %v", err)
-	}
-	dc, err := st.UpsertDomain("c.com", store.DiscoverySourceCTLog)
-	if err != nil {
-		t.Fatalf("UpsertDomain: %v", err)
-	}
-	if err := st.RecordProbe(&store.Probe{DomainID: dc.ID, Method: store.ProbeMethodWellKnown, Outcome: store.ProbeOutcomeHit}); err != nil {
-		t.Fatalf("RecordProbe: %v", err)
-	}
-	if err := st.UpdateDomainARDStatus(dc.ID, store.ARDStatusFoundValid); err != nil {
-		t.Fatalf("UpdateDomainARDStatus: %v", err)
-	}
-
-	groups, err := groupCount(st, "domains", "ard_status")
-	if err != nil {
-		t.Fatalf("groupCount() error = %v", err)
-	}
-
-	counts := make(map[string]int64, len(groups))
-	for _, g := range groups {
-		counts[g.key] = g.count
-	}
-
-	if counts[store.ARDStatusUnprobed] != 2 {
-		t.Errorf("unprobed count = %d, want 2", counts[store.ARDStatusUnprobed])
-	}
-	if counts[store.ARDStatusFoundValid] != 1 {
-		t.Errorf("found_valid count = %d, want 1", counts[store.ARDStatusFoundValid])
-	}
-}
-
-func TestSummarizeRun(t *testing.T) {
-	st := newTestStore(t)
-
-	run, err := st.CreateRun("{}")
-	if err != nil {
-		t.Fatalf("CreateRun: %v", err)
-	}
-
-	if err := st.DB.Create(&store.FrontierItem{
-		RunID: run.ID, Kind: store.KindPageFetch, URL: "https://a.com/", Host: "a.com",
-		Status: store.FrontierStatusDone, DedupKey: "page_fetch:https://a.com/",
-	}).Error; err != nil {
-		t.Fatalf("seeding frontier item: %v", err)
-	}
-	if err := st.DB.Create(&store.FrontierItem{
-		RunID: run.ID, Kind: store.KindHostProbe, Host: "a.com",
-		Status: store.FrontierStatusDone, DedupKey: "host_probe:a.com",
-	}).Error; err != nil {
-		t.Fatalf("seeding frontier item: %v", err)
-	}
-	if err := st.DB.Create(&store.FrontierItem{
-		RunID: run.ID, Kind: store.KindArtifactFetch, URL: "https://a.com/x", Host: "a.com",
-		Status: store.FrontierStatusFailed, DedupKey: "artifact_fetch:https://a.com/x",
-	}).Error; err != nil {
-		t.Fatalf("seeding frontier item: %v", err)
-	}
-
-	domain, err := st.UpsertDomain("a.com", store.DiscoverySourceSeed)
-	if err != nil {
-		t.Fatalf("UpsertDomain: %v", err)
-	}
-	if err := st.SaveCatalog(&store.Catalog{
-		DomainID: domain.ID, SourceURL: "https://a.com/.well-known/ai-catalog.json",
-		FetchedAt: time.Now(), VerificationStatus: store.VerificationStatusValid,
-	}, nil, nil); err != nil {
-		t.Fatalf("SaveCatalog: %v", err)
-	}
-
-	pagesFetched, hostsProbed, catalogsFound, catalogsValid, errCount, err := summarizeRun(st, run.StartedAt.Add(-time.Minute))
-	if err != nil {
-		t.Fatalf("summarizeRun() error = %v", err)
-	}
-	if pagesFetched != 1 {
-		t.Errorf("pagesFetched = %d, want 1", pagesFetched)
-	}
-	if hostsProbed != 1 {
-		t.Errorf("hostsProbed = %d, want 1", hostsProbed)
-	}
-	if catalogsFound != 1 {
-		t.Errorf("catalogsFound = %d, want 1", catalogsFound)
-	}
-	if catalogsValid != 1 {
-		t.Errorf("catalogsValid = %d, want 1", catalogsValid)
-	}
-	if errCount != 1 {
-		t.Errorf("errCount = %d, want 1", errCount)
-	}
-}
-
-// newTestStore opens an isolated in-memory-like sqlite store (file-backed
-// in a t.TempDir so concurrent connections within a single test see the
-// same data) with the schema migrated.
-func newTestStore(t *testing.T) *store.Store {
+// executeRoot runs the root command with args, capturing stdout+stderr, and
+// restores the flag-bound package state afterwards so tests don't leak into
+// each other.
+func executeRoot(t *testing.T, args ...string) (string, error) {
 	t.Helper()
-	dsn := filepath.Join(t.TempDir(), "ardvark.db")
-	st, err := store.Open("sqlite", dsn)
+	t.Cleanup(func() {
+		configPath = "./ardvark.json"
+		colorMode = "auto"
+		jsonOut = false
+		verifyStored = false
+		rootCmd.SetArgs(nil)
+		rootCmd.SetOut(nil)
+		rootCmd.SetErr(nil)
+	})
+
+	var buf bytes.Buffer
+	rootCmd.SetArgs(args)
+	rootCmd.SetOut(&buf)
+	rootCmd.SetErr(&buf)
+	err := rootCmd.Execute()
+	return buf.String(), err
+}
+
+// `ardvark mcp --help` must work: the MCP subcommand is wired into the root
+// command and documents the exposed tools.
+func TestMCPHelp(t *testing.T) {
+	out, err := executeRoot(t, "mcp", "--help")
 	if err != nil {
-		t.Fatalf("store.Open() error = %v", err)
+		t.Fatalf("mcp --help: %v", err)
 	}
-	t.Cleanup(func() { st.Close() })
-	return st
+	for _, want := range []string{"stdio", "ardvark_probe", "ardvark_stats"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("mcp --help output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// `ardvark stats --json` must emit parseable JSON with the documented
+// top-level sections.
+func TestStatsJSONOutput(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "ardvark.json")
+	cfg := fmt.Sprintf(`{"storage":{"driver":"sqlite","dsn":%q},"log":{"file":%q}}`,
+		filepath.Join(dir, "test.db"), filepath.Join(dir, "test.jsonl"))
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	out, err := executeRoot(t, "--config", cfgPath, "stats", "--json")
+	if err != nil {
+		t.Fatalf("stats --json: %v", err)
+	}
+
+	var parsed map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+		t.Fatalf("stats --json output is not valid JSON: %v\n%s", err, out)
+	}
+	for _, key := range []string{"domains", "catalogs", "entries"} {
+		if _, ok := parsed[key]; !ok {
+			t.Errorf("stats --json output missing %q key:\n%s", key, out)
+		}
+	}
+}
+
+// --json must be rejected by commands that don't support it.
+func TestJSONFlagRejectedWhereUnsupported(t *testing.T) {
+	if _, err := executeRoot(t, "migrate", "--json"); err == nil {
+		t.Fatal("migrate --json: want unknown-flag error, got nil")
+	}
 }

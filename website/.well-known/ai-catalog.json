@@ -1,0 +1,49 @@
+{
+  "specVersion": "1.0",
+  "host": {
+    "displayName": "ardvark",
+    "documentationUrl": "https://ardvark.no/"
+  },
+  "entries": [
+    {
+      "identifier": "urn:air:ardvark.no:skill:ardvark-cli",
+      "displayName": "ardvark CLI skill",
+      "type": "application/ai-skill+md",
+      "url": "https://ardvark.no/SKILLS.md",
+      "description": "Teaches an agent to install ardvark, run verify/probe/crawl/seed/export, interpret verdicts and exit codes, and query the resulting SQLite dataset.",
+      "tags": ["ard", "crawler", "verification", "cli"],
+      "representativeQueries": [
+        "how do I verify an ai-catalog.json file against the ARD spec",
+        "check whether a catalog is valid or valid_with_warnings",
+        "query the ardvark SQLite database for invalid catalogs",
+        "what config knobs control ardvark's crawl politeness"
+      ]
+    },
+    {
+      "identifier": "urn:air:ardvark.no:tool:ardvark",
+      "displayName": "ardvark",
+      "type": "application/ai-skill",
+      "url": "https://ardvark.no/docs.html",
+      "description": "Command-line crawler, verifier, and indexer for ARD ai-catalog.json documents, with SQLite/MySQL/Postgres storage and a JSONL event log.",
+      "tags": ["ard", "crawler", "verification", "cli"],
+      "representativeQueries": [
+        "crawl a site for ai-catalog.json documents",
+        "verify a catalog against the ARD JSON Schema and semantic checks",
+        "index discovered agents, MCP servers, and skills into a database"
+      ]
+    },
+    {
+      "identifier": "urn:air:ardvark.no:mcp:ardvark",
+      "displayName": "ardvark MCP server",
+      "type": "application/mcp-server-card+json",
+      "url": "https://ardvark.no/.well-known/ardvark-mcp.json",
+      "description": "stdio MCP server embedded in the ardvark CLI (`ardvark mcp`), exposing probe, verify, crawl, seed, stats, and export as tools that return the same typed JSON as the CLI's --json output.",
+      "tags": ["ard", "mcp", "crawler", "verification"],
+      "representativeQueries": [
+        "probe a host for an ARD ai-catalog.json document over MCP",
+        "verify an ai-catalog.json document from an agent",
+        "summarize what the ardvark index currently holds"
+      ]
+    }
+  ]
+}

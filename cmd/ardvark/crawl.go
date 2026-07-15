@@ -2,23 +2,19 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
-	"net/url"
 	"os"
 	"os/signal"
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/helgesverre/ardvark/internal/ard"
 	"github.com/helgesverre/ardvark/internal/crawler"
-	"github.com/helgesverre/ardvark/internal/frontier"
+	"github.com/helgesverre/ardvark/internal/jsonout"
 	"github.com/helgesverre/ardvark/internal/probe"
-	"github.com/helgesverre/ardvark/internal/store"
 	"github.com/helgesverre/ardvark/internal/ui"
 )
 
@@ -39,6 +35,7 @@ var crawlCmd = &cobra.Command{
 func init() {
 	crawlCmd.Flags().StringVar(&crawlListFile, "list", "", "path to a file of newline-separated URLs/domains to seed")
 	crawlCmd.Flags().BoolVar(&crawlForce, "force", false, "bypass the host_probe freshness window (re-probe hosts probed recently)")
+	addJSONFlag(crawlCmd)
 	rootCmd.AddCommand(crawlCmd)
 }
 
@@ -49,79 +46,60 @@ func runCrawl(cmd *cobra.Command, args []string) error {
 	}
 	defer st.Close()
 
-	logger, err := newLogger(cfg)
-	if err != nil {
-		return err
-	}
-
 	seeds, err := collectSeeds(args, crawlListFile)
 	if err != nil {
 		return err
 	}
 
-	configSnapshot, err := json.Marshal(cfg)
-	if err != nil {
-		return fmt.Errorf("crawl: marshalling config snapshot: %w", err)
-	}
-
-	run, err := st.CreateRun(string(configSnapshot))
-	if err != nil {
-		return err
-	}
-
-	p := printer(cmd)
-
-	fr := frontier.New(st.DB)
-	fc := newFetchClient(cfg)
-	// The engine's worker pool fires OnProbe from multiple goroutines, and
-	// ui.Printer is not goroutine-safe, so serialize the row writes.
-	var rowMu sync.Mutex
-	eng := crawler.New(cfg, st, fr, fc, logger, crawler.Options{
-		RunID:       run.ID,
-		Force:       crawlForce,
-		BackoffBase: time.Second,
-		OnProbe: func(ev crawler.ProbeEvent) {
-			rowMu.Lock()
-			defer rowMu.Unlock()
-			status, result, extra := probeRow(ev)
-			p.Row(status, ev.Host, ev.Method, result, extra)
-		},
-	})
-
-	seeded := 0
-	for _, s := range seeds {
-		added, err := seedOne(eng, s)
-		if err != nil {
-			p.Errorf("crawl: failed to seed %q: %v", s, err)
-			continue
+	// In JSON mode the live per-host rows and progress notes are suppressed;
+	// only the final run summary object is emitted (seed failures still go
+	// to stderr as plain text).
+	var cb jsonout.CrawlCallbacks
+	if jsonOut {
+		cb = jsonout.CrawlCallbacks{
+			SeedError: func(seed string, err error) {
+				fmt.Fprintf(os.Stderr, "crawl: failed to seed %q: %v\n", seed, err)
+			},
 		}
-		if added {
-			seeded++
+	} else {
+		p := printer(cmd)
+		// The engine's worker pool fires OnProbe from multiple goroutines,
+		// and ui.Printer is not goroutine-safe, so serialize the row writes.
+		var rowMu sync.Mutex
+		cb = jsonout.CrawlCallbacks{
+			OnProbe: func(ev crawler.ProbeEvent) {
+				rowMu.Lock()
+				defer rowMu.Unlock()
+				status, result, extra := probeRow(ev)
+				p.Row(status, ev.Host, ev.Method, result, extra)
+			},
+			SeedError: func(seed string, err error) {
+				p.Errorf("crawl: failed to seed %q: %v", seed, err)
+			},
+			Seeded: func(seeded, requested int) {
+				p.Mutedf("seeded %d of %d requested seed(s)", seeded, requested)
+			},
 		}
 	}
-	p.Mutedf("seeded %d of %d requested seed(s)", seeded, len(seeds))
 
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := eng.Run(ctx); err != nil {
-		return err
-	}
-
-	pagesFetched, hostsProbed, catalogsFound, catalogsValid, errCount, err := summarizeRun(st, run.StartedAt)
+	res, err := jsonout.Crawl(ctx, cfg, st, seeds, crawlForce, cb)
 	if err != nil {
 		return err
 	}
-	if err := st.FinishRun(run.ID, pagesFetched, hostsProbed, catalogsFound, catalogsValid, errCount); err != nil {
-		return err
+
+	if jsonOut {
+		return printJSON(cmd, res)
 	}
 
-	p.Summary("run complete",
-		fmt.Sprintf("%d pages fetched", pagesFetched),
-		fmt.Sprintf("%d hosts probed", hostsProbed),
-		fmt.Sprintf("%d catalogs found", catalogsFound),
-		fmt.Sprintf("%d valid", catalogsValid),
-		fmt.Sprintf("%d errors", errCount),
+	printer(cmd).Summary("run complete",
+		fmt.Sprintf("%d pages fetched", res.PagesFetched),
+		fmt.Sprintf("%d hosts probed", res.HostsProbed),
+		fmt.Sprintf("%d catalogs found", res.CatalogsFound),
+		fmt.Sprintf("%d valid", res.CatalogsValid),
+		fmt.Sprintf("%d errors", res.Errors),
 	)
 	return nil
 }
@@ -179,80 +157,4 @@ func collectSeeds(args []string, listFile string) ([]string, error) {
 	}
 
 	return seeds, nil
-}
-
-// seedOne enqueues a single seed. A bare domain is seeded as a host_probe. A
-// URL is seeded as a page_fetch and, additionally, as a host_probe of its
-// origin host — so a seed URL whose page 404s or has no anchors (an SPA, an
-// API root) still gets its well-known catalog checked. Deduping makes the
-// extra host_probe harmless when the page crawl reaches the same host.
-func seedOne(eng *crawler.Engine, seed string) (bool, error) {
-	if !strings.Contains(seed, "://") {
-		return eng.EnqueueSeedHost(seed, store.DiscoverySourceSeed)
-	}
-
-	added, err := eng.EnqueueSeedURL(seed)
-	if err != nil {
-		return added, err
-	}
-	if u, perr := url.Parse(seed); perr == nil && u.Hostname() != "" {
-		if _, herr := eng.EnqueueSeedHost(u.Hostname(), store.DiscoverySourceSeed); herr != nil {
-			return added, herr
-		}
-	}
-	return added, nil
-}
-
-// summarizeRun computes crawl_run summary counters for FinishRun. Pages
-// fetched and hosts probed are counted from completed frontier items
-// belonging to the run; catalogs found/valid are counted from catalog rows
-// fetched since the run started (catalogs have no run_id column, so a time
-// window is used — accurate for a single crawl run, an approximation if
-// runs overlap). Errors are frontier items that exhausted their retry
-// budget.
-func summarizeRun(st *store.Store, startedAt time.Time) (pagesFetched, hostsProbed, catalogsFound, catalogsValid, errCount int, err error) {
-	var n int64
-
-	// Count frontier work by when it completed, not by run_id: items seeded
-	// by a separate `seed` command (or a prior run) carry that run's id but
-	// are drained by this crawl, so time-window attribution is what reflects
-	// what this run actually did.
-	if err = st.DB.Model(&store.FrontierItem{}).
-		Where("kind = ? AND status = ? AND updated_at >= ?", store.KindPageFetch, store.FrontierStatusDone, startedAt).
-		Count(&n).Error; err != nil {
-		return
-	}
-	pagesFetched = int(n)
-
-	if err = st.DB.Model(&store.FrontierItem{}).
-		Where("kind = ? AND status = ? AND updated_at >= ?", store.KindHostProbe, store.FrontierStatusDone, startedAt).
-		Count(&n).Error; err != nil {
-		return
-	}
-	hostsProbed = int(n)
-
-	if err = st.DB.Model(&store.Catalog{}).
-		Where("fetched_at >= ?", startedAt).
-		Count(&n).Error; err != nil {
-		return
-	}
-	catalogsFound = int(n)
-
-	if err = st.DB.Model(&store.Catalog{}).
-		Where("fetched_at >= ? AND verification_status IN ?", startedAt, []string{
-			store.VerificationStatusValid, store.VerificationStatusValidWithWarnings,
-		}).
-		Count(&n).Error; err != nil {
-		return
-	}
-	catalogsValid = int(n)
-
-	if err = st.DB.Model(&store.FrontierItem{}).
-		Where("status = ? AND updated_at >= ?", store.FrontierStatusFailed, startedAt).
-		Count(&n).Error; err != nil {
-		return
-	}
-	errCount = int(n)
-
-	return
 }

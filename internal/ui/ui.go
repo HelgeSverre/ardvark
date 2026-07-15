@@ -156,7 +156,7 @@ func (p *Printer) Row(status Status, host, method, result, extra string) {
 // Summary prints the muted end-of-run line: the bare label, a ": "
 // separator, then parts joined with " · ":
 //
-//	run complete: 847 hosts probed · 3 catalogs · 41 resources indexed
+//	run complete: 12 pages fetched · 3 hosts probed · 2 catalogs found · 2 valid · 0 errors
 func (p *Printer) Summary(label string, parts ...string) {
 	fmt.Fprintln(p.w, p.Paint(StyleMuted, label+": "+strings.Join(parts, " · ")))
 }

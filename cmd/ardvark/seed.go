@@ -8,8 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/helgesverre/ardvark/internal/config"
-	"github.com/helgesverre/ardvark/internal/crawler"
-	"github.com/helgesverre/ardvark/internal/frontier"
+	"github.com/helgesverre/ardvark/internal/jsonout"
 	"github.com/helgesverre/ardvark/internal/seed"
 	"github.com/helgesverre/ardvark/internal/store"
 )
@@ -68,8 +67,8 @@ var seedCTCmd = &cobra.Command{
 	Use:   "ct",
 	Short: "Seed from Certificate Transparency logs",
 	Long: "Harvest domains from the newest Certificate Transparency log entries and queue them " +
-		"for probing. Logs are resolved live from the CT log list (Let's Encrypt Oak by default), " +
-		"so shard URLs never need updating as they rotate.",
+		"for probing. Logs are resolved live from the CT log list (the oak, argon, and nimbus " +
+		"operators by default), so shard URLs never need updating as they rotate.",
 	RunE: runSeedCT,
 }
 
@@ -154,13 +153,13 @@ func init() {
 	seedCommonCrawlCmd.Flags().IntVar(&seedCommonCrawlOffset, "offset", 0, "ranked domains to skip before collecting (default: config seed.commoncrawl.offset)")
 	seedCommonCrawlCmd.Flags().StringVar(&seedCommonCrawlGraph, "graph", "", "web-graph release id (default: config seed.commoncrawl.graph, else the latest release)")
 
-	seedCmd.AddCommand(seedCTCmd)
-	seedCmd.AddCommand(seedCrtshCmd)
-	seedCmd.AddCommand(seedTrancoCmd)
-	seedCmd.AddCommand(seedGitHubCmd)
-	seedCmd.AddCommand(seedMCPCmd)
-	seedCmd.AddCommand(seedCuratedCmd)
-	seedCmd.AddCommand(seedCommonCrawlCmd)
+	for _, c := range []*cobra.Command{
+		seedCTCmd, seedCrtshCmd, seedTrancoCmd, seedGitHubCmd,
+		seedMCPCmd, seedCuratedCmd, seedCommonCrawlCmd,
+	} {
+		addJSONFlag(c)
+		seedCmd.AddCommand(c)
+	}
 	rootCmd.AddCommand(seedCmd)
 }
 
@@ -301,45 +300,26 @@ func runSeedCommonCrawl(cmd *cobra.Command, args []string) error {
 	return runSeeder(cmd, cfg, st, seeder, top, label)
 }
 
-// runSeeder drives a seed.Seeder to completion: fetch up to n candidate
-// domains, then upsert each as a domains row and enqueue a host_probe
-// frontier item, tagged with the seeder's discovery_source. Shared by every
+// runSeeder drives a seed.Seeder to completion via the shared core
+// (jsonout.RunSeeder), then renders the result: the muted summary line by
+// default, or the typed result as JSON with --json. Shared by every
 // `seed <source>` subcommand so each one only has to build its Seeder and
 // resolve its flags/config. The caller owns st and its Close.
 func runSeeder(cmd *cobra.Command, cfg config.Config, st *store.Store, s seed.Seeder, n int, sourceLabel string) error {
-	logger, err := newLogger(cfg)
+	res, err := jsonout.RunSeeder(cmd.Context(), cfg, st, s, n, sourceLabel)
 	if err != nil {
 		return err
 	}
 
-	names, err := s.Domains(cmd.Context(), n)
-	if err != nil {
-		return fmt.Errorf("seed %s: %w", s.Source(), err)
-	}
-
-	fr := frontier.New(st.DB)
-	fc := newFetchClient(cfg)
-	eng := crawler.New(cfg, st, fr, fc, logger, crawler.Options{})
-
-	var added, skipped int
-	for _, host := range names {
-		ok, err := eng.EnqueueSeedHost(host, s.Source())
-		if err != nil {
-			skipped++
-			continue
-		}
-		if ok {
-			added++
-		} else {
-			skipped++
-		}
+	if jsonOut {
+		return printJSON(cmd, res)
 	}
 
 	p := printer(cmd)
-	p.Summary(fmt.Sprintf("seed %s complete", s.Source()),
-		sourceLabel,
-		fmt.Sprintf("%d added", added),
-		fmt.Sprintf("%d skipped (already queued)", skipped),
+	p.Summary(fmt.Sprintf("seed %s complete", res.Source),
+		res.Label,
+		fmt.Sprintf("%d added", res.Added),
+		fmt.Sprintf("%d skipped (already queued)", res.Skipped),
 	)
 	return nil
 }

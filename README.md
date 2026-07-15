@@ -23,6 +23,7 @@ Publishers advertise their AI agents, MCP servers, and skills in an `ai-catalog.
 - **Spec verification** — official JSON Schema plus seven semantic checks (URN grammar, value-or-reference exclusivity, query counts, …), each recorded pass/fail with a message
 - **Bootstrap seeding** — fill the frontier from Certificate Transparency logs, crt.sh, the Tranco top list, GitHub code search, the MCP registry, curated awesome-lists, or Common Crawl domain ranks (`ardvark seed ct|crtsh|tranco|github|mcp|curated|commoncrawl`)
 - **Swappable storage** — SQLite by default; MySQL and Postgres via one config key; append-only JSONL event log alongside
+- **Agent-ready** — `--json` on `crawl`, `probe`, `seed`, `verify`, and `stats` for machine-readable results, plus an embedded stdio MCP server (`ardvark mcp`) exposing the same operations as tools
 - **Resumable runs** — the crawl queue lives in the database; kill a run, start it again, it picks up where it stopped
 - **Polite by default** — per-host rate limiting, robots.txt compliance, body-size caps, redirect caps, backoff on transient failures
 
@@ -89,6 +90,9 @@ ardvark export --format jsonl --out resources.jsonl
 | `ardvark export [--format jsonl\|csv] [--out file]` | Dump discovered resources with their verification status. |
 | `ardvark stats` | Summarize the dataset: hosts probed, catalogs by verdict, entries by type. |
 | `ardvark migrate` | Create/update the database schema. |
+| `ardvark mcp` | Serve ardvark's commands as MCP tools over stdio: `ardvark_probe`, `ardvark_verify`, `ardvark_crawl`, `ardvark_seed`, `ardvark_stats`, `ardvark_export`. |
+
+`crawl`, `probe`, every `seed` source, `verify`, and `stats` also take `--json` to emit the result as pretty-printed JSON on stdout (diagnostics go to stderr; exit codes are unchanged) — the same typed structures the MCP tools return.
 
 ## Configuration
 
@@ -105,7 +109,7 @@ ardvark runs with sensible defaults and no config file. To change anything, drop
     "perHostRequestsPerSecond": 1,
     "requestTimeoutSeconds": 15,
     "maxBodyBytes": 5242880,
-    "userAgent": "ardvark/0.1 (+https://ardvark.no)",
+    "userAgent": "ardvark/0.1 (+https://github.com/helgesverre/ardvark)",
     "respectRobotsTxt": true,
     "refreshAfterHours": 168
   },
@@ -179,6 +183,8 @@ Run it standalone against anything:
 ardvark verify ./my-catalog.json
 ardvark verify https://example.com/.well-known/ai-catalog.json
 ```
+
+ardvark.no publishes its own `ai-catalog.json` and dogfoods the CLI as an agent skill — see [SKILLS.md](SKILLS.md). The catalog also carries a server card for `ardvark mcp` at [`/.well-known/ardvark-mcp.json`](https://ardvark.no/.well-known/ardvark-mcp.json).
 
 ## Development
 

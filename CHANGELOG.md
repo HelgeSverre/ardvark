@@ -6,6 +6,37 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`ardvark mcp`** — a stdio MCP (Model Context Protocol) server embedded in
+  the binary, exposing `ardvark_probe`, `ardvark_verify`, `ardvark_crawl`,
+  `ardvark_seed`, `ardvark_stats`, and `ardvark_export` as tools. Each tool
+  returns the same typed JSON structure as the corresponding command's
+  `--json` output; diagnostics go to stderr (stdout carries the protocol).
+- **`--json`** flag on `crawl`, `probe`, every `seed` source, `verify`
+  (including `--stored`), and `stats` — one pretty-printed JSON document on
+  stdout instead of human-readable rows; exit codes unchanged.
+- **Docs page** — single-page documentation at
+  [ardvark.no/docs.html](https://ardvark.no/docs.html): command reference,
+  JSON output, MCP server, seeding guide, verification checks, configuration,
+  storage schema, and operational notes.
+- **Dogfooding** — ardvark.no publishes its own
+  `/.well-known/ai-catalog.json`, an `Agentmap:` directive in robots.txt, a
+  SKILLS.md agent skill, and an MCP server card at
+  `/.well-known/ardvark-mcp.json`.
+
+### Changed
+
+- **`verify` on local files** — the `urn.publisher_matches` check is now
+  skipped when the catalog wasn't fetched from a host (a local file has no
+  serving domain to compare against). Catalogs that previously rolled up as
+  `valid_with_warnings` purely from that check now report `valid`; exit
+  codes are unchanged.
+- **Recognized entry media types** — `application/ai-skill+md` (the spec's
+  Markdown skill form) is now recognized by the `entry.media_type` check;
+  `application/ai-skill+json` remains recognized as a form seen on
+  published catalogs.
+
 ## [0.2.0] - 2026-07-15
 
 ### Added
@@ -79,5 +110,6 @@ First release.
   with live per-host result rows and a JSON config validated with friendly
   error messages.
 
-[Unreleased]: https://github.com/helgesverre/ardvark/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/helgesverre/ardvark/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/helgesverre/ardvark/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/helgesverre/ardvark/releases/tag/v0.1.0

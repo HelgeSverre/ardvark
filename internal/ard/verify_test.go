@@ -242,7 +242,9 @@ func TestCheckMediaType(t *testing.T) {
 		{"mcp server card", "application/mcp-server-card+json", true},
 		{"ai catalog", "application/ai-catalog+json", true},
 		{"ai registry", "application/ai-registry+json", true},
-		{"ai skill", "application/ai-skill+json", true},
+		{"ai skill", "application/ai-skill", true},
+		{"ai skill markdown", "application/ai-skill+md", true},
+		{"ai skill json wild form", "application/ai-skill+json", true},
 		{"unknown type", "application/x-custom+json", false},
 		{"empty type", "", false},
 	}
@@ -457,6 +459,29 @@ func TestVerify_PublisherMatches_WWWvsApex(t *testing.T) {
 	}
 	if !c.Passed {
 		t.Fatalf("urn.publisher_matches = %+v, want passed (www vs apex is the same registrable domain)", c)
+	}
+	if report.Verdict != VerdictValid {
+		t.Fatalf("Verdict = %q, want %q; checks: %+v", report.Verdict, VerdictValid, report.Checks)
+	}
+}
+
+// With no serving domain (local-file verification), urn.publisher_matches
+// has nothing to compare against and must be skipped, not warned, so a
+// spec-clean catalog verified from disk still rolls up to "valid".
+func TestVerify_PublisherMatches_SkippedWithoutServingDomain(t *testing.T) {
+	raw := `{
+		"specVersion": "1.0",
+		"entries": [{
+			"identifier": "urn:air:example.com:agents:a",
+			"displayName": "A",
+			"type": "application/a2a-agent-card+json",
+			"url": "https://www.example.com/a.json",
+			"representativeQueries": ["one", "two"]
+		}]
+	}`
+	report := Verify([]byte(raw), "")
+	if c, ok := checkByID(report.Checks, "urn.publisher_matches", "urn:air:example.com:agents:a"); ok {
+		t.Fatalf("urn.publisher_matches = %+v, want skipped when serving domain is empty", c)
 	}
 	if report.Verdict != VerdictValid {
 		t.Fatalf("Verdict = %q, want %q; checks: %+v", report.Verdict, VerdictValid, report.Checks)

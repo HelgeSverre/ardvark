@@ -1,0 +1,894 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Documentation — ardvark</title>
+  <meta name="description" content="ardvark documentation: install, quickstart, discovery mechanism, command reference, JSON output, MCP server, seeding guide, verification checks, configuration, storage schema, and operational notes.">
+  <meta name="robots" content="index, follow">
+  <meta name="theme-color" content="#FDF8F1">
+  <link rel="canonical" href="https://ardvark.no/docs.html">
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <link rel="stylesheet" href="brand.css">
+  <link rel="stylesheet" href="style.css">
+  <style>
+    /* ── Docs layout ─────────────────────────────────── */
+
+    .docs-body { overflow-x: initial; }
+
+    .docs-topbar {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+
+    .docs-home {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 700;
+      color: var(--text-bright);
+      font-size: var(--text-base);
+    }
+    .docs-home:hover { text-decoration: none; color: var(--brand-primary); }
+    .docs-home img { display: block; }
+
+    .docs-toc-toggle {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: var(--r-sm);
+      font-family: var(--font-body);
+      font-size: var(--text-sm);
+      padding: 6px 12px;
+      cursor: pointer;
+    }
+    .docs-toc-toggle:hover { border-color: var(--n-400); }
+
+    .docs-layout {
+      display: grid;
+      grid-template-columns: 240px 1fr;
+      gap: 48px;
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 40px 24px 96px;
+      align-items: start;
+    }
+
+    .docs-sidebar {
+      position: sticky;
+      top: 40px;
+      max-height: calc(100vh - 60px);
+      overflow-y: auto;
+      font-size: var(--text-sm);
+    }
+
+    .docs-sidebar-inner .docs-home-side { margin-bottom: 20px; }
+
+    .docs-sidebar details { margin-bottom: 2px; }
+
+    .docs-sidebar summary,
+    .docs-sidebar .docs-side-link {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 8px;
+      border-radius: var(--r-sm);
+      transition: background 0.12s var(--ease);
+    }
+    .docs-sidebar summary {
+      list-style: none;
+      cursor: pointer;
+    }
+    .docs-sidebar summary::-webkit-details-marker { display: none; }
+
+    .docs-sidebar .chev {
+      flex: none;
+      color: var(--text-muted);
+      transition: transform 0.15s var(--ease);
+    }
+    .docs-sidebar details[open] > summary .chev { transform: rotate(90deg); }
+
+    .docs-sidebar summary a,
+    .docs-sidebar .docs-side-link {
+      color: var(--text);
+      font-weight: 600;
+    }
+    /* Childless top-level link: no chevron, text aligned with summary labels
+       (8px padding + 12px chevron + 6px gap). */
+    .docs-sidebar .docs-side-link {
+      padding-left: 26px;
+      margin-bottom: 2px;
+    }
+    .docs-sidebar summary:hover,
+    .docs-sidebar .docs-side-link:hover { background: var(--surface-alt); }
+    .docs-sidebar summary a:hover,
+    .docs-sidebar .docs-side-link:hover { text-decoration: none; }
+
+    /* Animate expand/collapse where ::details-content is supported. */
+    @supports (interpolate-size: allow-keywords) {
+      .docs-sidebar { interpolate-size: allow-keywords; }
+      .docs-sidebar details::details-content {
+        block-size: 0;
+        overflow-y: clip;
+        transition: block-size 0.18s var(--ease), content-visibility 0.18s allow-discrete;
+      }
+      .docs-sidebar details[open]::details-content { block-size: auto; }
+    }
+
+    .docs-sidebar ul {
+      list-style: none;
+      margin: 2px 0 6px 16px;
+      padding: 0;
+    }
+    .docs-sidebar li a {
+      display: block;
+      color: var(--text-muted);
+      padding: 4px 8px;
+      border-radius: var(--r-sm);
+      border-left: 2px solid transparent;
+      transition: background 0.12s var(--ease), color 0.12s var(--ease);
+    }
+    .docs-sidebar li a:hover {
+      color: var(--text);
+      text-decoration: none;
+      background: var(--surface-alt);
+    }
+
+    .docs-sidebar a.active {
+      color: var(--brand-primary-ink) !important;
+      border-left-color: var(--brand-primary);
+      background: var(--brand-primary-fade);
+      font-weight: 600;
+    }
+    .docs-sidebar summary a.active {
+      color: var(--brand-primary-ink) !important;
+      background: none;
+    }
+
+    .docs-content { max-width: 720px; min-width: 0; }
+
+    .docs-content h1 {
+      font-size: var(--text-3xl);
+      color: var(--text-bright);
+      letter-spacing: -0.02em;
+      margin-bottom: 20px;
+    }
+
+    .docs-content section { padding: 0; margin-bottom: 56px; scroll-margin-top: 20px; }
+    .docs-content section h2 { scroll-margin-top: 20px; padding-top: 8px; }
+    .docs-content article { margin-bottom: 40px; scroll-margin-top: 20px; }
+    .docs-content article h3 { scroll-margin-top: 20px; }
+
+    .docs-content h2 {
+      font-size: var(--text-xl);
+      color: var(--text-bright);
+      letter-spacing: -0.01em;
+      margin-bottom: 14px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .docs-content h3 {
+      font-size: var(--text-lg);
+      color: var(--text-bright);
+      margin: 0 0 10px;
+      font-family: var(--font-mono);
+    }
+
+    .docs-content p { margin-bottom: 14px; color: var(--text); }
+    .docs-content p.section-sub-docs { color: var(--text-muted); }
+    .docs-content ul, .docs-content ol { margin: 0 0 14px 1.4em; }
+    .docs-content li { margin-bottom: 6px; }
+    .docs-content code {
+      font-size: 0.85em;
+      background: var(--brand-primary-fade);
+      color: var(--brand-primary-ink);
+      padding: 1px 5px;
+      border-radius: var(--r-sm);
+    }
+
+    .docs-synopsis {
+      font-family: var(--font-mono);
+      font-size: var(--text-sm);
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      border-radius: var(--r-md);
+      padding: 10px 14px;
+      margin-bottom: 14px;
+      overflow-x: auto;
+      color: var(--text);
+    }
+
+    .docs-code {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      background: var(--term-bg);
+      border-radius: var(--r-md);
+      padding: 14px 16px;
+      margin-bottom: 16px;
+    }
+    .docs-code pre {
+      flex: 1;
+      min-width: 0;
+      font-size: var(--text-sm);
+      line-height: 1.7;
+      color: var(--term-text);
+      overflow-x: auto;
+    }
+    .docs-code .c-m { color: var(--term-muted); }
+
+    .docs-term { margin-bottom: 16px; box-shadow: 0 8px 28px rgba(61, 44, 41, 0.12); }
+    .docs-term pre { font-size: var(--text-sm); }
+
+    .docs-flags {
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 16px;
+      font-size: var(--text-sm);
+    }
+    .docs-flags th, .docs-flags td {
+      text-align: left;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    .docs-flags th {
+      color: var(--text-muted);
+      font-weight: 600;
+      font-size: var(--text-xs);
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    .docs-flags td:first-child { white-space: nowrap; font-family: var(--font-mono); }
+    .docs-seed-table td:first-child,
+    .docs-config-table td:first-child { white-space: normal; }
+
+    /* ── Responsive ──────────────────────────────────── */
+
+    @media (max-width: 880px) {
+      .docs-topbar { display: flex; }
+
+      .docs-layout {
+        grid-template-columns: 1fr;
+        padding-top: 16px;
+      }
+
+      .docs-sidebar {
+        position: static;
+        max-height: none;
+        display: none;
+        border-bottom: 1px solid var(--border);
+        padding-bottom: 16px;
+        margin-bottom: 8px;
+      }
+      .docs-sidebar.open { display: block; }
+      .docs-sidebar-inner .docs-home-side { display: none; }
+    }
+
+    @media (max-width: 640px) {
+      /* Wide reference tables scroll instead of breaking the layout. */
+      .docs-flags { display: block; overflow-x: auto; }
+    }
+  </style>
+</head>
+<body class="docs-body">
+
+<div class="docs-topbar">
+  <a class="docs-home" href="index.html"><img src="mark.svg" alt="" width="26" height="23"> ardvark</a>
+  <button class="docs-toc-toggle" id="docs-toc-toggle" aria-expanded="false" aria-controls="docs-sidebar">
+    Contents
+  </button>
+</div>
+
+<div class="docs-layout">
+  <nav class="docs-sidebar" id="docs-sidebar">
+    <div class="docs-sidebar-inner">
+      <a class="docs-home docs-home-side" href="index.html"><img src="mark.svg" alt="" width="24" height="21"> ardvark</a>
+
+      <details open>
+        <summary><svg class="chev" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 2.5 8 6l-3.5 3.5"/></svg><a href="#what-is-ardvark">What is ardvark</a></summary>
+        <ul>
+          <li><a href="#install">Install</a></li>
+        </ul>
+      </details>
+
+      <a class="docs-side-link" href="#quickstart">Quickstart</a>
+      <a class="docs-side-link" href="#discovery">How discovery works</a>
+
+      <details open>
+        <summary><svg class="chev" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 2.5 8 6l-3.5 3.5"/></svg><a href="#commands">Commands</a></summary>
+        <ul>
+          <li><a href="#cmd-crawl">crawl</a></li>
+          <li><a href="#cmd-probe">probe</a></li>
+          <li><a href="#cmd-seed">seed</a></li>
+          <li><a href="#cmd-verify">verify</a></li>
+          <li><a href="#cmd-export">export</a></li>
+          <li><a href="#cmd-stats">stats</a></li>
+          <li><a href="#cmd-migrate">migrate</a></li>
+          <li><a href="#cmd-mcp">mcp</a></li>
+        </ul>
+      </details>
+
+      <a class="docs-side-link" href="#json-output">JSON output</a>
+      <a class="docs-side-link" href="#mcp">MCP server</a>
+      <a class="docs-side-link" href="#seeding">Seeding guide</a>
+      <a class="docs-side-link" href="#verification">Verification</a>
+      <a class="docs-side-link" href="#configuration">Configuration</a>
+      <a class="docs-side-link" href="#storage">Storage</a>
+      <a class="docs-side-link" href="#operations">Operational notes</a>
+    </div>
+  </nav>
+
+  <main class="docs-content">
+
+    <section id="what-is-ardvark">
+      <h1>Documentation</h1>
+      <p>ardvark crawls the web for <a href="https://agenticresourcediscovery.org">ARD</a> (Agentic Resource Discovery) <code>ai-catalog.json</code> documents, verifies each one against the spec, and indexes every discovered agent, MCP server, and skill into a database. It's a single Go binary: no runtime, no external services beyond the sources it seeds from and the storage backend you point it at.</p>
+      <p>A run works in two phases. The frontier gets populated with hosts — from a URL, a domain list, or one of the seed sources below — then the crawler drains it: probing each host for a catalog, resolving what it finds (nested catalogs, referenced artifact documents, registries), and running every catalog through the verification pipeline. Everything lands in SQLite (or MySQL/Postgres) plus a JSONL event log, whether the catalog was valid, invalid, or never found at all.</p>
+
+      <h2 id="install">Install</h2>
+      <div class="docs-code" data-copy="brew install helgesverre/tap/ardvark">
+        <pre><span class="c-m"># Homebrew</span>
+brew install helgesverre/tap/ardvark</pre>
+        <button class="copy" data-copy="brew install helgesverre/tap/ardvark">copy</button>
+      </div>
+      <div class="docs-code" data-copy="go install github.com/helgesverre/ardvark/cmd/ardvark@latest">
+        <pre><span class="c-m"># Go</span>
+go install github.com/helgesverre/ardvark/cmd/ardvark@latest</pre>
+        <button class="copy" data-copy="go install github.com/helgesverre/ardvark/cmd/ardvark@latest">copy</button>
+      </div>
+      <p>Or grab a binary from the <a href="https://github.com/helgesverre/ardvark/releases">releases page</a> — macOS, Linux, and Windows are all published.</p>
+    </section>
+
+    <section id="quickstart">
+      <h2>Quickstart</h2>
+      <p>Crawl a site and everything it links to, probing each discovered host for ARD catalogs:</p>
+      <div class="docs-code" data-copy="ardvark crawl https://example.com">
+        <pre>ardvark crawl https://example.com</pre>
+        <button class="copy" data-copy="ardvark crawl https://example.com">copy</button>
+      </div>
+      <p>Or skip crawling entirely and probe hosts directly:</p>
+      <div class="docs-code" data-copy="ardvark probe example.com huggingface.co">
+        <pre>ardvark probe example.com huggingface.co</pre>
+        <button class="copy" data-copy="ardvark probe example.com huggingface.co">copy</button>
+      </div>
+      <p>Seed the frontier from Certificate Transparency logs — new deployments are where adopters show up first — then work through it:</p>
+      <div class="docs-code" data-copy="ardvark seed ct --count 1000
+ardvark crawl">
+        <pre>ardvark seed ct --count 1000
+ardvark crawl</pre>
+        <button class="copy" data-copy="ardvark seed ct --count 1000
+ardvark crawl">copy</button>
+      </div>
+      <p>Or start from <code>seeds/adopters.txt</code> in the repository, the hosts already confirmed to publish ARD catalogs:</p>
+      <div class="docs-code" data-copy="ardvark crawl --list seeds/adopters.txt">
+        <pre>ardvark crawl --list seeds/adopters.txt</pre>
+        <button class="copy" data-copy="ardvark crawl --list seeds/adopters.txt">copy</button>
+      </div>
+      <p>Results land in <code>ardvark.db</code> (SQLite by default) and <code>ardvark.jsonl</code>. See what you caught:</p>
+      <div class="docs-code" data-copy="ardvark stats
+ardvark export --format jsonl --out resources.jsonl">
+        <pre>ardvark stats
+ardvark export --format jsonl --out resources.jsonl</pre>
+        <button class="copy" data-copy="ardvark stats
+ardvark export --format jsonl --out resources.jsonl">copy</button>
+      </div>
+    </section>
+
+    <section id="discovery">
+      <h2>How discovery works</h2>
+      <p>ardvark checks a host for an ARD catalog through three mechanisms. Each is attempted and recorded independently — a host publishing through more than one gets a result row for each, and every discovered catalog is fetched:</p>
+      <ol>
+        <li><code>/.well-known/ai-catalog.json</code> — the canonical location the spec defines.</li>
+        <li><code>Agentmap:</code> directive in <code>robots.txt</code> — a pointer to a catalog served from somewhere else.</li>
+        <li><code>&lt;link rel="ai-catalog"&gt;</code> tag on a crawled page — found while spidering during <code>ardvark crawl</code> (not tried by <code>ardvark probe</code>, which does no HTML spidering).</li>
+      </ol>
+      <p>Every probe is recorded regardless of outcome, one row per attempt:</p>
+      <ul>
+        <li><b>hit</b> — a document was found at that location. It still goes through verification; a hit can be a valid catalog, one with warnings, or an invalid one — invalid catalogs are stored too, since "found but broken" is useful data.</li>
+        <li><b>miss</b> — the location returned 404 (or equivalent); nothing published there.</li>
+        <li><b>err</b> — the request itself failed (timeout, connection error, malformed response) before a hit/miss could be determined.</li>
+      </ul>
+      <p>A hit that resolves to a valid catalog is then recursed into: nested catalogs are followed up to <code>ard.maxCatalogDepth</code>, entries pointing at artifact documents (agent cards, MCP server cards) are fetched, and entries pointing at registries are harvested via <code>POST /search</code>, including registry referrals, up to <code>registry.maxReferralDepth</code>.</p>
+    </section>
+
+    <section id="commands">
+      <h2>Commands</h2>
+      <p class="section-sub-docs">Every command accepts the global flags <code>--config &lt;path&gt;</code> (default <code>./ardvark.json</code>) and <code>--color auto|always|never</code>. <code>crawl</code>, <code>probe</code>, every <code>seed</code> source, <code>verify</code>, and <code>stats</code> also accept <code>--json</code> — see <a href="#json-output">JSON output</a>.</p>
+
+      <article id="cmd-crawl">
+        <h3>crawl</h3>
+        <p>Seeds the persistent frontier from the given URLs and/or bare domains (and/or a <code>--list</code> file), then runs the crawler until the frontier is empty. Pending work from prior runs is resumed automatically.</p>
+        <pre class="docs-synopsis">ardvark crawl [url|domain]... [flags]</pre>
+        <table class="docs-flags">
+          <thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>--list string</code></td><td>path to a file of newline-separated URLs/domains to seed</td></tr>
+            <tr><td><code>--force</code></td><td>bypass the host_probe freshness window (re-probe hosts probed recently)</td></tr>
+            <tr><td><code>--json</code></td><td>emit the run summary as JSON instead of live rows</td></tr>
+          </tbody>
+        </table>
+        <div class="term docs-term">
+          <div class="term-bar"><span></span><span></span><span></span><span class="term-title">ardvark crawl</span></div>
+          <pre><span class="c-p">$</span> ardvark crawl https://acme.example
+<span class="c-m">seeded 1 of 1 requested seed(s)</span>
+<span class="c-ok">  hit</span>   acme.example           well_known       catalog valid          <span class="c-m">14 entries</span>
+<span class="c-warn">  hit</span>   docs.acme.example      link_tag         valid_with_warnings    <span class="c-m">queries.count</span>
+<span class="c-m">  miss</span>  static.acme.example    well_known       404
+<span class="c-m">  miss</span>  static.acme.example    robots_agentmap  no Agentmap directive
+<span class="c-m">run complete: 12 pages fetched · 3 hosts probed · 2 catalogs found · 2 valid · 0 errors</span></pre>
+        </div>
+      </article>
+
+      <article id="cmd-probe">
+        <h3>probe</h3>
+        <p>Probe host(s) directly for ARD documents, without HTML spidering — checks <code>/.well-known/ai-catalog.json</code> and the robots.txt <code>Agentmap:</code> directive only.</p>
+        <pre class="docs-synopsis">ardvark probe &lt;host&gt;... [flags]</pre>
+        <div class="term docs-term">
+          <div class="term-bar"><span></span><span></span><span></span><span class="term-title">ardvark probe</span></div>
+          <pre><span class="c-p">$</span> ardvark probe huggingface.co github.com
+<span class="c-ok">  hit</span>   huggingface.co         well_known       found                  <span class="c-m">200 application/json; charset=utf-8</span>
+<span class="c-m">  miss</span>  huggingface.co         robots_agentmap  no Agentmap directive
+<span class="c-m">  miss</span>  github.com             well_known       404
+<span class="c-m">  miss</span>  github.com             robots_agentmap  no Agentmap directive
+<span class="c-m">probe complete: 1 hits · 3 misses · 0 errors</span></pre>
+        </div>
+      </article>
+
+      <article id="cmd-seed">
+        <h3>seed</h3>
+        <p>Bootstrap the frontier from an external domain source. <code>seed</code> itself has no flags; each of the seven sources is a subcommand — see the <a href="#seeding">seeding guide</a> below for what each is good for.</p>
+        <pre class="docs-synopsis">ardvark seed [ct|crtsh|tranco|github|mcp|curated|commoncrawl] [flags]</pre>
+        <div class="term docs-term">
+          <div class="term-bar"><span></span><span></span><span></span><span class="term-title">ardvark seed ct</span></div>
+          <pre><span class="c-p">$</span> ardvark seed ct --count 1000
+<span class="c-m">seed ct complete: 1000 entries from oak,argon,nimbus log(s) · 847 added · 153 skipped (already queued)</span></pre>
+        </div>
+      </article>
+
+      <article id="cmd-verify">
+        <h3>verify</h3>
+        <p>Runs the ARD verification pipeline (JSON Schema + semantic checks) against a local file or remote URL and prints the check report, exiting 1 if the verdict is invalid. With <code>--stored</code>, every catalog already in the database is re-verified in place instead — useful after a spec or schema update.</p>
+        <pre class="docs-synopsis">ardvark verify &lt;path|url&gt; [flags]</pre>
+        <table class="docs-flags">
+          <thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>--stored</code></td><td>re-verify every catalog stored in the database instead of a single document</td></tr>
+            <tr><td><code>--json</code></td><td>emit the check report as JSON instead of the printed report card</td></tr>
+          </tbody>
+        </table>
+        <div class="term docs-term">
+          <div class="term-bar"><span></span><span></span><span></span><span class="term-title">ardvark verify</span></div>
+          <pre><span class="c-p">$</span> ardvark verify ./my-catalog.json
+<b>./my-catalog.json</b>
+  <span class="c-ok">✓</span> identifier.unique          <span class="c-m">all entry identifiers are unique</span>
+  <span class="c-ok">✓</span> catalog.spec_version       <span class="c-m">specVersion is "1.0"</span>
+  <span class="c-ok">✓</span> entry.value_or_reference   <span class="c-m">urn:air:example.com:agent:support — exactly one of url or data is present</span>
+  <span class="c-ok">✓</span> urn.format                 <span class="c-m">urn:air:example.com:agent:support — identifier is a well-formed ARD URN</span>
+  <span class="c-warn">!</span> queries.count              <span class="c-m">urn:air:example.com:agent:support — 0 representativeQueries present (recommended: 2-5)</span>
+  <span class="c-ok">✓</span> entry.media_type           <span class="c-m">urn:air:example.com:agent:support — type "application/a2a-agent-card+json" is a recognized ARD media type</span>
+<b>verdict:</b> <span class="c-warn">valid_with_warnings</span></pre>
+        </div>
+      </article>
+
+      <article id="cmd-export">
+        <h3>export</h3>
+        <p>Dump catalog entries, joined with domain and verification status, as JSONL or CSV.</p>
+        <pre class="docs-synopsis">ardvark export [flags]</pre>
+        <table class="docs-flags">
+          <thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>--format string</code></td><td>output format: jsonl or csv (default "jsonl")</td></tr>
+            <tr><td><code>--out string</code></td><td>output file path (default: stdout)</td></tr>
+          </tbody>
+        </table>
+        <div class="docs-code" data-copy="ardvark export --format jsonl --out resources.jsonl">
+          <pre>ardvark export --format jsonl --out resources.jsonl</pre>
+          <button class="copy" data-copy="ardvark export --format jsonl --out resources.jsonl">copy</button>
+        </div>
+      </article>
+
+      <article id="cmd-stats">
+        <h3>stats</h3>
+        <p>Summarize the dataset: hosts probed, catalogs by verdict, entries by media type.</p>
+        <pre class="docs-synopsis">ardvark stats [flags]</pre>
+        <div class="term docs-term">
+          <div class="term-bar"><span></span><span></span><span></span><span class="term-title">ardvark stats</span></div>
+          <pre><span class="c-p">$</span> ardvark stats
+<b>domains</b>
+  <span class="c-m">total</span>                        847
+  <span class="c-m">  found_valid</span>                3
+  <span class="c-m">  not_found</span>                  798
+  <span class="c-m">  unprobed</span>                   46
+<b>catalogs</b>
+  <span class="c-m">total</span>                        3
+  <span class="c-m">  valid</span>                      2
+  <span class="c-m">  valid_with_warnings</span>        1
+<b>entries</b>
+  <span class="c-m">total</span>                        41
+  <span class="c-m">  application/mcp-server-card+json</span> 18
+  <span class="c-m">  application/a2a-agent-card+json</span> 15
+  <span class="c-m">  application/ai-skill+md</span>    8</pre>
+        </div>
+      </article>
+
+      <article id="cmd-migrate">
+        <h3>migrate</h3>
+        <p>Opens the configured database (<code>storage.driver</code>/<code>storage.dsn</code>) and runs GORM AutoMigrate for all ardvark tables, creating the schema if it does not already exist.</p>
+        <pre class="docs-synopsis">ardvark migrate [flags]</pre>
+        <div class="docs-code" data-copy="ardvark migrate">
+          <pre>ardvark migrate</pre>
+          <button class="copy" data-copy="ardvark migrate">copy</button>
+        </div>
+      </article>
+
+      <article id="cmd-mcp">
+        <h3>mcp</h3>
+        <p>Serves ardvark's commands as MCP tools over stdio, for use from an MCP client rather than a shell. No flags of its own; see the <a href="#mcp">MCP server</a> section for the tool list, client configuration, and caveats.</p>
+        <pre class="docs-synopsis">ardvark mcp [flags]</pre>
+      </article>
+    </section>
+
+    <section id="json-output">
+      <h2>JSON output</h2>
+      <p><code>crawl</code>, <code>probe</code>, every <code>seed</code> source, <code>verify</code> (including <code>--stored</code>), and <code>stats</code> accept a <code>--json</code> flag: the command runs exactly as before but emits one pretty-printed JSON document on stdout instead of human-readable rows. <code>export</code> has no <code>--json</code> because its output is already machine-readable — pick JSONL or CSV with <code>--format</code>.</p>
+      <ul>
+        <li><b>stdout is the document</b> — live per-host rows are suppressed and diagnostics go to stderr, so piping stdout into <code>jq</code> is always safe.</li>
+        <li><b>Exit codes are unchanged</b> — <code>verify --json</code> still exits 1 when the verdict is <code>invalid</code>.</li>
+        <li><b>Same shapes as the MCP tools</b> — each structure is exactly what the corresponding <a href="#mcp">MCP tool</a> returns.</li>
+      </ul>
+      <p><code>probe --json</code> returns per-host, per-mechanism results plus a hit/miss/error summary:</p>
+      <div class="term docs-term">
+        <div class="term-bar"><span></span><span></span><span></span><span class="term-title">ardvark probe --json</span></div>
+        <pre><span class="c-p">$</span> ardvark probe example.com --json
+{
+  "hosts": [
+    {
+      "host": "example.com",
+      "results": [
+        {
+          "method": "well_known",
+          "url": "https://example.com/.well-known/ai-catalog.json",
+          "http_status": 404,
+          "outcome": "miss"
+        },
+        {
+          "method": "robots_agentmap",
+          "url": "https://example.com/robots.txt",
+          "outcome": "miss",
+          "error_detail": "no robots.txt"
+        }
+      ]
+    }
+  ],
+  "summary": { "hits": 0, "misses": 2, "errors": 0 }
+}</pre>
+      </div>
+      <p><code>crawl --json</code> returns the final run summary once the frontier is drained:</p>
+      <div class="term docs-term">
+        <div class="term-bar"><span></span><span></span><span></span><span class="term-title">ardvark crawl --json</span></div>
+        <pre><span class="c-p">$</span> ardvark crawl example.com --json
+{
+  "seeds_requested": 1,
+  "seeded": 1,
+  "pages_fetched": 0,
+  "hosts_probed": 1,
+  "catalogs_found": 0,
+  "catalogs_valid": 0,
+  "errors": 0
+}</pre>
+      </div>
+      <p><code>verify --json</code> returns the full report card — <code>source</code>, <code>verdict</code>, and every check's <code>id</code>, <code>severity</code>, <code>subject</code>, <code>passed</code>, and <code>message</code>. <code>stats --json</code> returns domain, catalog, and entry totals with their per-status breakdowns; <code>seed &lt;source&gt; --json</code> returns the source label and seeded/duplicate counts.</p>
+    </section>
+
+    <section id="mcp">
+      <h2>MCP server</h2>
+      <p><code>ardvark mcp</code> runs a stdio MCP (Model Context Protocol) server exposing ardvark's commands as tools, so an agent can drive the crawler directly instead of shelling out. Each tool is a thin wrapper over the same code path as the CLI and returns the same typed JSON structure as the corresponding command's <a href="#json-output"><code>--json</code></a> output. Config resolution is identical too: <code>--config</code>, or <code>ardvark.json</code> in the server process's working directory. Protocol messages flow over stdout; diagnostics go to stderr.</p>
+      <pre class="docs-synopsis">ardvark mcp [flags]</pre>
+      <table class="docs-flags">
+        <thead><tr><th>Tool</th><th>Arguments</th><th>What it does</th></tr></thead>
+        <tbody>
+          <tr><td><code>ardvark_probe</code></td><td><code>hosts</code></td><td>Probe hosts directly for ARD documents via the well-known path and robots.txt <code>Agentmap:</code>, recording results to the database. A few polite requests per host.</td></tr>
+          <tr><td><code>ardvark_verify</code></td><td><code>target</code></td><td>Verify one catalog — a URL or a local file path — and return the full check report. Does not write to the database.</td></tr>
+          <tr><td><code>ardvark_crawl</code></td><td><code>seeds</code>, <code>force</code> (both optional)</td><td>Seed the frontier, run the crawler until it's empty, and return the run summary. Pending work from prior runs is resumed automatically.</td></tr>
+          <tr><td><code>ardvark_seed</code></td><td><code>source</code>, <code>count</code>, <code>offset</code></td><td>Bootstrap the frontier from <code>ct</code>, <code>crtsh</code>, <code>tranco</code>, <code>github</code> (needs <code>GITHUB_TOKEN</code>), <code>mcp</code>, <code>curated</code>, or <code>commoncrawl</code>.</td></tr>
+          <tr><td><code>ardvark_stats</code></td><td>—</td><td>Summarize the indexed dataset. Read-only and fast — a good first call.</td></tr>
+          <tr><td><code>ardvark_export</code></td><td><code>format</code>, <code>out</code></td><td>Dump every indexed entry to a file as JSONL or CSV and return the row count. Writes to a file, not stdout — stdout carries the protocol.</td></tr>
+        </tbody>
+      </table>
+      <p>Register it in any client that takes an <code>mcpServers</code> map (Claude, Cursor, and friends):</p>
+      <div class="docs-code" data-copy='{
+  "mcpServers": {
+    "ardvark": {
+      "command": "ardvark",
+      "args": ["mcp", "--config", "/path/to/ardvark.json"]
+    }
+  }
+}'>
+        <pre>{
+  "mcpServers": {
+    "ardvark": {
+      "command": "ardvark",
+      "args": ["mcp", "--config", "/path/to/ardvark.json"]
+    }
+  }
+}</pre>
+        <button class="copy" data-copy='{
+  "mcpServers": {
+    "ardvark": {
+      "command": "ardvark",
+      "args": ["mcp", "--config", "/path/to/ardvark.json"]
+    }
+  }
+}'>copy</button>
+      </div>
+      <p>Clients rarely launch servers from your project directory, so pass an absolute <code>--config</code> path (and use an absolute <code>storage.dsn</code> in it) to make the tools hit the database you expect. With no config at all you get the defaults, resolved relative to whatever directory the client starts the server in.</p>
+      <p><b>Long-running crawls</b> — <code>ardvark_crawl</code> drains the entire frontier at polite per-host rates and can take minutes to hours depending on what's queued, and many MCP clients time out tool calls well before that. Prefer <code>ardvark_probe</code> for quick checks of specific hosts, keep <code>ardvark_crawl</code> for small seed lists, and run big crawls from the CLI.</p>
+      <p>ardvark.no describes this server in its own catalog: a server card at <a href="https://ardvark.no/.well-known/ardvark-mcp.json"><code>/.well-known/ardvark-mcp.json</code></a>, referenced from <a href="https://ardvark.no/.well-known/ai-catalog.json"><code>/.well-known/ai-catalog.json</code></a>.</p>
+    </section>
+
+    <section id="seeding">
+      <h2>Seeding guide</h2>
+      <p>Seven sources fill the frontier, each trading off precision (how likely a domain is to actually publish a catalog) against breadth (how many domains it surfaces). Run <code>ardvark seed &lt;source&gt; --help</code> for the full flag list; every source also reads its defaults from <a href="#configuration">config</a>.</p>
+      <table class="docs-flags docs-seed-table">
+        <thead><tr><th>Source</th><th>Command</th><th>Good for</th><th>Tradeoff</th><th>Needs a token</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Certificate Transparency</td>
+            <td><code>seed ct</code></td>
+            <td>Freshly issued certificates — new deployments show up here first. Logs resolve live from the CT log list (the <code>oak</code>, <code>argon</code>, and <code>nimbus</code> operators by default), so shard URLs never go stale.</td>
+            <td>High breadth, low precision — most new certs aren't ARD adopters.</td>
+            <td>No</td>
+          </tr>
+          <tr>
+            <td>crt.sh</td>
+            <td><code>seed crtsh</code></td>
+            <td>Certificate identity search narrowed by <code>--match</code> (e.g. <code>agent</code>, <code>mcp</code>). Without <code>--match</code>, queries a curated agent/mcp/ai keyword set instead of an unfiltered wildcard, which crt.sh can't serve.</td>
+            <td>Better precision than raw CT when keyword-matched; still keyword coincidence, not confirmation.</td>
+            <td>No</td>
+          </tr>
+          <tr>
+            <td>Tranco</td>
+            <td><code>seed tranco</code></td>
+            <td>The top N domains from the established web — everything CT-log seeding misses, since it only sees freshly issued certificates.</td>
+            <td>High breadth, low precision — mostly domains with no reason to publish an ARD catalog.</td>
+            <td>No</td>
+          </tr>
+          <tr>
+            <td>GitHub code search</td>
+            <td><code>seed github</code></td>
+            <td>Searches for well-known ARD catalog files directly and queues the owning repositories' domains.</td>
+            <td>Highest precision of all sources — a hit is a real deployed catalog, not a keyword coincidence. Low breadth: bounded by GitHub's index and rate limits.</td>
+            <td>Yes — <code>GITHUB_TOKEN</code></td>
+          </tr>
+          <tr>
+            <td>MCP registry</td>
+            <td><code>seed mcp</code></td>
+            <td>Each listed server's remote endpoint host, plus a domain decoded from its reverse-DNS-style name.</td>
+            <td>High-propensity: MCP server operators are exactly the audience ARD targets. Bounded by registry size.</td>
+            <td>No</td>
+          </tr>
+          <tr>
+            <td>Curated lists</td>
+            <td><code>seed curated</code></td>
+            <td>Extracts candidate domains from curated awesome-lists (community MCP server lists by default), dropping hosting/badge/social infrastructure so only real product domains remain.</td>
+            <td>Moderate precision, small breadth — as large as the lists scanned. <code>--url</code> replaces the default set entirely.</td>
+            <td>No</td>
+          </tr>
+          <tr>
+            <td>Common Crawl</td>
+            <td><code>seed commoncrawl</code></td>
+            <td>Top N domains from the latest web-graph domain ranks by harmonic centrality — the established web at scale (~121M ranked domains vs Tranco's 1M). Streams the ranks file and stops as soon as N domains are collected.</td>
+            <td>Very high breadth, low precision; <code>--offset</code> samples deeper slices instead of always taking the same top domains.</td>
+            <td>No</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="verification">
+      <h2>Verification</h2>
+      <p>Every fetched catalog is run through the same pipeline <code>ardvark verify</code> exposes standalone: official JSON Schema validation (Draft 2020-12) against the vendored ARD spec schema, followed by seven semantic checks the schema can't express. Each check is recorded pass/fail with a message — a report card per catalog, stored in <code>verification_checks</code>.</p>
+      <p>The rolled-up verdict is one of:</p>
+      <ul>
+        <li><b>valid</b> — every check passed.</li>
+        <li><b>valid_with_warnings</b> — all error-severity checks passed; one or more warning-severity checks failed.</li>
+        <li><b>invalid</b> — at least one error-severity check failed (including schema validation itself).</li>
+      </ul>
+      <p>Identifiers use the URN grammar <code>urn:&lt;nid&gt;:&lt;publisher&gt;:&lt;namespace...&gt;:&lt;name&gt;</code>. <code>air</code> is the namespace identifier (NID) in the ARD spec draft; <code>ai</code> also appears on catalogs already published in the wild, so both <code>urn:air:</code> and <code>urn:ai:</code> are accepted.</p>
+      <table class="docs-flags">
+        <thead><tr><th>Check ID</th><th>Severity</th><th>What it means</th></tr></thead>
+        <tbody>
+          <tr><td><code>schema.validation</code></td><td>error</td><td>The document doesn't conform to the official ai-catalog.json JSON Schema. Failures are reported per leaf, with the instance location and detail.</td></tr>
+          <tr><td><code>catalog.spec_version</code></td><td>error</td><td><code>specVersion</code> must be exactly <code>"1.0"</code>. Skipped if schema validation already failed on this field.</td></tr>
+          <tr><td><code>identifier.unique</code></td><td>error</td><td>No two entries share the same identifier, compared on the normalized parsed URN so case and encoding differences don't hide a duplicate.</td></tr>
+          <tr><td><code>entry.value_or_reference</code></td><td>error</td><td>Each entry has exactly one of <code>url</code> or <code>data</code> — not both, not neither.</td></tr>
+          <tr><td><code>urn.format</code></td><td>error</td><td>The identifier parses as a well-formed ARD URN: <code>urn:air:</code> or <code>urn:ai:</code>, a publisher segment, zero or more namespace segments, and a mandatory name segment.</td></tr>
+          <tr><td><code>urn.publisher_matches</code></td><td>warning</td><td>The URN's publisher segment shares a registrable domain (eTLD+1) with the domain the catalog was served from. May legitimately fail for aggregators publishing on behalf of others.</td></tr>
+          <tr><td><code>queries.count</code></td><td>warning</td><td>Callable entries should list 2–5 <code>representativeQueries</code>. Not checked on container/pointer entries (nested catalogs, registries).</td></tr>
+          <tr><td><code>entry.media_type</code></td><td>warning</td><td>The entry's <code>type</code> is a recognized ARD media type. The spec doesn't strictly enforce this, so an unrecognized type only warns.</td></tr>
+        </tbody>
+      </table>
+      <p>Run it standalone against anything, local or remote:</p>
+      <div class="docs-code" data-copy="ardvark verify ./my-catalog.json
+ardvark verify https://example.com/.well-known/ai-catalog.json">
+        <pre>ardvark verify ./my-catalog.json
+ardvark verify https://example.com/.well-known/ai-catalog.json</pre>
+        <button class="copy" data-copy="ardvark verify ./my-catalog.json
+ardvark verify https://example.com/.well-known/ai-catalog.json">copy</button>
+      </div>
+    </section>
+
+    <section id="configuration">
+      <h2>Configuration</h2>
+      <p>ardvark runs with sensible defaults and no config file. To change anything, drop an <code>ardvark.json</code> in the working directory (or pass <code>--config path</code>). The file is schema-validated — a typo'd key or bad value gets a precise <code>config.&lt;path&gt;: ...</code> error, not silent misbehavior. Values present in the file override defaults; missing keys keep their default.</p>
+      <table class="docs-flags docs-config-table">
+        <thead><tr><th>Key</th><th>Default</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>storage.driver</code></td><td><code>sqlite</code></td><td><code>sqlite</code>, <code>mysql</code>, or <code>postgres</code></td></tr>
+          <tr><td><code>storage.dsn</code></td><td><code>ardvark.db</code></td><td>File path (sqlite) or DSN (mysql/postgres)</td></tr>
+          <tr><td><code>log.file</code></td><td><code>ardvark.jsonl</code></td><td>JSONL event log path</td></tr>
+          <tr><td><code>log.level</code></td><td><code>info</code></td><td><code>debug</code>, <code>info</code>, <code>warn</code>, or <code>error</code></td></tr>
+          <tr><td><code>crawler.concurrency</code></td><td><code>8</code></td><td>Parallel workers</td></tr>
+          <tr><td><code>crawler.maxDepth</code></td><td><code>2</code></td><td>Anchor-following depth from seeds</td></tr>
+          <tr><td><code>crawler.maxPagesPerDomain</code></td><td><code>50</code></td><td>Page budget per domain</td></tr>
+          <tr><td><code>crawler.perHostRequestsPerSecond</code></td><td><code>1</code></td><td>Politeness rate limit</td></tr>
+          <tr><td><code>crawler.requestTimeoutSeconds</code></td><td><code>15</code></td><td>Per-request timeout</td></tr>
+          <tr><td><code>crawler.maxBodyBytes</code></td><td><code>5242880</code></td><td>Response body size cap (5 MiB)</td></tr>
+          <tr><td><code>crawler.userAgent</code></td><td><code>ardvark/0.1 (+https://github.com/helgesverre/ardvark)</code></td><td>User-Agent header sent on every request</td></tr>
+          <tr><td><code>crawler.respectRobotsTxt</code></td><td><code>true</code></td><td>Honor robots.txt disallow rules</td></tr>
+          <tr><td><code>crawler.refreshAfterHours</code></td><td><code>168</code></td><td>Skip hosts probed within this window (see <code>--force</code>)</td></tr>
+          <tr><td><code>ard.maxCatalogDepth</code></td><td><code>3</code></td><td>Nested-catalog recursion bound</td></tr>
+          <tr><td><code>ard.fetchArtifacts</code></td><td><code>true</code></td><td>Fetch the agent/MCP-server cards entries point at</td></tr>
+          <tr><td><code>registry.harvest</code></td><td><code>true</code></td><td>Harvest registries discovered via catalog entries</td></tr>
+          <tr><td><code>registry.maxReferralDepth</code></td><td><code>2</code></td><td>Registry referral-following bound</td></tr>
+          <tr><td><code>registry.pageLimit</code></td><td><code>20</code></td><td>Max <code>POST /search</code> pages per registry</td></tr>
+          <tr><td><code>seed.ct.logListUrl</code></td><td>gstatic CT log list v3</td><td>Source of live CT log shard URLs</td></tr>
+          <tr><td><code>seed.ct.logs</code></td><td><code>["oak", "argon", "nimbus"]</code></td><td>CT log operator tokens tried for <code>seed ct</code></td></tr>
+          <tr><td><code>seed.ct.entryCount</code></td><td><code>1000</code></td><td>Default <code>seed ct</code> entry count</td></tr>
+          <tr><td><code>seed.crtsh.endpoint</code></td><td><code>https://crt.sh</code></td><td>crt.sh endpoint</td></tr>
+          <tr><td><code>seed.crtsh.count</code></td><td><code>1000</code></td><td>Default <code>seed crtsh</code> domain count (own key, not shared with <code>seed.ct.entryCount</code>)</td></tr>
+          <tr><td><code>seed.tranco.listUrl</code></td><td><code>tranco-list.eu/top-1m.csv.zip</code></td><td>Tranco list URL</td></tr>
+          <tr><td><code>seed.tranco.top</code></td><td><code>1000</code></td><td>Default <code>seed tranco</code> domain count</td></tr>
+          <tr><td><code>seed.github.query</code></td><td><code>filename:ai-catalog.json path:.well-known</code></td><td>GitHub code-search query for <code>seed github</code></td></tr>
+          <tr><td><code>seed.github.count</code></td><td><code>100</code></td><td>Default <code>seed github</code> domain count</td></tr>
+          <tr><td><code>seed.mcp.registryUrl</code></td><td><code>https://registry.modelcontextprotocol.io</code></td><td>MCP registry API base URL for <code>seed mcp</code></td></tr>
+          <tr><td><code>seed.mcp.count</code></td><td><code>1000</code></td><td>Default <code>seed mcp</code> domain count</td></tr>
+          <tr><td><code>seed.curated.urls</code></td><td>three awesome-mcp-servers READMEs</td><td>List documents scanned by <code>seed curated</code></td></tr>
+          <tr><td><code>seed.curated.count</code></td><td><code>500</code></td><td>Default <code>seed curated</code> domain count</td></tr>
+          <tr><td><code>seed.commoncrawl.graphInfoUrl</code></td><td><code>index.commoncrawl.org/graphinfo.json</code></td><td>Lists available web-graph releases</td></tr>
+          <tr><td><code>seed.commoncrawl.graph</code></td><td><code>""</code> (latest)</td><td>Pinned Common Crawl web-graph release id</td></tr>
+          <tr><td><code>seed.commoncrawl.top</code></td><td><code>1000</code></td><td>Default <code>seed commoncrawl</code> domain count</td></tr>
+          <tr><td><code>seed.commoncrawl.offset</code></td><td><code>0</code></td><td>Ranked domains skipped before collecting</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="storage">
+      <h2>Storage</h2>
+      <p>Every raw document is kept verbatim alongside the extracted data, so you can re-process without re-crawling. Nine tables:</p>
+      <table class="docs-flags">
+        <thead><tr><th>Table</th><th>What's in it</th></tr></thead>
+        <tbody>
+          <tr><td><code>crawl_runs</code></td><td>One row per <code>ardvark crawl</code> invocation: start/finish time, config snapshot, run totals.</td></tr>
+          <tr><td><code>frontier_items</code></td><td>The persistent work queue — page fetches, host probes, catalog fetches, artifact fetches, registry harvests — with status, attempts, and dedup key.</td></tr>
+          <tr><td><code>domains</code></td><td>Every discovered host, its discovery source, and its ARD status (unprobed / not_found / found_invalid / found_valid).</td></tr>
+          <tr><td><code>probes</code></td><td>Every probe attempt against a domain: method, outcome (hit/miss/error), HTTP status, full history.</td></tr>
+          <tr><td><code>catalogs</code></td><td>Fetched catalogs with raw JSON kept verbatim, content hash, and verification status. Invalid catalogs are stored too — flagged <code>invalid</code>, not dropped.</td></tr>
+          <tr><td><code>catalog_entries</code></td><td>Individual resource entries with URN segments split out for filtering; registry-harvested entries live in the same table with provenance back to their source registry.</td></tr>
+          <tr><td><code>artifacts</code></td><td>The fetched agent cards and MCP server cards entries point at, raw body included.</td></tr>
+          <tr><td><code>registries</code></td><td>ARD registries discovered via catalog entries, with harvest status and referral provenance.</td></tr>
+          <tr><td><code>verification_checks</code></td><td>One row per check per catalog (or entry) — the machine-readable report card <code>ardvark verify</code> prints.</td></tr>
+        </tbody>
+      </table>
+      <p>Alongside the database, every significant crawl event (probe result, catalog verified, item failed, registry harvested, ...) is appended as a JSON line to <code>log.file</code> (<code>ardvark.jsonl</code> by default) — the machine-readable record; the CLI's own printed rows are the human-readable one.</p>
+      <p>Swapping storage backends is one config key, <code>storage.driver</code>, plus a matching <code>storage.dsn</code>:</p>
+      <div class="docs-code" data-copy='{ "storage": { "driver": "sqlite", "dsn": "ardvark.db" } }'>
+        <pre><span class="c-m">// sqlite (default) — dsn is a file path</span>
+{ "storage": { "driver": "sqlite", "dsn": "ardvark.db" } }</pre>
+        <button class="copy" data-copy='{ "storage": { "driver": "sqlite", "dsn": "ardvark.db" } }'>copy</button>
+      </div>
+      <div class="docs-code" data-copy='{ "storage": { "driver": "mysql", "dsn": "user:pass@tcp(127.0.0.1:3306)/ardvark?parseTime=true" } }'>
+        <pre><span class="c-m">// mysql</span>
+{ "storage": { "driver": "mysql", "dsn": "user:pass@tcp(127.0.0.1:3306)/ardvark?parseTime=true" } }</pre>
+        <button class="copy" data-copy='{ "storage": { "driver": "mysql", "dsn": "user:pass@tcp(127.0.0.1:3306)/ardvark?parseTime=true" } }'>copy</button>
+      </div>
+      <div class="docs-code" data-copy='{ "storage": { "driver": "postgres", "dsn": "postgres://user:pass@127.0.0.1:5432/ardvark?sslmode=disable" } }'>
+        <pre><span class="c-m">// postgres</span>
+{ "storage": { "driver": "postgres", "dsn": "postgres://user:pass@127.0.0.1:5432/ardvark?sslmode=disable" } }</pre>
+        <button class="copy" data-copy='{ "storage": { "driver": "postgres", "dsn": "postgres://user:pass@127.0.0.1:5432/ardvark?sslmode=disable" } }'>copy</button>
+      </div>
+      <p><code>ardvark migrate</code> creates or updates the schema for whichever driver is configured; <code>crawl</code>, <code>verify</code>, and every other command that touches the database run the same migration on open.</p>
+    </section>
+
+    <section id="operations">
+      <h2>Operational notes</h2>
+      <ul>
+        <li><b>Politeness by default</b> — <code>crawler.perHostRequestsPerSecond</code> rate-limits requests per host (default 1/s), <code>crawler.respectRobotsTxt</code> honors disallow rules (default on), and <code>crawler.maxBodyBytes</code>/redirect caps bound what a single response can cost. One host having a bad day doesn't sink a run.</li>
+        <li><b>Resumable runs</b> — the crawl frontier lives in the database as <code>frontier_items</code>, not in process memory. Kill <code>ardvark crawl</code> at any point and run it again: pending and in-flight items are picked back up automatically, no separate resume flag needed.</li>
+        <li><b><code>--force</code></b> — hosts probed within <code>crawler.refreshAfterHours</code> (default 168h / 7 days) are skipped on a normal run. <code>--force</code> bypasses that freshness window and re-probes them anyway.</li>
+        <li><b><code>refreshAfterHours</code></b> — tune this to control how often previously-probed hosts get re-checked; lower it for fast-moving domain sets, raise it to avoid re-hitting a stable dataset.</li>
+        <li><b>Exit codes</b> — 0 on success. Any command returns a non-zero exit on error, including <code>ardvark verify</code> against a single document whose verdict comes back <code>invalid</code>.</li>
+      </ul>
+    </section>
+
+  </main>
+</div>
+
+<script>
+// Copy buttons — shared with index.html's handler.
+document.querySelectorAll('.copy').forEach(function (btn) {
+  btn.addEventListener('click', function () {
+    navigator.clipboard.writeText(btn.dataset.copy).then(function () {
+      btn.textContent = 'copied';
+      btn.classList.add('ok');
+      setTimeout(function () {
+        btn.textContent = 'copy';
+        btn.classList.remove('ok');
+      }, 1500);
+    });
+  });
+});
+
+// Clicking a section label inside a <summary> should navigate, not also
+// collapse the section — preventDefault stops the toggle, then we navigate
+// and make sure the section is open.
+document.querySelectorAll('.docs-sidebar summary').forEach(function (s) {
+  s.addEventListener('click', function (e) {
+    var link = e.target.closest('a');
+    if (!link) return;
+    e.preventDefault();
+    s.parentElement.open = true;
+    location.hash = link.getAttribute('href');
+  });
+});
+
+// Mobile sidebar disclosure.
+var tocToggle = document.getElementById('docs-toc-toggle');
+var sidebar = document.getElementById('docs-sidebar');
+if (tocToggle && sidebar) {
+  tocToggle.addEventListener('click', function () {
+    var open = sidebar.classList.toggle('open');
+    tocToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+  sidebar.addEventListener('click', function (e) {
+    if (e.target.tagName === 'A' && window.matchMedia('(max-width: 880px)').matches) {
+      sidebar.classList.remove('open');
+      tocToggle.setAttribute('aria-expanded', 'false');
+    }
+  });
+}
+
+// Highlight the current section's sidebar link on scroll.
+// Articles (command subsections) also highlight their parent section.
+var spyTargets = document.querySelectorAll('.docs-content section[id], .docs-content article[id]');
+var sidebarLinks = sidebar ? sidebar.querySelectorAll('a[href^="#"]') : [];
+function setActive(el) {
+  var ids = ['#' + el.id];
+  var parent = el.closest('section[id]');
+  if (parent && parent !== el) ids.push('#' + parent.id);
+  sidebarLinks.forEach(function (a) {
+    a.classList.toggle('active', ids.indexOf(a.getAttribute('href')) !== -1);
+  });
+}
+if ('IntersectionObserver' in window && spyTargets.length) {
+  var observer = new IntersectionObserver(function (entries) {
+    entries.forEach(function (entry) {
+      if (entry.isIntersecting) setActive(entry.target);
+    });
+  }, { rootMargin: '-10% 0px -70% 0px', threshold: 0 });
+  spyTargets.forEach(function (s) { observer.observe(s); });
+}
+</script>
+</body>
+</html>

@@ -1,14 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
-	"log/slog"
 	"os"
 
 	"github.com/spf13/cobra"
 
 	"github.com/helgesverre/ardvark/internal/config"
-	"github.com/helgesverre/ardvark/internal/eventlog"
 	"github.com/helgesverre/ardvark/internal/fetch"
 	"github.com/helgesverre/ardvark/internal/store"
 	"github.com/helgesverre/ardvark/internal/ui"
@@ -20,6 +19,12 @@ var configPath string
 // colorMode is bound to the root --color persistent flag: auto (TTY/NO_COLOR
 // detection), always, or never.
 var colorMode string
+
+// jsonOut is bound to the --json flag. It is registered per command (via
+// addJSONFlag) rather than as a persistent root flag, so cobra itself
+// rejects --json on commands that don't support it ("unknown flag") instead
+// of needing bespoke validation.
+var jsonOut bool
 
 // rootCmd is the ardvark CLI entry point. Subcommands are added to it in
 // their own files' init() functions.
@@ -69,26 +74,21 @@ func openApp() (config.Config, *store.Store, error) {
 	return cfg, st, nil
 }
 
-// newLogger builds the crawl-event logger from cfg.Log: JSONL to
-// cfg.Log.File, human-readable text to stderr.
-func newLogger(cfg config.Config) (*slog.Logger, error) {
-	level := parseLevel(cfg.Log.Level)
-	return eventlog.New(cfg.Log.File, level)
+// addJSONFlag registers the --json flag on a command that supports typed
+// JSON output. Commands render their jsonout result struct as pretty-printed
+// JSON instead of human output when it is set.
+func addJSONFlag(cmd *cobra.Command) {
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit the result as pretty-printed JSON instead of human-readable output")
 }
 
-// parseLevel maps a config log level string to a slog.Level, defaulting to
-// Info for an empty or unrecognized value.
-func parseLevel(s string) slog.Level {
-	switch s {
-	case "debug":
-		return slog.LevelDebug
-	case "warn":
-		return slog.LevelWarn
-	case "error":
-		return slog.LevelError
-	default:
-		return slog.LevelInfo
+// printJSON pretty-prints v as JSON to cmd's configured stdout.
+func printJSON(cmd *cobra.Command, v any) error {
+	out, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encoding JSON output: %w", err)
 	}
+	fmt.Fprintln(cmd.OutOrStdout(), string(out))
+	return nil
 }
 
 // newFetchClient builds a polite fetch.Client from the crawler config.

@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Agentmap: https://ardvark.no/.well-known/ai-catalog.json

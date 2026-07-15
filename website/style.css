@@ -83,10 +83,12 @@ code, pre { font-family: var(--font-mono); }
   color: var(--text-muted);
 }
 
-.ctas { display: flex; gap: 12px; margin-top: 24px; }
+.ctas { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 24px; }
 
 .btn {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   padding: 10px 22px;
   border-radius: var(--r-md);
   font-size: var(--text-sm);
@@ -94,6 +96,7 @@ code, pre { font-family: var(--font-mono); }
   transition: all 0.15s var(--ease);
 }
 .btn:hover { text-decoration: none; transform: translateY(-1px); }
+.btn svg { width: 1em; height: 1em; flex-shrink: 0; }
 
 .btn-primary { background: var(--brand-primary); color: #fff; }
 .btn-primary:hover { background: var(--brand-primary-ink); }
