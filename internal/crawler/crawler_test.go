@@ -1253,29 +1253,141 @@ func TestHandlePageFetch_MaxPagesPerDomainIsPerHost(t *testing.T) {
 	}
 }
 
-func TestPageBudgetAvailable_FailsOpenAndClosesAtLimit(t *testing.T) {
+// TestEnqueuePageFetch_GatesNewButAllowsReactivationAtBudget verifies the
+// engine-level budget wiring at exactly the cap: a NEW url is refused, while
+// re-enqueueing an EXISTING done url succeeds (flipping it to pending)
+// without creating a new row. This is the regression guard for the finding
+// that the count-only gate froze a capped host's known pages out of every
+// later crawl.
+func TestEnqueuePageFetch_GatesNewButAllowsReactivationAtBudget(t *testing.T) {
 	cfg := testCrawlerConfig()
 	cfg.Crawler.MaxPagesPerDomain = 2
 	eng, st := newTestEngine(t, cfg)
 
-	if !eng.pageBudgetAvailable("fresh.example") {
-		t.Fatal("expected budget available for a host with no existing page_fetch rows")
+	const host = "fresh.example"
+	for i := 0; i < 2; i++ {
+		url := fmt.Sprintf("https://%s/%d", host, i)
+		added, err := eng.enqueuePageFetch(url, host, 1)
+		if err != nil {
+			t.Fatalf("enqueuePageFetch(fill %d): %v", i, err)
+		}
+		if !added {
+			t.Fatalf("expected fill enqueue %d to be added", i)
+		}
+	}
+
+	// Complete the first URL so re-enqueue exercises the re-activation path.
+	fr := frontier.New(st.DB)
+	items, err := fr.Dequeue(2)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	doneURL := items[0].URL
+	if err := fr.Complete(items[0].ID); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	// A brand-new URL at budget is refused.
+	added, err := eng.enqueuePageFetch(fmt.Sprintf("https://%s/brand-new", host), host, 1)
+	if err != nil {
+		t.Fatalf("enqueuePageFetch(new): %v", err)
+	}
+	if added {
+		t.Fatal("expected a NEW url at budget to be refused")
+	}
+
+	// The existing done URL re-activates for free.
+	added, err = eng.enqueuePageFetch(doneURL, host, 1)
+	if err != nil {
+		t.Fatalf("enqueuePageFetch(reactivate): %v", err)
+	}
+	if !added {
+		t.Fatal("expected re-enqueue of an existing done url at budget to succeed")
+	}
+
+	var count int64
+	if err := st.DB.Model(&store.FrontierItem{}).
+		Where("kind = ? AND host = ?", store.KindPageFetch, host).
+		Count(&count).Error; err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("re-activation must not create a row: want 2 page_fetch rows, got %d", count)
+	}
+}
+
+// TestHandlePageFetch_ReCrawlReactivatesCappedHostPages simulates the
+// refresh-crawl regression end to end: a host that already reached
+// maxPagesPerDomain (its budget rows all "done") must, on a later crawl of
+// the same seed page, re-activate those existing page rows rather than only
+// re-fetching the seed. Before the fix the budget blocked every re-enqueue,
+// so the done rows stayed done and the host silently stopped re-crawling its
+// known pages.
+func TestHandlePageFetch_ReCrawlReactivatesCappedHostPages(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		var links strings.Builder
+		for i := 0; i < 6; i++ {
+			fmt.Fprintf(&links, `<a href="/link%d">link</a>`, i)
+		}
+		w.Write([]byte("<html><body>" + links.String() + "</body></html>"))
+	})
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(404) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := testCrawlerConfig()
+	cfg.Crawler.MaxDepth = 5
+	cfg.Crawler.MaxPagesPerDomain = 3
+	eng, st := newTestEngine(t, cfg)
+	host := strings.TrimPrefix(srv.URL, "http://")
+
+	item := store.FrontierItem{URL: srv.URL + "/", Host: host, Depth: 0}
+
+	// First crawl: fan-out fills the host to its budget of 3 page rows.
+	if err := eng.handlePageFetch(context.Background(), item); err != nil {
+		t.Fatalf("handlePageFetch (first): %v", err)
 	}
 
 	fr := frontier.New(st.DB)
-	for i := 0; i < 2; i++ {
-		item := &store.FrontierItem{
-			Kind:     store.KindPageFetch,
-			Host:     "fresh.example",
-			URL:      fmt.Sprintf("https://fresh.example/%d", i),
-			DedupKey: fmt.Sprintf("page_fetch:https://fresh.example/%d", i),
+	drainToDone := func() []store.FrontierItem {
+		items, err := fr.Dequeue(100)
+		if err != nil {
+			t.Fatalf("Dequeue: %v", err)
 		}
-		if _, err := fr.Enqueue(item); err != nil {
-			t.Fatalf("Enqueue: %v", err)
+		for _, it := range items {
+			if err := fr.Complete(it.ID); err != nil {
+				t.Fatalf("Complete: %v", err)
+			}
+		}
+		return items
+	}
+	firstBatch := drainToDone()
+	var firstPageIDs []uint
+	for _, it := range firstBatch {
+		if it.Kind == store.KindPageFetch && it.Host == host {
+			firstPageIDs = append(firstPageIDs, it.ID)
 		}
 	}
+	if len(firstPageIDs) != 3 {
+		t.Fatalf("precondition: want 3 page_fetch rows at budget, got %d", len(firstPageIDs))
+	}
 
-	if eng.pageBudgetAvailable("fresh.example") {
-		t.Fatal("expected budget exhausted once maxPagesPerDomain rows exist for the host")
+	// Second crawl of the same seed: the fan-out sees the same 6 links. The 3
+	// already-known ones must re-activate (done -> pending); the other 3 are
+	// refused because the host is at budget. Net: still 3 rows, now pending.
+	if err := eng.handlePageFetch(context.Background(), item); err != nil {
+		t.Fatalf("handlePageFetch (re-crawl): %v", err)
+	}
+
+	var total, pending int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ? AND host = ?", store.KindPageFetch, host).Count(&total)
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ? AND host = ? AND status = ?", store.KindPageFetch, host, store.FrontierStatusPending).Count(&pending)
+	if total != 3 {
+		t.Fatalf("re-crawl must not create new page rows past budget: want 3, got %d", total)
+	}
+	if pending != 3 {
+		t.Fatalf("re-crawl must re-activate the capped host's done pages: want 3 pending, got %d", pending)
 	}
 }

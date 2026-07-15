@@ -93,13 +93,13 @@ func (e *Engine) handlePageFetch(ctx context.Context, item store.FrontierItem) e
 			if err != nil {
 				continue
 			}
-			if !e.pageBudgetAvailable(linkHost) {
-				continue
-			}
-			// A failed or deduped enqueue inserted no frontier_items row, so
-			// there is nothing to undo: the budget is counted straight from
-			// the table (see pageBudgetAvailable), not reserved in memory.
-			if _, err := e.enqueue(store.KindPageFetch, link, linkHost, item.Depth+1, provenance{}); err != nil {
+			// enqueuePageFetch applies the maxPagesPerDomain budget per call,
+			// so it both refuses NEW URLs once linkHost is capped and lets an
+			// already-known URL be re-activated for free (see its doc comment).
+			// Checked here inside the fan-out loop, the budget reflects every
+			// page_fetch row the earlier iterations added, so one page cannot
+			// overshoot.
+			if _, err := e.enqueuePageFetch(link, linkHost, item.Depth+1); err != nil {
 				continue
 			}
 		}

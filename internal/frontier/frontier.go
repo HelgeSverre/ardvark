@@ -208,6 +208,38 @@ type Item = store.FrontierItem
 // no-op and returns (false, nil) — true in-flight dedup, to avoid
 // duplicate concurrent work.
 func (f *Frontier) Enqueue(item *store.FrontierItem) (bool, error) {
+	// No budget: -1 disables the per-(host, kind) row cap that
+	// EnqueueBudgeted applies (see enqueue).
+	return f.enqueue(item, -1)
+}
+
+// EnqueueBudgeted behaves exactly like Enqueue except it refuses to create a
+// NEW frontier_items row for item.Host/item.Kind once that pair already has
+// maxRowsForHostKind rows (across every status). It exists so callers can cap
+// how many distinct URLs a host contributes to the frontier — e.g. the crawl
+// engine's crawler.maxPagesPerDomain page budget — without contorting
+// Enqueue's signature for the many call sites that need no budget.
+//
+// The budget gates ONLY fresh-row creation. Re-activating an existing dedup
+// key (flipping a done/failed row back to pending for a refresh crawl or
+// --force) creates no row and so is ALWAYS permitted, even at or over budget:
+// the cap counts distinct rows present in the frontier, and a re-activation
+// adds none. This is the whole point of the method over a caller-side
+// "count < budget" gate, which cannot tell a genuinely new URL apart from a
+// re-enqueue of one the host already reached — and so would wrongly freeze a
+// capped host's existing pages out of every subsequent crawl.
+//
+// maxRowsForHostKind < 0 disables the budget entirely (equivalent to
+// Enqueue). A budget of 0 permits re-activations but no new rows.
+func (f *Frontier) EnqueueBudgeted(item *store.FrontierItem, maxRowsForHostKind int) (bool, error) {
+	return f.enqueue(item, maxRowsForHostKind)
+}
+
+// enqueue is the shared implementation of Enqueue and EnqueueBudgeted.
+// maxRowsForHostKind < 0 means "no budget"; >= 0 caps the number of distinct
+// frontier_items rows for (item.Host, item.Kind), gating fresh inserts only
+// (see EnqueueBudgeted).
+func (f *Frontier) enqueue(item *store.FrontierItem, maxRowsForHostKind int) (bool, error) {
 	if item.DedupKey == "" {
 		return false, fmt.Errorf("frontier: enqueue requires a non-empty DedupKey")
 	}
@@ -232,6 +264,46 @@ func (f *Frontier) Enqueue(item *store.FrontierItem) (bool, error) {
 	// and internal/fetch's package doc). item.Host itself is left untouched
 	// here — it keeps its attribution/budget meaning.
 	item.HostShard = hostShard(fetchHost(item))
+
+	if maxRowsForHostKind >= 0 {
+		// Budget enabled: gate a FRESH insert on the (host, kind) row count,
+		// but never a re-activation of an existing dedup key (which creates no
+		// row). We count first rather than insert-then-check-then-delete: an
+		// over-budget insert that we later rolled back would briefly publish a
+		// row a peer worker could dequeue. The count is taken BEFORE the
+		// existence probe below, so at exactly the budget the sole enqueue we
+		// still allow is a re-activation of a key that already exists.
+		//
+		// Count-first is not atomic with the Create/re-activate below — a peer
+		// could insert another row for the same host in the gap — so under
+		// distributed crawling the cap is a soft, per-process bound that can be
+		// overshot by a small, bounded amount. That is an accepted, documented
+		// tradeoff (see the Engine's maxPagesPerDomain doc comment); host-
+		// affinity sharding makes the race rare because one worker normally owns
+		// a given host.
+		var count int64
+		if err := f.db.Model(&store.FrontierItem{}).
+			Where("host = ? AND kind = ?", item.Host, item.Kind).
+			Count(&count).Error; err != nil {
+			return false, fmt.Errorf("frontier: enqueue budget count: %w", err)
+		}
+		if count >= int64(maxRowsForHostKind) {
+			// At/over budget: permit this enqueue only if the dedup key already
+			// exists (a re-activation, which the shared path below performs via
+			// the unique-constraint conflict branch). A genuinely new key would
+			// create an over-budget row, so refuse it.
+			var existing store.FrontierItem
+			if err := f.db.Select("id").Where("dedup_key = ?", item.DedupKey).First(&existing).Error; err != nil {
+				// No existing row (ErrRecordNotFound) or a transient lookup
+				// error: either way a new row is not permitted here. Refusing is
+				// safe — the budget is a soft cap, so declining under a rare
+				// lookup error merely under-enqueues rather than corrupting.
+				return false, nil
+			}
+			// Existing key: fall through. Create will conflict on the unique
+			// dedup_key index and the re-activation path runs unconditionally.
+		}
+	}
 
 	err := f.db.Create(item).Error
 	if err == nil {
@@ -569,11 +641,13 @@ func (f *Frontier) PendingCount() (int64, error) {
 
 // CountByHostKind returns how many frontier_items rows exist for host with
 // the given kind, across every status (pending, in_flight, done, failed).
-// The crawl engine uses this at enqueue time to enforce
-// crawler.maxPagesPerDomain against kind page_fetch: since Enqueue's dedup
-// key guarantees at most one row per distinct URL, this count is an exact
-// per-process page budget check (see the Engine doc comment on
-// maxPagesPerDomain for the cross-worker race this does not cover).
+// Since Enqueue's dedup key guarantees at most one row per distinct URL, this
+// is an exact per-process count of the distinct URLs a host contributes for a
+// kind. EnqueueBudgeted uses the same count internally to enforce the
+// crawler.maxPagesPerDomain page budget against kind page_fetch (gating only
+// fresh inserts — see EnqueueBudgeted and the Engine's maxPagesPerDomain doc
+// comment for the cross-worker race this does not cover); this exported form
+// is retained for callers and tests that need the raw count.
 func (f *Frontier) CountByHostKind(host, kind string) (int64, error) {
 	var count int64
 	if err := f.db.Model(&store.FrontierItem{}).

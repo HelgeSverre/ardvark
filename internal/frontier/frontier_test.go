@@ -1102,3 +1102,114 @@ func TestCountByHostKind(t *testing.T) {
 		t.Fatalf("CountByHostKind(other.example, page_fetch) = %d, want 1", count)
 	}
 }
+
+// TestEnqueueBudgeted_GatesNewRowsButAllowsReactivation is the core
+// regression test for the DB-backed page budget: at exactly the budget, a
+// NEW URL must be refused, but re-enqueueing an EXISTING done URL must
+// succeed (flipping it back to pending) WITHOUT creating a new row. The old
+// count-only gate blocked both, silently freezing a capped host's known
+// pages out of every later crawl.
+func TestEnqueueBudgeted_GatesNewRowsButAllowsReactivation(t *testing.T) {
+	f := newTestFrontier(t)
+
+	const host = "budget.example"
+	const budget = 2
+
+	// Fill the host to exactly its budget with distinct URLs.
+	for i := 0; i < budget; i++ {
+		url := fmt.Sprintf("https://%s/%d", host, i)
+		added, err := f.EnqueueBudgeted(&store.FrontierItem{
+			Kind: store.KindPageFetch, Host: host, URL: url,
+			DedupKey: "page_fetch:" + url,
+		}, budget)
+		if err != nil {
+			t.Fatalf("EnqueueBudgeted(fill %d): %v", i, err)
+		}
+		if !added {
+			t.Fatalf("expected fill enqueue %d to be added (host under budget)", i)
+		}
+	}
+
+	// Drive one of the existing URLs to "done" so re-enqueue exercises the
+	// re-activation (not in-flight dedup) path.
+	items, err := f.Dequeue(budget)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	doneID := items[0].ID
+	doneURL := items[0].URL
+	if err := f.Complete(doneID); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	rowsBefore, err := f.CountByHostKind(host, store.KindPageFetch)
+	if err != nil {
+		t.Fatalf("CountByHostKind: %v", err)
+	}
+	if rowsBefore != budget {
+		t.Fatalf("precondition: want %d rows at budget, got %d", budget, rowsBefore)
+	}
+
+	// (1a) A genuinely NEW URL for the capped host must be refused, and must
+	// not create a row.
+	newURL := fmt.Sprintf("https://%s/brand-new", host)
+	added, err := f.EnqueueBudgeted(&store.FrontierItem{
+		Kind: store.KindPageFetch, Host: host, URL: newURL,
+		DedupKey: "page_fetch:" + newURL,
+	}, budget)
+	if err != nil {
+		t.Fatalf("EnqueueBudgeted(new): %v", err)
+	}
+	if added {
+		t.Fatal("expected a NEW url at budget to be refused")
+	}
+
+	// (1b) Re-enqueueing the EXISTING done URL must succeed, flipping the row
+	// back to pending, and must NOT create a new row.
+	added, err = f.EnqueueBudgeted(&store.FrontierItem{
+		Kind: store.KindPageFetch, Host: host, URL: doneURL,
+		DedupKey: "page_fetch:" + doneURL,
+	}, budget)
+	if err != nil {
+		t.Fatalf("EnqueueBudgeted(reactivate): %v", err)
+	}
+	if !added {
+		t.Fatal("expected re-enqueue of an existing done url at budget to succeed (re-activation is free)")
+	}
+
+	rowsAfter, err := f.CountByHostKind(host, store.KindPageFetch)
+	if err != nil {
+		t.Fatalf("CountByHostKind: %v", err)
+	}
+	if rowsAfter != budget {
+		t.Fatalf("re-activation must not create a row: want %d rows, got %d", budget, rowsAfter)
+	}
+
+	var reactivated store.FrontierItem
+	if err := f.db.First(&reactivated, doneID).Error; err != nil {
+		t.Fatalf("re-read reactivated row: %v", err)
+	}
+	if reactivated.Status != store.FrontierStatusPending {
+		t.Fatalf("expected re-activated row to be pending, got %q", reactivated.Status)
+	}
+}
+
+// TestEnqueueBudgeted_NegativeBudgetDisablesGate verifies that a negative
+// budget is equivalent to plain Enqueue (no cap): the whole point of the
+// sentinel is to let enqueue() serve both Enqueue and EnqueueBudgeted.
+func TestEnqueueBudgeted_NegativeBudgetDisablesGate(t *testing.T) {
+	f := newTestFrontier(t)
+	for i := 0; i < 5; i++ {
+		url := fmt.Sprintf("https://nolimit.example/%d", i)
+		added, err := f.EnqueueBudgeted(&store.FrontierItem{
+			Kind: store.KindPageFetch, Host: "nolimit.example", URL: url,
+			DedupKey: "page_fetch:" + url,
+		}, -1)
+		if err != nil {
+			t.Fatalf("EnqueueBudgeted(%d): %v", i, err)
+		}
+		if !added {
+			t.Fatalf("expected enqueue %d to be added with budget disabled", i)
+		}
+	}
+}

@@ -154,20 +154,50 @@ type provenance struct {
 	ProbeMethod       string
 }
 
-// enqueue builds and enqueues a frontier item for kind, deriving the dedup
-// key from the item's natural key (host for host_probe, URL otherwise) in
-// one place so keys cannot drift across call sites, and stamping prov onto
-// the row so a handler can read it back after this item is dequeued
-// (possibly by a different worker process). An enqueue failure is
-// warn-logged here — the crawl always continues without the item — and
-// also returned for the callers that must react to it (seed enqueues,
-// page-budget release).
+// enqueue builds (via buildItem) and enqueues a frontier item for kind. An
+// enqueue failure is warn-logged here — the crawl always continues without
+// the item — and also returned for the callers that must react to it (seed
+// enqueues). Page-fetch fan-out uses enqueuePageFetch instead, which applies
+// the maxPagesPerDomain budget.
 func (e *Engine) enqueue(kind, url, host string, depth int, prov provenance) (bool, error) {
+	added, err := e.frontier.Enqueue(e.buildItem(kind, url, host, depth, prov))
+	if err != nil {
+		e.logger.Warn("crawler: failed to enqueue item", "kind", kind, "url", url, "host", host, "error", err)
+		return false, err
+	}
+	return added, nil
+}
+
+// enqueuePageFetch enqueues a page_fetch item like enqueue, but subject to the
+// crawler.maxPagesPerDomain page budget: a NEW page_fetch URL for host is
+// only created while host has fewer than maxPagesPerDomain page_fetch rows in
+// the frontier, whereas re-activating a page URL host already reached is
+// always permitted and never consumes budget (see
+// frontier.EnqueueBudgeted and the maxPagesPerDomain doc comment).
+//
+// The budget is enforced per call, so invoking this once per link in a page's
+// fan-out loop guarantees a single page cannot overshoot: each call re-counts
+// and thus sees every page_fetch row the earlier iterations added.
+func (e *Engine) enqueuePageFetch(url, host string, depth int) (bool, error) {
+	item := e.buildItem(store.KindPageFetch, url, host, depth, provenance{})
+	added, err := e.frontier.EnqueueBudgeted(item, e.maxPagesPerDomain())
+	if err != nil {
+		e.logger.Warn("crawler: failed to enqueue item", "kind", store.KindPageFetch, "url", url, "host", host, "error", err)
+		return false, err
+	}
+	return added, nil
+}
+
+// buildItem constructs a frontier item for kind, deriving the dedup key from
+// the item's natural key (host for host_probe, URL otherwise) in one place so
+// keys cannot drift across call sites, and stamping prov onto the row so a
+// handler can read it back after the item is dequeued.
+func (e *Engine) buildItem(kind, url, host string, depth int, prov provenance) *store.FrontierItem {
 	natural := url
 	if kind == store.KindHostProbe {
 		natural = host
 	}
-	added, err := e.frontier.Enqueue(&store.FrontierItem{
+	return &store.FrontierItem{
 		RunID:             e.opts.RunID,
 		Kind:              kind,
 		URL:               url,
@@ -180,12 +210,7 @@ func (e *Engine) enqueue(kind, url, host string, depth int, prov provenance) (bo
 		RegistryCatalogID: prov.RegistryCatalogID,
 		RegistryRowID:     prov.RegistryRowID,
 		ProbeMethod:       prov.ProbeMethod,
-	})
-	if err != nil {
-		e.logger.Warn("crawler: failed to enqueue item", "kind", kind, "url", url, "host", host, "error", err)
-		return false, err
 	}
-	return added, nil
 }
 
 // Run drains the frontier with a continuous worker pool: concurrency()
@@ -470,46 +495,36 @@ func (e *Engine) registryHTTPClient() *http.Client {
 	return e.httpClient
 }
 
-// -- Page-count tracking for maxPagesPerDomain -----------------------------
+// -- Page budget for maxPagesPerDomain -------------------------------------
 
-// pageBudgetAvailable reports whether host still has room in its
-// maxPagesPerDomain budget for one more page_fetch item, by counting
-// existing page_fetch rows for host directly in the frontier
-// (frontier.CountByHostKind) rather than an in-memory approximation. The
-// dedup key guarantees at most one frontier_items row per distinct URL, so
-// within a single process this count is exact.
+// maxPagesPerDomain returns the configured page budget per domain: the
+// maximum number of distinct page_fetch URLs a single host may have present
+// in the frontier at once. The budget is enforced by frontier.EnqueueBudgeted
+// (via enqueuePageFetch), which counts existing page_fetch rows for the host
+// directly in the frontier_items table — the dedup key guarantees at most one
+// row per distinct URL, so within a single process this count is exact.
 //
-// The check happens at enqueue time (not fetch time) so that a single
-// page's link fan-out cannot enqueue far more page_fetch items than the
-// budget allows before any of them have actually been fetched and counted.
-// It is checked immediately before each enqueue call in the fan-out loop
-// (handlePageFetch), so the count reflects every item enqueued earlier in
-// the same loop.
+// Precise semantics: the budget caps DISTINCT page URLs per host present in
+// the frontier, not pages fetched per database lifetime. Re-activating a page
+// URL the host already has (flipping a done/failed row back to pending, as a
+// refresh crawl or --force does through the dedup re-enqueue path) creates no
+// new row and so never consumes budget — a capped host therefore re-fetches
+// all its known pages on later crawls, not just its seed. Only creating a
+// NEW page URL is gated. The check runs at enqueue time (not fetch time) and
+// per enqueue call, so a single page's link fan-out cannot overshoot: each
+// call re-counts and sees every row the earlier iterations added.
 //
-// Under distributed crawling (mysql/postgres, multiple worker processes),
-// this check is exact per-process but not globally atomic: two workers
-// racing to enqueue page_fetch items for the same host could each observe
-// a budget count just under the limit and both enqueue, overshooting by a
-// small, bounded amount. Host-affinity sharding (store.FrontierItem.HostShard)
-// means this race is rare in practice — normally only one worker ever owns
-// a given host — but it is not eliminated for hosts discovered mid-crawl
-// before sharding routes their future items consistently. This is a
-// deliberate, documented tradeoff rather than a bug: closing it fully would
-// require a cross-process lock or a DB-side atomic counter for a budget
-// whose entire purpose is a soft cap, not an exact one.
-func (e *Engine) pageBudgetAvailable(host string) bool {
-	count, err := e.frontier.CountByHostKind(host, store.KindPageFetch)
-	if err != nil {
-		// Fail open: the budget is a politeness/scope guard, not a
-		// correctness requirement, so a broken count must not block the
-		// crawl — but it shouldn't be silent.
-		e.logger.Warn("crawler: page budget count failed", "host", host, "error", err)
-		return true
-	}
-	return count < int64(e.maxPagesPerDomain())
-}
-
-// maxPagesPerDomain returns the configured page budget per domain.
+// Under distributed crawling (mysql/postgres, multiple worker processes) the
+// count is exact per-process but not globally atomic: two workers racing to
+// enqueue page_fetch items for the same host could each observe a count just
+// under the limit and both enqueue, overshooting by a small, bounded amount.
+// Host-affinity sharding (store.FrontierItem.HostShard) makes this race rare
+// — normally only one worker ever owns a given host — but it is not
+// eliminated for hosts discovered mid-crawl before sharding routes their
+// future items consistently. This is a deliberate, documented tradeoff rather
+// than a bug: closing it fully would require a cross-process lock or a DB-side
+// atomic counter for a budget whose entire purpose is a soft cap.
+//
 // config.Load/config.Defaults already fill in the documented default (50)
 // for any key absent from the config file, so an explicit 0 here reflects
 // the operator's own choice (permitted by the config schema's minimum:0)
