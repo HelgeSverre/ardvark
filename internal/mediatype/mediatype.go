@@ -113,10 +113,11 @@ var kindByFullType = map[string]Kind{
 // Kind classifies the media type. A profile parameter of "urn:air:agent-skills"
 // marks a skill regardless of the carrier type (e.g. text/markdown).
 func (m MediaType) Kind() Kind {
-	if m.Profile() == "urn:air:agent-skills" {
+	base := kindByFullType[m.FullType()]
+	if base != KindCatalog && base != KindRegistry && m.Profile() == "urn:air:agent-skills" {
 		return KindSkill
 	}
-	return kindByFullType[m.FullType()]
+	return base
 }
 
 // IsPointer reports whether the entry points at another ARD document to crawl

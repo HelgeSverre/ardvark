@@ -71,6 +71,7 @@ func TestKindClassification(t *testing.T) {
 		{"application/octet-stream", KindUnknown, false, false},
 		{"garbage", KindUnknown, false, false},
 		{"", KindUnknown, false, false},
+		{`application/ai-catalog+json; profile="urn:air:agent-skills"`, KindCatalog, true, true},
 	}
 	for _, tt := range tests {
 		m := Parse(tt.in)

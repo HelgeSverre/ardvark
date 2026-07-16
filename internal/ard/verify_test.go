@@ -2,6 +2,7 @@ package ard
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/helgesverre/ardvark/internal/mediatype"
@@ -693,6 +694,30 @@ func TestVerify_MediaType_UnsuffixedRegistryIsPointer(t *testing.T) {
 	// Pointer entries must not be nagged about representativeQueries.
 	if _, ok := checkByID(report.Checks, "queries.count", "urn:air:example.com:registry:r"); ok {
 		t.Error("queries.count should be skipped for an unsuffixed application/ai-registry pointer")
+	}
+	c, ok := checkByID(report.Checks, "entry.media_type", "urn:air:example.com:registry:r")
+	if !ok {
+		t.Fatal("expected entry.media_type check for urn:air:example.com:registry:r")
+	}
+	if !c.Passed {
+		t.Errorf("expected entry.media_type check to pass for unsuffixed application/ai-registry pointer, got %+v", c)
+	}
+}
+
+func TestVerify_MediaType_MessageIncludesKindAndFormat(t *testing.T) {
+	raw := []byte(`{"specVersion":"1.0","host":{"displayName":"H"},"entries":[
+		{"identifier":"urn:air:example.com:mcp:m","displayName":"M","type":"application/mcp-server-card+json","url":"https://example.com/m.json"}
+	]}`)
+	report := Verify(raw, "example.com")
+	c, ok := checkByID(report.Checks, "entry.media_type", "urn:air:example.com:mcp:m")
+	if !ok {
+		t.Fatal("expected entry.media_type check for urn:air:example.com:mcp:m")
+	}
+	if !c.Passed {
+		t.Errorf("expected entry.media_type check to pass, got %+v", c)
+	}
+	if !strings.Contains(c.Message, "recognized as mcp-server (format: json)") {
+		t.Errorf("Message = %q, want substring %q", c.Message, "recognized as mcp-server (format: json)")
 	}
 }
 

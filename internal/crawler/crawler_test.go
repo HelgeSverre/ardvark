@@ -1422,3 +1422,34 @@ func TestEnqueueFollowups_UnsuffixedRegistryPointerIsFollowed(t *testing.T) {
 		t.Fatalf("expected 1 registries row, got %d", regRows)
 	}
 }
+
+func TestEnqueueFollowups_UnsuffixedCatalogPointerIsFollowed(t *testing.T) {
+	mux := http.NewServeMux()
+	var catalog string
+	mux.HandleFunc("/root.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/ai-catalog+json")
+		w.Write([]byte(catalog))
+	})
+	mux.HandleFunc("/nested.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/ai-catalog+json")
+		w.Write([]byte(`{"specVersion":"1.0","host":{"displayName":"N"},"entries":[]}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	catalog = `{"specVersion":"1.0","host":{"displayName":"H"},"entries":[
+		{"identifier":"urn:air:example.com:catalog:c","displayName":"C","type":"application/ai-catalog","url":"` + srv.URL + `/nested.json"}
+	]}`
+
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	host := strings.TrimPrefix(srv.URL, "http://")
+	item := store.FrontierItem{URL: srv.URL + "/root.json", Host: host, Depth: 0}
+	if err := eng.handleCatalogFetch(context.Background(), item); err != nil {
+		t.Fatalf("handleCatalogFetch: %v", err)
+	}
+
+	var fetches int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ? AND url = ?", store.KindCatalogFetch, srv.URL+"/nested.json").Count(&fetches)
+	if fetches != 1 {
+		t.Fatalf("expected 1 catalog_fetch for unsuffixed application/ai-catalog, got %d", fetches)
+	}
+}
