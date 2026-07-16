@@ -6,6 +6,26 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Frontier dedup key is hashed to a fixed 64-char width** — long URLs no
+  longer overflow the `frontier_items.dedup_key` column on MySQL/Postgres,
+  where a raw `kind:natural` key past the varchar limit would truncate and
+  silently collide distinct pending URLs onto the unique index (SQLite was
+  unaffected). The key is now a SHA-256 digest, so it is fixed-width and
+  driver-independent regardless of URL length.
+
+### Upgrading from 0.4.0 on MySQL/Postgres
+
+- The `dedup_key` column narrows from `varchar(512)` to `varchar(64)`. A
+  populated 0.4.0 frontier almost always holds keys longer than 64 chars, which
+  an in-place `ALTER` cannot narrow (strict `sql_mode` aborts; non-strict would
+  truncate-and-collide), so **the first 0.4.1 start drops and recreates the
+  `frontier_items` table automatically.** Pending frontier work is discarded and
+  re-discovered from the seed/domain tables on the next crawl — no other tables
+  are touched. Finish or drain any in-progress 0.4.0 crawl before upgrading if
+  you need its pending queue preserved. SQLite deployments are unaffected.
+
 ## [0.4.0] - 2026-07-16
 
 ### Added

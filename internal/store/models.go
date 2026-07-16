@@ -156,9 +156,15 @@ type FrontierItem struct {
 	// long the source URL is. The column must stay at size:64: it must not be
 	// widened toward the URL column's size:2048, which would exceed the index
 	// key limit and fail migration. Upgrading from <=0.4.0 (which stored raw
-	// "kind:natural" strings here) re-keys existing rows because new enqueues
-	// hash the key; AutoMigrate narrows the column and old rows simply stop
-	// dedup-matching new lookups, which is benign for a crawler (see dedupKey).
+	// "kind:natural" strings up to varchar(512) here) cannot narrow this column
+	// in place: on mysql/postgres a populated 0.4.0 frontier almost always
+	// holds keys longer than 64 chars, so AutoMigrate's ALTER to varchar(64)
+	// would hard-fail (strict sql_mode) or silently truncate-and-collide
+	// (non-strict). The stale raw keys are worthless after the upgrade anyway —
+	// new enqueues hash their keys and would never match them again — so
+	// store.Open drops and recreates the frontier table before AutoMigrate
+	// runs, discarding pending work that is harmlessly re-discovered on the
+	// next crawl (see store.migrateFrontierDedupKey and dedupKey).
 	DedupKey string `gorm:"uniqueIndex;size:64"`
 
 	// HostShard is fnv32a(fetchHost) % HostShardCount, computed once at

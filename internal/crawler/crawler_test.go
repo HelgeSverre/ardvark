@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -59,10 +60,70 @@ func testCrawlerConfig() config.Config {
 func newTestEngine(t *testing.T, cfg config.Config) (*Engine, *store.Store) {
 	t.Helper()
 	st := newTestStore(t)
+	return newEngineForStore(t, cfg, st), st
+}
+
+// newEngineForStore builds an Engine over a caller-provided store, letting the
+// backend-matrix tests (see dedupBackends) exercise the same enqueue path
+// against sqlite, mysql, and postgres.
+func newEngineForStore(t *testing.T, cfg config.Config, st *store.Store) *Engine {
+	t.Helper()
 	fr := frontier.New(st.DB)
 	fc := fetch.New(cfg.Crawler)
-	eng := New(cfg, st, fr, fc, discardLogger(), Options{MaxAttempts: 2})
-	return eng, st
+	return New(cfg, st, fr, fc, discardLogger(), Options{MaxAttempts: 2})
+}
+
+// dedupBackend is one store backend the long-URL enqueue tests run against.
+type dedupBackend struct {
+	name string
+	open func(t *testing.T) *store.Store
+}
+
+// dedupBackends returns the backends the long-URL enqueue tests exercise:
+// always an isolated in-memory sqlite (the fast default), plus mysql and/or
+// postgres whenever ARDVARK_TEST_MYSQL_DSN / ARDVARK_TEST_POSTGRES_DSN are set.
+// sqlite alone cannot catch the varchar-truncation regression these tests
+// guard — it treats VARCHAR(n) as unlimited TEXT and would pass even against
+// the old raw-key code — so a length-enforcing engine must be wired in (the
+// tools/smoketest harness stands up matching containers) for the assertions to
+// be load-bearing on the databases the 0.4.1 fix targets.
+func dedupBackends(t *testing.T) []dedupBackend {
+	t.Helper()
+	backends := []dedupBackend{{
+		name: "sqlite",
+		open: func(t *testing.T) *store.Store {
+			testDSNCounter++
+			dsn := fmt.Sprintf("file:dedupmatrix%d?mode=memory&cache=shared", testDSNCounter)
+			s, err := store.Open("sqlite", dsn)
+			if err != nil {
+				t.Fatalf("store.Open sqlite: %v", err)
+			}
+			t.Cleanup(func() { _ = s.Close() })
+			return s
+		},
+	}}
+	add := func(name, driver, dsn string) {
+		backends = append(backends, dedupBackend{name: name, open: func(t *testing.T) *store.Store {
+			s, err := store.Open(driver, dsn)
+			if err != nil {
+				t.Fatalf("store.Open %s: %v", driver, err)
+			}
+			// Isolate from prior runs / other tests sharing this database:
+			// these tests count frontier rows, so start from an empty table.
+			if err := s.DB.Exec("DELETE FROM frontier_items").Error; err != nil {
+				t.Fatalf("clearing frontier_items on %s: %v", driver, err)
+			}
+			t.Cleanup(func() { _ = s.Close() })
+			return s
+		}})
+	}
+	if dsn := os.Getenv("ARDVARK_TEST_MYSQL_DSN"); dsn != "" {
+		add("mysql", "mysql", dsn)
+	}
+	if dsn := os.Getenv("ARDVARK_TEST_POSTGRES_DSN"); dsn != "" {
+		add("postgres", "postgres", dsn)
+	}
+	return backends
 }
 
 // -- handleItem dispatch -----------------------------------------------------

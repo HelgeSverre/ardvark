@@ -44,59 +44,81 @@ func TestDedupKey_DistinctForSharedPrefix(t *testing.T) {
 // an over-512-char URL: the first enqueue succeeds (no overflow), and a second
 // enqueue of the SAME URL is a silent no-op via the in-flight dedup path
 // (added=false, err=nil), proving dedup still works for long URLs.
+//
+// It runs over the backend matrix (see dedupBackends) so that when a mysql or
+// postgres DSN is configured the assertions actually exercise varchar length
+// enforcement, not just sqlite's unlimited-TEXT behaviour.
 func TestEnqueue_LongURLDedupsAgainstItself(t *testing.T) {
-	eng, st := newTestEngine(t, testCrawlerConfig())
-	fr := frontier.New(st.DB)
+	for _, b := range dedupBackends(t) {
+		t.Run(b.name, func(t *testing.T) {
+			st := b.open(t)
+			eng := newEngineForStore(t, testCrawlerConfig(), st)
+			fr := frontier.New(st.DB)
 
-	longURL := "https://example.com/" + strings.Repeat("a", 3000)
-	host := "example.com"
+			// Long enough that the raw "page_fetch:<url>" key would blow past
+			// the 64-char dedup_key column, but within the url varchar(2048)
+			// column so the URL itself stores cleanly on mysql/postgres.
+			longURL := "https://example.com/" + strings.Repeat("a", 1500)
+			host := "example.com"
 
-	added, err := fr.Enqueue(eng.buildItem(store.KindPageFetch, longURL, host, 0, provenance{}))
-	if err != nil {
-		t.Fatalf("first enqueue of long URL: %v", err)
-	}
-	if !added {
-		t.Fatal("expected first enqueue of long URL to insert a row")
-	}
+			added, err := fr.Enqueue(eng.buildItem(store.KindPageFetch, longURL, host, 0, provenance{}))
+			if err != nil {
+				t.Fatalf("first enqueue of long URL: %v", err)
+			}
+			if !added {
+				t.Fatal("expected first enqueue of long URL to insert a row")
+			}
 
-	added, err = fr.Enqueue(eng.buildItem(store.KindPageFetch, longURL, host, 0, provenance{}))
-	if err != nil {
-		t.Fatalf("second enqueue of long URL: %v", err)
-	}
-	if added {
-		t.Fatal("expected second enqueue of identical long URL to dedup (no-op)")
-	}
+			added, err = fr.Enqueue(eng.buildItem(store.KindPageFetch, longURL, host, 0, provenance{}))
+			if err != nil {
+				t.Fatalf("second enqueue of long URL: %v", err)
+			}
+			if added {
+				t.Fatal("expected second enqueue of identical long URL to dedup (no-op)")
+			}
 
-	var count int64
-	st.DB.Model(&store.FrontierItem{}).Where("kind = ?", store.KindPageFetch).Count(&count)
-	if count != 1 {
-		t.Fatalf("expected exactly 1 frontier row for the long URL, got %d", count)
+			var count int64
+			st.DB.Model(&store.FrontierItem{}).Where("kind = ?", store.KindPageFetch).Count(&count)
+			if count != 1 {
+				t.Fatalf("expected exactly 1 frontier row for the long URL, got %d", count)
+			}
+		})
 	}
 }
 
 // TestEnqueue_DistinctLongURLsBothInsert is the end-to-end collision case: two
 // distinct long URLs sharing a >512-char prefix must BOTH enqueue as separate
 // rows. Before hashing, the truncated keys collided and only one row survived.
+//
+// This is the mysql/postgres regression guard: on those engines a raw-key
+// column would truncate both URLs to the same value and the unique index would
+// drop the second insert (or hard-fail), so run it over the backend matrix
+// (see dedupBackends) to make it load-bearing when a real DSN is configured.
 func TestEnqueue_DistinctLongURLsBothInsert(t *testing.T) {
-	eng, st := newTestEngine(t, testCrawlerConfig())
-	fr := frontier.New(st.DB)
+	for _, b := range dedupBackends(t) {
+		t.Run(b.name, func(t *testing.T) {
+			st := b.open(t)
+			eng := newEngineForStore(t, testCrawlerConfig(), st)
+			fr := frontier.New(st.DB)
 
-	prefix := "https://example.com/" + strings.Repeat("a", 700) + "/"
-	host := "example.com"
+			prefix := "https://example.com/" + strings.Repeat("a", 700) + "/"
+			host := "example.com"
 
-	for _, suffix := range []string{"one", "two"} {
-		added, err := fr.Enqueue(eng.buildItem(store.KindPageFetch, prefix+suffix, host, 0, provenance{}))
-		if err != nil {
-			t.Fatalf("enqueue %q: %v", suffix, err)
-		}
-		if !added {
-			t.Fatalf("expected distinct long URL %q to insert its own row", suffix)
-		}
-	}
+			for _, suffix := range []string{"one", "two"} {
+				added, err := fr.Enqueue(eng.buildItem(store.KindPageFetch, prefix+suffix, host, 0, provenance{}))
+				if err != nil {
+					t.Fatalf("enqueue %q: %v", suffix, err)
+				}
+				if !added {
+					t.Fatalf("expected distinct long URL %q to insert its own row", suffix)
+				}
+			}
 
-	var count int64
-	st.DB.Model(&store.FrontierItem{}).Where("kind = ?", store.KindPageFetch).Count(&count)
-	if count != 2 {
-		t.Fatalf("expected 2 distinct frontier rows, got %d", count)
+			var count int64
+			st.DB.Model(&store.FrontierItem{}).Where("kind = ?", store.KindPageFetch).Count(&count)
+			if count != 2 {
+				t.Fatalf("expected 2 distinct frontier rows, got %d", count)
+			}
+		})
 	}
 }

@@ -580,8 +580,11 @@ func (e *Engine) maxReferralDepth() int {
 // "kind:natural" keys) means pre-existing frontier_items rows no longer match
 // the hashed lookups of new enqueues. That is benign for a crawler — worst
 // case a still-pending or already-done URL is re-discovered and re-enqueued
-// once (status guards prevent duplicating live work); no corruption results —
-// so no data migration rewrites the old keys.
+// once (status guards prevent duplicating live work); no corruption results.
+// Rather than rewrite the old keys in place (impossible under the narrowed
+// varchar(64) column — see store.migrateFrontierDedupKey), store.Open discards
+// the stale <=0.4.0 frontier table on the first 0.4.1 open so those rows are
+// simply re-discovered.
 func dedupKey(kind, natural string) string {
 	sum := sha256.Sum256([]byte(kind + ":" + natural))
 	return hex.EncodeToString(sum[:])
