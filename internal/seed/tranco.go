@@ -80,16 +80,17 @@ func (t *TrancoSeeder) Domains(ctx context.Context, n int) ([]string, error) {
 		return nil, fmt.Errorf("seed: tranco: %s returned status %d", t.listURL(), resp.StatusCode)
 	}
 
-	names, err := domainsFromTrancoZip(body, n)
-	if err != nil {
-		return nil, err
-	}
-	return Sanitize(names), nil
+	return domainsFromTrancoZip(body, n)
 }
 
-// domainsFromTrancoZip extracts up to n "domain" values (second column) from
-// the first CSV file found in a Tranco zip archive, in file order (Tranco
-// lists are already rank-sorted).
+// domainsFromTrancoZip reads "domain" values (second column) from the first
+// CSV file found in a Tranco zip archive, in file order (Tranco lists are
+// already rank-sorted), sanitizing and deduping as it goes via a
+// domainCollector. It keeps consuming rows — not merely counting them —
+// until n valid domains are collected or the CSV is exhausted, since some
+// rows are filtered out by sanitization (wildcards resolve to a domain
+// already seen, malformed hostnames, …) and stopping at n raw rows read
+// would silently under-return.
 func domainsFromTrancoZip(zipBytes []byte, n int) ([]string, error) {
 	zr, err := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
 	if err != nil {
@@ -116,8 +117,8 @@ func domainsFromTrancoZip(zipBytes []byte, n int) ([]string, error) {
 	reader := csv.NewReader(rc)
 	reader.FieldsPerRecord = -1
 
-	var names []string
-	for len(names) < n {
+	collector := newDomainCollector(n)
+	for !collector.full() {
 		record, err := reader.Read()
 		if err == io.EOF {
 			break
@@ -128,8 +129,8 @@ func domainsFromTrancoZip(zipBytes []byte, n int) ([]string, error) {
 		if len(record) < 2 {
 			continue
 		}
-		names = append(names, record[1])
+		collector.add([]string{record[1]})
 	}
 
-	return names, nil
+	return collector.domains(), nil
 }

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -275,6 +276,47 @@ func TestRobots_NoRobotsTxtAllowsAll(t *testing.T) {
 	}
 	if !allowed {
 		t.Error("expected allow when no robots.txt present")
+	}
+}
+
+func TestRobots_TooManyRequestsNotCachedAsAllowAll(t *testing.T) {
+	var hits int32
+
+	var mux http.ServeMux
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("User-agent: *\nDisallow: /private/\n"))
+	})
+	mux.HandleFunc("/private/secret", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("secret"))
+	})
+	srv := httptest.NewServer(&mux)
+	defer srv.Close()
+
+	c := New(testConfig())
+
+	// First fetch of robots.txt is rate-limited: this must be refused, not
+	// treated as "no robots.txt exists".
+	_, err := c.Allowed(context.Background(), srv.URL+"/private/secret")
+	if err == nil {
+		t.Fatal("expected error on 429 robots.txt fetch, got nil")
+	}
+	if !Transient(err) {
+		t.Fatalf("expected a transient error for 429, got %v (%T)", err, err)
+	}
+
+	// The 429 must not have poisoned the cache with an allow-all verdict.
+	allowed, err := c.Allowed(context.Background(), srv.URL+"/private/secret")
+	if err != nil {
+		t.Fatalf("Allowed error on retry: %v", err)
+	}
+	if allowed {
+		t.Error("expected /private/secret to be disallowed once robots.txt is honored")
 	}
 }
 

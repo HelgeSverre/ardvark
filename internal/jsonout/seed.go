@@ -28,10 +28,11 @@ type SeedResult struct {
 // `seed <source>` subcommand and the MCP ardvark_seed tool. The caller owns
 // st and its Close.
 func RunSeeder(ctx context.Context, cfg config.Config, st *store.Store, s seed.Seeder, n int, sourceLabel string) (SeedResult, error) {
-	logger, err := NewLogger(cfg)
+	logger, closeLogger, err := NewLogger(cfg)
 	if err != nil {
 		return SeedResult{}, err
 	}
+	defer closeLogger()
 
 	names, err := s.Domains(ctx, n)
 	if err != nil {

@@ -428,7 +428,7 @@ func (c *Client) robotsFor(ctx context.Context, scheme, host string) (*robotstxt
 		fetched, err := c.doGet(ctx, robotsURL)
 		if err != nil {
 			var fe *Error
-			if errors.As(err, &fe) && fe.Status >= 400 && fe.Status < 500 {
+			if errors.As(err, &fe) && fe.Status >= 400 && fe.Status < 500 && fe.Status != http.StatusTooManyRequests {
 				// No robots.txt: everything allowed, empty raw body.
 				c.robotsMu.Lock()
 				c.robotsCache[host] = nil
@@ -436,6 +436,10 @@ func (c *Client) robotsFor(ctx context.Context, scheme, host string) (*robotstxt
 				c.robotsMu.Unlock()
 				return nil, nil
 			}
+			// A 429 on robots.txt is a transient rate-limit signal, not
+			// evidence robots.txt is absent: don't cache an allow-all
+			// verdict, and propagate the (transient) error so callers
+			// retry instead of crawling with robots ignored forever.
 			lastErr = err
 			continue
 		}

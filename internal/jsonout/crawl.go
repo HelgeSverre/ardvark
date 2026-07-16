@@ -44,10 +44,11 @@ type CrawlCallbacks struct {
 // domains, then runs the crawler until the frontier is empty (pending work
 // from prior runs is resumed automatically) and returns the run summary.
 func Crawl(ctx context.Context, cfg config.Config, st *store.Store, seeds []string, force bool, cb CrawlCallbacks) (CrawlResult, error) {
-	logger, err := NewLogger(cfg)
+	logger, closeLogger, err := NewLogger(cfg)
 	if err != nil {
 		return CrawlResult{}, err
 	}
+	defer closeLogger()
 
 	configSnapshot, err := json.Marshal(cfg)
 	if err != nil {

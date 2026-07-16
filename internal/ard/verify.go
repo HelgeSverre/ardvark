@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
+	"github.com/santhosh-tekuri/jsonschema/v6/kind"
 	"golang.org/x/net/idna"
 	"golang.org/x/net/publicsuffix"
 
@@ -73,7 +74,11 @@ var (
 )
 
 // compiledCatalogSchema lazily compiles the vendored ai-catalog.schema.json,
-// caching the result for the process lifetime.
+// caching the result for the process lifetime. Format assertions
+// (AssertFormat) are always enabled: strict mode wants format failures
+// reported as errors, and lenient mode wants them reported too, just
+// downgraded to warnings (see validateSchema) — either way the compiler must
+// actually assert formats for a leaf failure to exist to classify.
 func compiledCatalogSchema() (*jsonschema.Schema, error) {
 	catalogSchemaOnce.Do(func() {
 		doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(catalogSchemaJSON))
@@ -82,6 +87,7 @@ func compiledCatalogSchema() (*jsonschema.Schema, error) {
 			return
 		}
 		c := jsonschema.NewCompiler()
+		c.AssertFormat()
 		if err := c.AddResource(catalogSchemaURL, doc); err != nil {
 			catalogSchemaErr = fmt.Errorf("ard: register vendored schema: %w", err)
 			return
@@ -147,14 +153,33 @@ func (r Report) MergeChecks(extra []Check) Report {
 }
 
 // Verify runs the ARD verification pipeline over a raw ai-catalog.json
-// document: JSON Schema validation against the vendored spec schema,
-// followed by the seven semantic checks. servingDomain is the host the
-// catalog was fetched from, used by the urn.publisher_matches check; when
-// empty (e.g. a local file), that check is skipped.
+// document in lenient mode (the ardvark default): JSON Schema validation
+// against the vendored spec schema — with several deliberate leniencies
+// relative to the raw schema, documented at schema/PROVENANCE.md and at each
+// leniency's implementation site below — followed by the seven semantic
+// checks. servingDomain is the host the catalog was fetched from, used by
+// the urn.publisher_matches check; when empty (e.g. a local file), that
+// check is skipped.
 //
 // Transport-level checks (content type, size, UTF-8 validity) are the
 // caller's responsibility and are not repeated here.
 func Verify(raw []byte, servingDomain string) Report {
+	return verify(raw, servingDomain, false)
+}
+
+// VerifyStrict runs the same verification pipeline as Verify, but validates
+// the raw document against the vendored spec schema exactly as published:
+// no identifier/data normalization, and format assertion failures (e.g. a
+// malformed uri or date-time) are reported as errors rather than downgraded
+// to warnings. A legacy "urn:ai:" identifier, which Verify accepts, fails
+// schema validation here since the raw schema's pattern only permits the
+// "air" NID.
+func VerifyStrict(raw []byte, servingDomain string) Report {
+	return verify(raw, servingDomain, true)
+}
+
+// verify is the shared core of Verify and VerifyStrict.
+func verify(raw []byte, servingDomain string, strict bool) Report {
 	var report Report
 
 	var generic any
@@ -171,7 +196,7 @@ func Verify(raw []byte, servingDomain string) Report {
 		return report
 	}
 
-	schemaChecks := validateSchema(raw)
+	schemaChecks := validateSchema(raw, strict)
 	report.Checks = append(report.Checks, schemaChecks...)
 
 	// Semantic checks re-derive several of the same failures JSON Schema
@@ -194,25 +219,60 @@ func Verify(raw []byte, servingDomain string) Report {
 	return report
 }
 
-// schemaFailed reports whether any JSON Schema validation check failed.
+// schemaFailed reports whether any error-severity JSON Schema validation
+// check failed. Lenient mode downgrades some schema failures (format
+// assertions) to warning severity rather than dropping them, and those
+// downgraded rows must not trip the semantic-check skip logic below — a
+// catalog failing only on a downgraded format warning should still get the
+// full set of semantic checks.
 func schemaFailed(checks []Check) bool {
 	for _, c := range checks {
-		if !c.Passed {
+		if !c.Passed && c.Severity == SeverityError {
 			return true
 		}
 	}
 	return false
 }
 
-// normalizeIdentifiersForSchema returns raw with each entries[i].identifier
-// publisher segment normalized to ASCII/punycode, for JSON Schema validation
-// purposes only. The vendored schema's identifier pattern is ASCII-only
-// ("[a-zA-Z0-9.-]+" for the publisher segment), so a catalog with a
-// Unicode-form (U-label) IDN publisher — which ParseURN accepts fine — would
-// otherwise fail schema.validation purely on encoding, not on any real
-// defect. If raw doesn't parse as a document with an "entries" array, or
+// normalizeIdentifierForSchema rewrites the "urn:<nid>:" prefix of a raw
+// identifier string to the lowercase, canonical "urn:air:" form, then
+// ASCII/punycode-normalizes its publisher segment, for JSON Schema
+// validation purposes only. This folds two deliberate lenient-mode
+// deviations from the raw vendored schema into one step:
+//
+//   - Legacy "urn:ai:" identifiers (seen on catalogs published in the wild
+//     before the spec settled on "air") are rewritten to "urn:air:" so they
+//     pass the schema's ASCII pattern, which only accepts "air". ParseURN
+//     and everything downstream already accept both NIDs directly; this
+//     rewrite exists purely so schema validation doesn't reject a document
+//     ardvark otherwise treats as valid.
+//   - An uppercase/mixed-case "URN:AIR:" (or "urn:Ai:") prefix is lowercased,
+//     since the schema's pattern is a case-sensitive literal match on
+//     "urn:air:" while URN schemes and NIDs are case-insensitive per RFC
+//     8141.
+//
+// If s doesn't look like a recognized ARD URN, s is returned unchanged and
+// schema validation reports whatever it would have reported anyway.
+func normalizeIdentifierForSchema(s string) string {
+	lower := strings.ToLower(s)
+	for _, candidate := range urnNIDs {
+		prefix := "urn:" + candidate + ":"
+		if !strings.HasPrefix(lower, prefix) {
+			continue
+		}
+		rewritten := "urn:air:" + s[len(prefix):]
+		return normalizeIdentifierPublisherASCII(rewritten)
+	}
+	return s
+}
+
+// normalizeForLenientSchema returns raw with each entries[i] normalized for
+// JSON Schema validation purposes only, applying two deliberate lenient-mode
+// deviations from the raw vendored schema (see normalizeIdentifierForSchema
+// and the "data": null case below, and schema/PROVENANCE.md for the full
+// list). If raw doesn't parse as a document with an "entries" array, or
 // nothing needs normalizing, raw is returned unchanged.
-func normalizeIdentifiersForSchema(raw []byte) []byte {
+func normalizeForLenientSchema(raw []byte) []byte {
 	var doc map[string]any
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return raw
@@ -228,12 +288,18 @@ func normalizeIdentifiersForSchema(raw []byte) []byte {
 		if !ok {
 			continue
 		}
-		id, ok := entry["identifier"].(string)
-		if !ok {
-			continue
+		if id, ok := entry["identifier"].(string); ok {
+			if normalized := normalizeIdentifierForSchema(id); normalized != id {
+				entry["identifier"] = normalized
+				changed = true
+			}
 		}
-		if normalized := normalizeIdentifierPublisherASCII(id); normalized != id {
-			entry["identifier"] = normalized
+		// An explicit "data": null is, semantically, the same as data being
+		// absent (checkValueOrReference already treats it that way); strip
+		// the key so the schema's value-or-reference oneOf/not constraint
+		// doesn't see both "url" and "data" present and reject the entry.
+		if v, exists := entry["data"]; exists && v == nil {
+			delete(entry, "data")
 			changed = true
 		}
 	}
@@ -249,8 +315,16 @@ func normalizeIdentifiersForSchema(raw []byte) []byte {
 }
 
 // validateSchema runs JSON Schema validation and turns each leaf failure
-// into a Check row carrying the instance location in its message.
-func validateSchema(raw []byte) []Check {
+// into a Check row carrying the instance location in its message. In strict
+// mode, the raw document is validated as-is and every leaf failure is an
+// error. In lenient mode, the instance is first normalized (see
+// normalizeForLenientSchema), and two further deviations are applied per
+// leaf: a representativeQueries minItems/maxItems failure is dropped
+// entirely (the semantic queries.count check already reports it, as a
+// warning, so keeping both would double-report the same defect), and a
+// format-assertion failure is downgraded to a warning rather than dropped
+// (there's no semantic check duplicating it, so it still needs to surface).
+func validateSchema(raw []byte, strict bool) []Check {
 	sch, err := compiledCatalogSchema()
 	if err != nil {
 		return []Check{{
@@ -263,7 +337,11 @@ func validateSchema(raw []byte) []Check {
 		}}
 	}
 
-	instance, err := jsonschema.UnmarshalJSON(bytes.NewReader(normalizeIdentifiersForSchema(raw)))
+	instanceBytes := raw
+	if !strict {
+		instanceBytes = normalizeForLenientSchema(raw)
+	}
+	instance, err := jsonschema.UnmarshalJSON(bytes.NewReader(instanceBytes))
 	if err != nil {
 		return []Check{{
 			CheckID:  "schema.parse",
@@ -292,14 +370,28 @@ func validateSchema(raw []byte) []Check {
 		}}
 	}
 
-	basic := ve.BasicOutput()
-	leaves := basic.Errors
-	if len(leaves) == 0 {
-		leaves = []jsonschema.OutputUnit{*basic}
-	}
+	// DetailedOutput, not BasicOutput, is used deliberately: BasicOutput's
+	// flattening collapses a $ref indirection (every catalogEntry is reached
+	// through "entries.items" -> "$ref") into its parent node and, in doing
+	// so, overwrites that leaf's ErrorKind with the wrapping *kind.Reference
+	// — which would break the Kind-based classification below (isFormatFailure,
+	// isRepresentativeQueriesCountFailure) for every per-entry failure.
+	// DetailedOutput preserves the real per-leaf ErrorKind and message;
+	// collectLeaves walks its (possibly multi-level, for combinators like
+	// oneOf) tree down to the true leaves itself.
+	leaves := collectLeaves(*ve.DetailedOutput())
 
 	checks := make([]Check, 0, len(leaves))
 	for _, leaf := range leaves {
+		if !strict && isRepresentativeQueriesCountFailure(leaf) {
+			continue
+		}
+
+		severity := SeverityError
+		if !strict && isFormatFailure(leaf) {
+			severity = SeverityWarning
+		}
+
 		loc := leaf.InstanceLocation
 		if loc == "" {
 			loc = "(root)"
@@ -310,7 +402,7 @@ func validateSchema(raw []byte) []Check {
 		}
 		checks = append(checks, Check{
 			CheckID:  "schema.validation",
-			Severity: SeverityError,
+			Severity: severity,
 			Passed:   false,
 			Message:  fmt.Sprintf("at %s: %s", loc, detail),
 			SpecRef:  specRef,
@@ -318,6 +410,57 @@ func validateSchema(raw []byte) []Check {
 		})
 	}
 	return checks
+}
+
+// collectLeaves recursively walks a jsonschema.OutputUnit tree (as produced
+// by ValidationError.DetailedOutput) and returns its true leaves: units with
+// no nested Errors. Combinator keywords (oneOf, anyOf, allOf, not, and $ref
+// indirection) show up as intermediate units carrying their own (generally
+// unhelpful, e.g. "'not' failed") Error alongside nested Errors for the
+// actual cause; only the deepest units — which carry the real per-property
+// ErrorKind and message — are returned.
+func collectLeaves(unit jsonschema.OutputUnit) []jsonschema.OutputUnit {
+	if len(unit.Errors) == 0 {
+		if unit.Error == nil {
+			return nil
+		}
+		return []jsonschema.OutputUnit{unit}
+	}
+	var leaves []jsonschema.OutputUnit
+	for _, child := range unit.Errors {
+		leaves = append(leaves, collectLeaves(child)...)
+	}
+	return leaves
+}
+
+// isFormatFailure reports whether leaf is a "format" keyword assertion
+// failure (e.g. a malformed "uri" or "date-time"), as opposed to a
+// structural schema failure.
+func isFormatFailure(leaf jsonschema.OutputUnit) bool {
+	if leaf.Error == nil {
+		return false
+	}
+	_, ok := leaf.Error.Kind.(*kind.Format)
+	return ok
+}
+
+// isRepresentativeQueriesCountFailure reports whether leaf is a minItems or
+// maxItems failure on an entry's representativeQueries array — the schema's
+// 2-5 item constraint, which the design doc treats as a recommendation
+// rather than a hard rule.
+func isRepresentativeQueriesCountFailure(leaf jsonschema.OutputUnit) bool {
+	if leaf.Error == nil {
+		return false
+	}
+	if !strings.HasSuffix(leaf.InstanceLocation, "/representativeQueries") {
+		return false
+	}
+	switch leaf.Error.Kind.(type) {
+	case *kind.MinItems, *kind.MaxItems:
+		return true
+	default:
+		return false
+	}
 }
 
 // schemaSubject best-efforts a Subject (entry URN or "catalog") for a JSON

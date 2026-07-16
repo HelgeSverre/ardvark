@@ -82,6 +82,66 @@ func TestTrancoSeederDomains_FewerRowsThanRequested(t *testing.T) {
 	}
 }
 
+func TestTrancoSeederDomains_SkipsInvalidRowsToReachN(t *testing.T) {
+	// Interleave rows that Sanitize drops (an IP address, a bare label with
+	// no dot, a duplicate) among enough valid ones that n=3 valid domains
+	// are available further down the list than row 3.
+	zipBytes := makeTrancoZip(t, [][2]string{
+		{"1", "192.0.2.1"},         // IP address, dropped
+		{"2", "example.com"},       // valid
+		{"3", "nodothost"},         // no dot, dropped
+		{"4", "example.com"},       // duplicate, dropped
+		{"5", "*.wildcard.com"},    // valid (wildcard stripped)
+		{"6", "third.example.com"}, // valid
+	})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(zipBytes)
+	}))
+	defer srv.Close()
+
+	seeder := &TrancoSeeder{ListURL: srv.URL}
+	names, err := seeder.Domains(context.Background(), 3)
+	if err != nil {
+		t.Fatalf("Domains: %v", err)
+	}
+	want := []string{"example.com", "wildcard.com", "third.example.com"}
+	if len(names) != len(want) {
+		t.Fatalf("got %v, want %v", names, want)
+	}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Fatalf("got %v, want %v", names, want)
+		}
+	}
+}
+
+func TestTrancoSeederDomains_FewerValidRowsThanRequested(t *testing.T) {
+	// Only one row survives sanitization even though there are several raw
+	// rows; the source is genuinely exhausted, so Domains should return
+	// exactly that one instead of erroring or padding.
+	zipBytes := makeTrancoZip(t, [][2]string{
+		{"1", "192.0.2.1"},
+		{"2", "only.example.com"},
+		{"3", "nodothost"},
+		{"4", "only.example.com"}, // duplicate
+	})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(zipBytes)
+	}))
+	defer srv.Close()
+
+	seeder := &TrancoSeeder{ListURL: srv.URL}
+	names, err := seeder.Domains(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("Domains: %v", err)
+	}
+	if len(names) != 1 || names[0] != "only.example.com" {
+		t.Fatalf("got %v, want [only.example.com]", names)
+	}
+}
+
 func TestTrancoSeederDomains_RejectsNonPositiveN(t *testing.T) {
 	seeder := &TrancoSeeder{ListURL: "http://example.invalid"}
 	if _, err := seeder.Domains(context.Background(), 0); err == nil {

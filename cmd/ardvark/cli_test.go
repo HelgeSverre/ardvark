@@ -10,9 +10,25 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
+
 	"github.com/helgesverre/ardvark/internal/probe"
 	"github.com/helgesverre/ardvark/internal/ui"
 )
+
+// resetHelpFlags recursively clears the "help" flag's value on cmd and every
+// descendant command, undoing the effect of a --help invocation so it
+// doesn't leak into later executeRoot calls against the same (package-level,
+// reused) command objects.
+func resetHelpFlags(cmd *cobra.Command) {
+	if f := cmd.Flags().Lookup("help"); f != nil {
+		_ = f.Value.Set("false")
+		f.Changed = false
+	}
+	for _, child := range cmd.Commands() {
+		resetHelpFlags(child)
+	}
+}
 
 func TestCollectSeeds(t *testing.T) {
 	dir := t.TempDir()
@@ -142,9 +158,18 @@ func executeRoot(t *testing.T, args ...string) (string, error) {
 		colorMode = "auto"
 		jsonOut = false
 		verifyStored = false
+		verifyStrict = false
 		rootCmd.SetArgs(nil)
 		rootCmd.SetOut(nil)
 		rootCmd.SetErr(nil)
+		// cobra's own "-h/--help" flag is local to each command and, once
+		// set true by a --help invocation, stays true on that same command
+		// object across later executeRoot calls in other tests (rootCmd and
+		// its subcommands are package-level vars, reused for every test) —
+		// which would make the next invocation of that command print help
+		// instead of actually running. Reset it across the whole command
+		// tree so a --help test can't leak into an unrelated test.
+		resetHelpFlags(rootCmd)
 	})
 
 	var buf bytes.Buffer
@@ -294,5 +319,45 @@ func TestConfigResolvedFromUserConfigDir(t *testing.T) {
 func TestJSONFlagRejectedWhereUnsupported(t *testing.T) {
 	if _, err := executeRoot(t, "migrate", "--json"); err == nil {
 		t.Fatal("migrate --json: want unknown-flag error, got nil")
+	}
+}
+
+// `ardvark verify --help` must document --strict.
+func TestVerifyHelp_MentionsStrict(t *testing.T) {
+	out, err := executeRoot(t, "verify", "--help")
+	if err != nil {
+		t.Fatalf("verify --help: %v", err)
+	}
+	if !strings.Contains(out, "--strict") {
+		t.Errorf("verify --help output missing %q:\n%s", "--strict", out)
+	}
+}
+
+// A legacy "urn:ai:" identifier is a deliberate ardvark leniency: the
+// default `ardvark verify` must accept it, while `ardvark verify --strict`
+// (the exact published spec schema) must reject it.
+func TestVerify_StrictFlag_RejectsLegacyAiNID(t *testing.T) {
+	dir := t.TempDir()
+	catalogPath := filepath.Join(dir, "catalog.json")
+	catalog := `{
+		"specVersion": "1.0",
+		"entries": [{
+			"identifier": "urn:ai:example.com:tool:x",
+			"displayName": "X",
+			"type": "application/mcp-server-card+json",
+			"url": "https://example.com/x.json",
+			"representativeQueries": ["one", "two"]
+		}]
+	}`
+	if err := os.WriteFile(catalogPath, []byte(catalog), 0o644); err != nil {
+		t.Fatalf("writing catalog: %v", err)
+	}
+
+	if _, err := executeRoot(t, "verify", catalogPath); err != nil {
+		t.Fatalf("verify (lenient): want valid, got error: %v", err)
+	}
+
+	if _, err := executeRoot(t, "verify", "--strict", catalogPath); err == nil {
+		t.Fatal("verify --strict: want invalid (urn:ai: rejected by the raw schema), got nil error")
 	}
 }

@@ -22,8 +22,10 @@ type KeyCount struct {
 
 // NewLogger builds the crawl-event logger from cfg.Log: JSONL to
 // cfg.Log.File, human-readable text to stderr (never stdout, so the MCP
-// stdio protocol and --json output stay clean).
-func NewLogger(cfg config.Config) (*slog.Logger, error) {
+// stdio protocol and --json output stay clean). Callers must invoke the
+// returned close func (typically via defer) once done with the logger to
+// release the underlying file descriptor.
+func NewLogger(cfg config.Config) (*slog.Logger, func() error, error) {
 	return eventlog.New(cfg.Log.File, parseLevel(cfg.Log.Level))
 }
 
