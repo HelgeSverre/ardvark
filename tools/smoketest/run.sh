@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Distributed-crawling smoke test driver. Brings up MySQL + the multi-host TLS
-# fixture, builds the ardvark worker image from the worktree source, and runs
-# four scenarios against a fleet of 10 workers sharing one MySQL frontier:
+# Distributed-crawling smoke test driver. Brings up the frontier DB (MySQL by
+# default, or Postgres via `DB=postgres ./run.sh`) + the multi-host TLS fixture,
+# builds the ardvark worker image from the worktree source, and runs four
+# scenarios against a fleet of 10 workers sharing one frontier:
 #
 #   a  full cooperative drain (10 workers, --worker 0/10 .. 9/10)
 #   b  shard partition (per-worker log disjointness + foreign-artifact ownership)
@@ -21,7 +22,37 @@ REPO_ROOT="$(cd ../.. && pwd)"
 COMPOSE="docker compose -f $HERE/docker-compose.yml"
 WORKERS=10
 SEED_CMD=(crawl --list /seeds/seeds.txt)
-DSN_HOST="ardvark:ardvark@tcp(127.0.0.1:13399)/ardvark?charset=utf8mb4&parseTime=True&loc=UTC"
+
+# Frontier backend: mysql (default) or postgres. Selected with `DB=postgres
+# ./run.sh`. Everything downstream keys off this — the compose service brought
+# up, the in-container storage driver+DSN injected into the config by the
+# worker entrypoint, the host-side DSN the assert tool connects with, and the
+# assert -driver. Default is mysql, so the original run is unchanged.
+#
+# Only the selected DB service is ever `up`'d, and the ardvark containers run
+# with --no-deps, so the other backend's container is never created.
+DB="${DB:-mysql}"
+case "$DB" in
+  mysql)
+    DB_SERVICE=mysql
+    DB_DRIVER=mysql
+    # In-container DSN (compose service host); host DSN (published port) for assert.
+    DB_DSN="ardvark:ardvark@tcp(mysql:3306)/ardvark?charset=utf8mb4&parseTime=True&loc=UTC"
+    DSN_HOST="ardvark:ardvark@tcp(127.0.0.1:13399)/ardvark?charset=utf8mb4&parseTime=True&loc=UTC"
+    ;;
+  postgres|postgresql)
+    DB=postgres
+    DB_SERVICE=postgres
+    DB_DRIVER=postgres
+    DB_DSN="host=postgres user=ardvark password=ardvark dbname=ardvark port=5432 sslmode=disable TimeZone=UTC"
+    DSN_HOST="host=127.0.0.1 user=ardvark password=ardvark dbname=ardvark port=15499 sslmode=disable TimeZone=UTC"
+    ;;
+  *)
+    echo "unknown DB=$DB (want mysql or postgres)"; exit 2 ;;
+esac
+# Exported so `-e DB_DRIVER -e DB_DSN` passthrough on `docker compose run` picks
+# them up for the worker entrypoint's config templating.
+export DB_DRIVER DB_DSN
 
 # Track overall result so a failing scenario is reported but does not abort the
 # rest of the run (a failing scenario is a valid, reportable outcome). Plain
@@ -39,23 +70,34 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mysql_q() {
-  # Run a single SQL statement in the mysql container, returning raw values.
-  $COMPOSE exec -T mysql mysql -uardvark -pardvark ardvark -N -B -e "$1" 2>/dev/null
+db_q() {
+  # Run a single read-only SQL statement against the active backend, returning
+  # bare values (no headers). All queries here are portable across both drivers.
+  if [ "$DB" = postgres ]; then
+    $COMPOSE exec -T postgres psql -U ardvark -d ardvark -tA -c "$1" 2>/dev/null
+  else
+    $COMPOSE exec -T mysql mysql -uardvark -pardvark ardvark -N -B -e "$1" 2>/dev/null
+  fi
 }
 
 reset_db() {
-  sub "resetting database schema"
-  $COMPOSE exec -T mysql mysql -uroot -proot -e \
-    "DROP DATABASE IF EXISTS ardvark; CREATE DATABASE ardvark; GRANT ALL ON ardvark.* TO 'ardvark'@'%'; FLUSH PRIVILEGES;" 2>/dev/null
+  sub "resetting database schema ($DB)"
+  if [ "$DB" = postgres ]; then
+    # ardvark is the database owner, so it can drop/recreate schema public.
+    $COMPOSE exec -T postgres psql -U ardvark -d ardvark \
+      -c "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO ardvark;" >/dev/null 2>&1
+  else
+    $COMPOSE exec -T mysql mysql -uroot -proot -e \
+      "DROP DATABASE IF EXISTS ardvark; CREATE DATABASE ardvark; GRANT ALL ON ardvark.* TO 'ardvark'@'%'; FLUSH PRIVILEGES;" 2>/dev/null
+  fi
   sub "running ardvark migrate"
-  $COMPOSE run --rm -e "WORKER_INDEX=migrate" ardvark migrate >/dev/null || {
+  $COMPOSE run --rm --no-deps -e "WORKER_INDEX=migrate" -e DB_DRIVER -e DB_DSN ardvark migrate >/dev/null || {
     echo "migrate failed"; return 1; }
 }
 
 start_detached() { # NAME INDEX CMD...
   local name="$1" index="$2"; shift 2
-  $COMPOSE run -d --name "$name" -e "WORKER_INDEX=$index" -e "WORKER_COUNT=$WORKERS" ardvark "$@" >/dev/null
+  $COMPOSE run -d --no-deps --name "$name" -e "WORKER_INDEX=$index" -e "WORKER_COUNT=$WORKERS" -e DB_DRIVER -e DB_DSN ardvark "$@" >/dev/null
 }
 
 wait_containers() { # TIMEOUT_SECONDS NAME...
@@ -93,7 +135,7 @@ diagnostics() {
   sub "DIAGNOSTICS: docker ps"
   docker ps --filter "name=^sm-" --format '  {{.Names}}\t{{.Status}}'
   sub "DIAGNOSTICS: frontier state"
-  mysql_q "SELECT status, COUNT(*) FROM frontier_items GROUP BY status" || true
+  db_q "SELECT status, COUNT(*) FROM frontier_items GROUP BY status" || true
 }
 
 clear_logs() { rm -f "$HERE"/logs/*.jsonl 2>/dev/null; mkdir -p "$HERE/logs"; }
@@ -129,7 +171,7 @@ start_fleet() {
   sub "waiting for the seeder to populate pending work"
   local deadline=$(( $(date +%s) + 60 ))
   while :; do
-    local n; n="$(mysql_q "SELECT COUNT(*) FROM frontier_items WHERE status IN ('pending','in_flight')")"
+    local n; n="$(db_q "SELECT COUNT(*) FROM frontier_items WHERE status IN ('pending','in_flight')")"
     [ -n "$n" ] && [ "$n" -ge 15 ] 2>/dev/null && break
     if [ "$(date +%s)" -ge "$deadline" ]; then echo "seeding did not populate pending work"; return 1; fi
     sleep 1
@@ -155,16 +197,16 @@ log "SETUP: generate certs"
 log "SETUP: build images"
 $COMPOSE build
 
-log "SETUP: start mysql + fixture"
-$COMPOSE up -d mysql fixture
-sub "waiting for mysql + fixture health"
+log "SETUP: start $DB_SERVICE + fixture"
+$COMPOSE up -d "$DB_SERVICE" fixture
+sub "waiting for $DB_SERVICE + fixture health"
 for i in $(seq 1 60); do
-  mh="$(docker inspect -f '{{.State.Health.Status}}' "$($COMPOSE ps -q mysql)" 2>/dev/null)"
+  mh="$(docker inspect -f '{{.State.Health.Status}}' "$($COMPOSE ps -q "$DB_SERVICE")" 2>/dev/null)"
   fh="$(docker inspect -f '{{.State.Health.Status}}' "$($COMPOSE ps -q fixture)" 2>/dev/null)"
   [ "$mh" = "healthy" ] && [ "$fh" = "healthy" ] && break
   sleep 2
 done
-echo "  mysql=$mh fixture=$fh"
+echo "  $DB_SERVICE=$mh fixture=$fh"
 
 build_assert() { ( cd "$REPO_ROOT" && go build -o "$HERE/bin/assert" ./tools/smoketest/assert ); }
 log "SETUP: build assert tool"; mkdir -p "$HERE/bin"; build_assert
@@ -183,12 +225,12 @@ if wait_containers 600 $(fleet_names); then
 else
   diagnostics; A_EXIT=1
 fi
-"$ASSERT" a -dsn "$DSN_HOST" -logs "$HERE/logs" -workers "$WORKERS"; A_ASSERT=$?
+"$ASSERT" a -driver "$DB_DRIVER" -dsn "$DSN_HOST" -logs "$HERE/logs" -workers "$WORKERS"; A_ASSERT=$?
 RESULT_A=$(( A_EXIT + A_ASSERT ))
 
 # --- Scenario B reuses Scenario A's logs -----------------------------------
 log "SCENARIO B: shard partition (assert on scenario A logs)"
-"$ASSERT" b -dsn "$DSN_HOST" -logs "$HERE/logs" -workers "$WORKERS"; RESULT_B=$?
+"$ASSERT" b -driver "$DB_DRIVER" -dsn "$DSN_HOST" -logs "$HERE/logs" -workers "$WORKERS"; RESULT_B=$?
 
 # --- Scenario D: re-crawl budget (same DB as A, fresh logs) -----------------
 log "SCENARIO D: re-crawl page-budget re-activation"
@@ -201,7 +243,7 @@ if wait_containers 600 $(fleet_names); then
 else
   diagnostics; D_EXIT=1
 fi
-"$ASSERT" d -dsn "$DSN_HOST" -logs "$HERE/logs" -workers "$WORKERS"; D_ASSERT=$?
+"$ASSERT" d -driver "$DB_DRIVER" -dsn "$DSN_HOST" -logs "$HERE/logs" -workers "$WORKERS"; D_ASSERT=$?
 RESULT_D=$(( D_EXIT + D_ASSERT ))
 
 # --- Scenario C: kill-and-reclaim (fresh DB) -------------------------------
@@ -220,7 +262,7 @@ sub "waiting for worker 6 to hold an in_flight item, then SIGKILL"
 kill_deadline=$(( $(date +%s) + 30 ))
 killed=0
 while [ "$(date +%s)" -lt "$kill_deadline" ]; do
-  inflight6="$(mysql_q "SELECT COUNT(*) FROM frontier_items WHERE status='in_flight' AND host_shard % 10 = 6")"
+  inflight6="$(db_q "SELECT COUNT(*) FROM frontier_items WHERE status='in_flight' AND host_shard % 10 = 6")"
   if [ -n "$inflight6" ] && [ "$inflight6" -ge 1 ] 2>/dev/null; then
     if docker kill "$KILL_TARGET" >/dev/null 2>&1; then
       echo "  killed $KILL_TARGET (SIGKILL) while shard-6 in_flight=$inflight6"
@@ -232,7 +274,7 @@ while [ "$(date +%s)" -lt "$kill_deadline" ]; do
 done
 [ "$killed" = "1" ] || echo "  WARNING: never observed an in_flight item on shard 6 to kill"
 sub "shard-6 frontier state immediately after kill (stranded in_flight/pending):"
-mysql_q "SELECT status, COUNT(*) FROM frontier_items WHERE host_shard % 10 = 6 GROUP BY status" | sed 's/^/    /'
+db_q "SELECT status, COUNT(*) FROM frontier_items WHERE host_shard % 10 = 6 GROUP BY status" | sed 's/^/    /'
 sub "waiting past leaseSeconds(15) + reclaim interval(30) before restart"
 sleep 50
 sub "restarting worker 6 (same index) as sm-w6b"
@@ -247,7 +289,7 @@ if wait_containers 600 "${C_NAMES[@]}"; then
 else
   diagnostics; C_EXIT=1
 fi
-"$ASSERT" c -dsn "$DSN_HOST" -logs "$HERE/logs" -workers "$WORKERS"; C_ASSERT=$?
+"$ASSERT" c -driver "$DB_DRIVER" -dsn "$DSN_HOST" -logs "$HERE/logs" -workers "$WORKERS"; C_ASSERT=$?
 RESULT_C=$(( C_EXIT + C_ASSERT ))
 
 # ===========================================================================

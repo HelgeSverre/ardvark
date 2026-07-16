@@ -28,6 +28,28 @@ services:
     networks:
       default: {}
 
+  # Alternative frontier backend, selected by run.sh's DB=postgres switch. Only
+  # one of mysql/postgres is ever brought up per run (the harness `up`s the
+  # chosen service and runs the ardvark containers with --no-deps). Exposed on a
+  # deliberately uncommon host port so it never collides with a pre-existing
+  # local postgres (e.g. an ardvark-postgres container this harness did not
+  # create, which may own 5432).
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ardvark
+      POSTGRES_USER: ardvark
+      POSTGRES_PASSWORD: ardvark
+    ports:
+      - "15499:5432"   # exposed to host so the assert tool can connect
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "ardvark", "-d", "ardvark"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    networks:
+      default: {}
+
   fixture:
     build:
       context: ../..

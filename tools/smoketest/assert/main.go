@@ -1,15 +1,16 @@
 // Command assert runs the SQL-and-log assertions for the distributed-crawling
-// smoke test (tools/smoketest). It connects to the shared MySQL frontier and
-// reads the per-worker event logs, then verifies one scenario's invariants,
-// printing every observed number and a PASS/FAIL per check. Exit code is
-// non-zero if any check in the scenario failed, so run.sh can gate on it.
+// smoke test (tools/smoketest). It connects to the shared frontier (MySQL or
+// Postgres, per -driver) and reads the per-worker event logs, then verifies one
+// scenario's invariants, printing every observed number and a PASS/FAIL per
+// check. Exit code is non-zero if any check in the scenario failed, so run.sh
+// can gate on it. All SQL it issues is portable across both backends.
 //
 // Usage:
 //
-//	assert <a|b|c|d> -dsn <mysql-dsn> -logs <dir> [-workers 10]
+//	assert <a|b|c|d> [-driver mysql|postgres] -dsn <dsn> -logs <dir> [-workers 10]
 //
 // It is part of the ardvark module purely so it can reuse store models and the
-// same gorm/mysql driver; it writes nothing to the database.
+// same gorm drivers; it writes nothing to the database.
 package main
 
 import (
@@ -44,14 +45,15 @@ func main() {
 	}
 	scenario := os.Args[1]
 	fs := flag.NewFlagSet("assert", flag.ExitOnError)
-	dsn := fs.String("dsn", "ardvark:ardvark@tcp(127.0.0.1:13399)/ardvark?charset=utf8mb4&parseTime=True&loc=UTC", "mysql DSN")
+	driver := fs.String("driver", "mysql", "store driver: mysql or postgres")
+	dsn := fs.String("dsn", "ardvark:ardvark@tcp(127.0.0.1:13399)/ardvark?charset=utf8mb4&parseTime=True&loc=UTC", "store DSN (mysql or postgres, matching -driver)")
 	logsDir := fs.String("logs", "logs", "directory of per-worker JSONL logs")
 	workers := fs.Int("workers", 10, "worker count")
 	_ = fs.Parse(os.Args[2:])
 
-	st, err := store.Open("mysql", *dsn)
+	st, err := store.Open(*driver, *dsn)
 	if err != nil {
-		fatal("open mysql: %v", err)
+		fatal("open %s: %v", *driver, err)
 	}
 	defer st.Close()
 

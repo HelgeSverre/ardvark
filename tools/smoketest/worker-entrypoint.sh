@@ -37,10 +37,25 @@ esac
 CFG_TEMPLATE="${ARDVARK_CONFIG_TEMPLATE:-/config/ardvark.json}"
 CFG_OUT="/tmp/ardvark.json"
 
+# Storage backend is injected too, so the same template drives both the mysql
+# and postgres runs (run.sh's DB switch). Defaults reproduce the original
+# mysql wiring exactly, so an invocation that sets neither var is unchanged.
+DB_DRIVER="${DB_DRIVER:-mysql}"
+DB_DSN="${DB_DSN:-ardvark:ardvark@tcp(mysql:3306)/ardvark?charset=utf8mb4&parseTime=True&loc=UTC}"
+
+# Escape characters that are special in a sed replacement (& = whole match,
+# # = our delimiter, \ = escape). The mysql DSN contains '&', the postgres
+# keyword DSN contains spaces and '=' (both sed-safe), so only &/#/\ matter.
+sed_escape() { printf '%s' "$1" | sed -e 's/[&#\\]/\\&/g'; }
+DB_DRIVER_E="$(sed_escape "$DB_DRIVER")"
+DB_DSN_E="$(sed_escape "$DB_DSN")"
+
 sed \
   -e "s#__LOGFILE__#/logs/worker-${RAW_INDEX}.jsonl#" \
   -e "s#__WORKER_INDEX__#${IDX}#" \
   -e "s#__WORKER_COUNT__#${COUNT}#" \
+  -e "s#__DB_DRIVER__#${DB_DRIVER_E}#" \
+  -e "s#__DB_DSN__#${DB_DSN_E}#" \
   "$CFG_TEMPLATE" > "$CFG_OUT"
 
 exec ardvark --config "$CFG_OUT" "$@"
