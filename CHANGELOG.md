@@ -37,6 +37,11 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Recognized entry media types** — the crawler now matches catalog and
   registry entry media types by semantic kind rather than exact string suffix,
   via a dedicated internal media-type parsing package.
+- **Registry search results are followed** — catalog and registry pointers
+  returned in a registry's `POST /search` results are now followed (pointed-to
+  catalogs fetched and verified, pointed-to registries harvested), matching how
+  pointers in catalog entries are already resolved. Ordinary (non-pointer)
+  results are not artifact-fetched.
 
 ## [0.3.0] - 2026-07-16
 

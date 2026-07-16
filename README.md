@@ -94,7 +94,7 @@ ardvark export --format jsonl --out resources.jsonl
 | `ardvark migrate` | Create/update the database schema. |
 | `ardvark mcp` | Serve ardvark's commands as MCP tools over stdio: `ardvark_probe`, `ardvark_verify`, `ardvark_crawl`, `ardvark_seed`, `ardvark_stats`, `ardvark_info`, `ardvark_export`. |
 
-`crawl`, `work`, `probe`, every `seed` source, `verify`, and `stats` also take `--json` to emit the result as pretty-printed JSON on stdout (diagnostics go to stderr; exit codes are unchanged) — the same typed structures the MCP tools return.
+`crawl`, `work`, `probe`, every `seed` source, `verify`, `stats`, and `info` also take `--json` to emit the result as pretty-printed JSON on stdout (diagnostics go to stderr; exit codes are unchanged) — the same typed structures the MCP tools return.
 
 ## Configuration
 
