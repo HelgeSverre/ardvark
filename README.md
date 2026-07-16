@@ -23,7 +23,7 @@ Publishers advertise their AI agents, MCP servers, and skills in an `ai-catalog.
 - **Spec verification** — official JSON Schema plus seven semantic checks (URN grammar, value-or-reference exclusivity, query counts, …), each recorded pass/fail with a message
 - **Bootstrap seeding** — fill the frontier from Certificate Transparency logs, crt.sh, the Tranco top list, GitHub code search, the MCP registry, curated awesome-lists, or Common Crawl domain ranks (`ardvark seed ct|crtsh|tranco|github|mcp|curated|commoncrawl`)
 - **Swappable storage** — SQLite by default; MySQL and Postgres via one config key; append-only JSONL event log alongside
-- **Agent-ready** — `--json` on `crawl`, `probe`, `seed`, `verify`, and `stats` for machine-readable results, plus an embedded stdio MCP server (`ardvark mcp`) exposing the same operations as tools
+- **Agent-ready** — `--json` on `crawl`, `work`, `probe`, `seed`, `verify`, and `stats` for machine-readable results, plus an embedded stdio MCP server (`ardvark mcp`) exposing the same operations as tools
 - **Resumable runs** — the crawl queue lives in the database; kill a run, start it again, it picks up where it stopped
 - **Polite by default** — per-host rate limiting, robots.txt compliance, body-size caps, redirect caps, backoff on transient failures
 
@@ -77,7 +77,8 @@ ardvark export --format jsonl --out resources.jsonl
 
 | Command | What it does |
 |---------|--------------|
-| `ardvark crawl [url\|domain]... [--list file] [--force]` | Seed the frontier and run the crawler until the queue is empty. Resumes pending work from earlier runs. |
+| `ardvark crawl [url\|domain]... [--list file] [--force]` | Seed the frontier and run the crawler until the queue is empty. Resumes pending work from earlier runs. With a worker fleet configured, this process only drains its own shard, so pair it with `ardvark work` for the other worker indices. |
+| `ardvark work [--worker i/n] [--force]` | Drain the shared frontier without seeding it. Multiple `work` processes can point at the same mysql/postgres database, each taking a disjoint `--worker` share of hosts (0-based index / total count) so they crawl cooperatively; sqlite is single-process only. Exits cleanly if the frontier is empty. |
 | `ardvark probe <host>...` | Probe specific hosts for ARD documents, no crawling. |
 | `ardvark seed ct [--count N] [--log oak\|argon\|all\|URL]` | Harvest domains from the newest Certificate Transparency log entries. Logs resolve live from the CT log list (Oak by default), so shard URLs never go stale. |
 | `ardvark seed crtsh [--count N] [--match keyword]` | Harvest domains from crt.sh, narrowed to certificate identities mentioning `--match` (e.g. `agent`, `mcp`); without `--match`, queries a curated agent/mcp/ai keyword set instead of an unfiltered wildcard, which crt.sh can't serve. |
@@ -93,7 +94,7 @@ ardvark export --format jsonl --out resources.jsonl
 | `ardvark migrate` | Create/update the database schema. |
 | `ardvark mcp` | Serve ardvark's commands as MCP tools over stdio: `ardvark_probe`, `ardvark_verify`, `ardvark_crawl`, `ardvark_seed`, `ardvark_stats`, `ardvark_info`, `ardvark_export`. |
 
-`crawl`, `probe`, every `seed` source, `verify`, and `stats` also take `--json` to emit the result as pretty-printed JSON on stdout (diagnostics go to stderr; exit codes are unchanged) — the same typed structures the MCP tools return.
+`crawl`, `work`, `probe`, every `seed` source, `verify`, and `stats` also take `--json` to emit the result as pretty-printed JSON on stdout (diagnostics go to stderr; exit codes are unchanged) — the same typed structures the MCP tools return.
 
 ## Configuration
 
@@ -112,7 +113,8 @@ ardvark runs with sensible defaults and no config file. To change anything, drop
     "maxBodyBytes": 5242880,
     "userAgent": "ardvark/0.1 (+https://github.com/helgesverre/ardvark)",
     "respectRobotsTxt": true,
-    "refreshAfterHours": 168
+    "refreshAfterHours": 168,
+    "leaseSeconds": 600
   },
   "ard":      { "maxCatalogDepth": 3, "fetchArtifacts": true },
   "registry": { "harvest": true, "maxReferralDepth": 2, "pageLimit": 20 },
@@ -146,6 +148,7 @@ ardvark runs with sensible defaults and no config file. To change anything, drop
 | `crawler.maxPagesPerDomain` | `50` | Page budget per domain |
 | `crawler.perHostRequestsPerSecond` | `1` | Politeness rate limit |
 | `crawler.refreshAfterHours` | `168` | Skip hosts probed within this window |
+| `crawler.leaseSeconds` | `600` | How long a claimed work item can stay in progress before it's treated as stalled and reclaimed (must outlast the slowest handler; see below) |
 | `ard.maxCatalogDepth` | `3` | Nested-catalog recursion bound |
 | `registry.maxReferralDepth` | `2` | Registry referral-following bound |
 | `seed.crtsh.count` | `1000` | Default `seed crtsh` domain count (own key, not shared with `seed.ct.entryCount`) |

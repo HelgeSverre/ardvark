@@ -1,0 +1,33 @@
+# Multi-stage build for the ardvark worker image used by the distributed
+# smoke test. The build context is the REPO ROOT (see docker-compose.yml), so
+# the binary is built from the worktree source under test.
+#
+# The final stage installs the smoke test's throwaway CA (tools/smoketest/certs/
+# ca.crt, produced by gencerts) into the system trust store, because probing is
+# https-only and the fixture serves TLS signed by that CA — without trust,
+# every well-known probe would fail with a certificate error.
+
+# --- build stage ----------------------------------------------------------
+FROM golang:1.26-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/ardvark ./cmd/ardvark
+
+# --- final stage ----------------------------------------------------------
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the disposable smoke-test CA into the system trust store so Go's
+# default transport (which reads /etc/ssl/certs) trusts the fixture's TLS.
+COPY tools/smoketest/certs/ca.crt /usr/local/share/ca-certificates/ardvark-smoketest-ca.crt
+RUN update-ca-certificates
+
+COPY --from=build /out/ardvark /usr/local/bin/ardvark
+COPY tools/smoketest/worker-entrypoint.sh /usr/local/bin/worker-entrypoint.sh
+RUN chmod +x /usr/local/bin/worker-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/worker-entrypoint.sh"]

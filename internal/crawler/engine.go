@@ -8,19 +8,16 @@
 // Two recursion sources are bounded by config and dedup keys: nested
 // catalogs (ard.maxCatalogDepth, reusing FrontierItem.Depth with
 // catalog_fetch-specific meaning) and registry referrals
-// (registry.maxReferralDepth, same mechanism). Because FrontierItem does
-// not carry a parent-catalog or declaring-entry foreign key, the engine
-// tracks that provenance in an in-memory map keyed by URL, populated at
-// enqueue time. This is a known limitation: if the process restarts with
-// items still pending in the frontier, resumed catalog_fetch /
-// registry_harvest items whose provenance was only in memory will fall
-// back to sensible defaults (no parent, catalog id 0) rather than losing
-// data outright. A future iteration could add explicit foreign-key columns
-// to the frontier_items table to make this fully resumable.
+// (registry.maxReferralDepth, same mechanism). Provenance a handler needs
+// to attribute its result (parent catalog, declaring entry, probe method,
+// ...) is persisted directly on the frontier_items row by the enqueuing
+// side and read back by the dequeuing side's handler — see the
+// "Provenance columns" doc comment on store.FrontierItem — so it survives
+// process restarts and is visible to whichever worker process ends up
+// dequeuing the item, not just the one that enqueued it.
 package crawler
 
 import (
-	"container/list"
 	"context"
 	"errors"
 	"fmt"
@@ -54,12 +51,18 @@ const defaultRegistryTimeout = 15 * time.Second
 // may enqueue new work, so the crawl cannot terminate yet).
 const idlePollInterval = 25 * time.Millisecond
 
-// ARD entry media types the engine treats specially (see
-// processCatalog).
-const (
-	mediaTypeAICatalog  = "application/ai-catalog+json"
-	mediaTypeAIRegistry = "application/ai-registry+json"
-)
+// globalCountsCheckInterval throttles how often Run queries
+// Frontier.Counts() while locally idle. Counts is a real query (two, on
+// most drivers), so it is checked at a coarser cadence than
+// idlePollInterval rather than on every poll tick.
+const globalCountsCheckInterval = time.Second
+
+// expiredLeaseReclaimInterval is how often Run's dispatcher sweeps for
+// expired in_flight leases on mysql/postgres, where multiple worker
+// processes may share the frontier and a blanket startup reclaim (safe only
+// under sqlite's single-process assumption) would be wrong: a peer's
+// legitimately in-flight item must not be reclaimed out from under it.
+const expiredLeaseReclaimInterval = 30 * time.Second
 
 // Options configures an Engine run.
 type Options struct {
@@ -97,69 +100,18 @@ type Engine struct {
 
 	httpClientOnce sync.Once
 	httpClient     *http.Client
-
-	parentCatalogByURL *lockedMap[string, uint]
-	artifactEntryByURL *lockedMap[string, uint]
-	registryCtxByURL   *lockedMap[string, registryContext]
-	// catalogMethodByURL remembers which probe method (well_known,
-	// robots_agentmap, link_tag) discovered each enqueued catalog URL, so
-	// the verified-catalog ProbeEvent can report it. Same in-memory
-	// provenance caveat as the maps above.
-	catalogMethodByURL *lockedMap[string, string]
-
-	// pagesMu guards pageCounts/pageOrder/pageElems, an in-memory
-	// approximation of "pages fetched so far per domain" used to enforce
-	// maxPagesPerDomain without an extra store query per link. Unlike the
-	// provenance maps above, a host's entry cannot simply be dropped once
-	// "consumed" — the budget must hold for the domain's entire life in
-	// the crawl, and page_fetch items for a host can keep arriving as long
-	// as its budget isn't exhausted. So instead of per-entry release this
-	// is bounded with an LRU cap (maxTrackedDomains): once that many
-	// distinct hosts are tracked, the least-recently-touched host is
-	// evicted to make room. This is a deliberate, documented
-	// approximation (see reservePage) — an evicted host that reappears
-	// much later starts a fresh count, so it could exceed
-	// maxPagesPerDomain by a bounded amount. Given the cap is large
-	// relative to any single crawl's realistic per-run host cardinality,
-	// eviction is rare in practice; it exists purely to bound memory for
-	// very long-running crawls over huge seed sets (e.g. CT-log seeding).
-	pagesMu    sync.Mutex
-	pageCounts map[string]int
-	pageOrder  *list.List
-	pageElems  map[string]*list.Element
-}
-
-// maxTrackedDomains bounds the number of distinct hosts pageCounts (and its
-// LRU bookkeeping) will track at once. See the pagesMu doc comment.
-const maxTrackedDomains = 20000
-
-// registryContext carries the provenance an in-flight registry_harvest
-// item needs: which catalog entry declared the registry, which catalog its
-// harvested entries should be attributed to, and the registries-table row
-// id for the registry itself.
-type registryContext struct {
-	entryID   uint
-	catalogID uint
-	regRowID  uint
 }
 
 // New builds an Engine. logger must not be nil; pass eventlog.New's result
 // (or slog.Default() in tests).
 func New(cfg config.Config, st *store.Store, fr *frontier.Frontier, fetchClient *fetch.Client, logger *slog.Logger, opts Options) *Engine {
 	return &Engine{
-		cfg:                cfg,
-		store:              st,
-		frontier:           fr,
-		fetch:              fetchClient,
-		logger:             logger,
-		opts:               opts,
-		parentCatalogByURL: newLockedMap[string, uint](),
-		artifactEntryByURL: newLockedMap[string, uint](),
-		registryCtxByURL:   newLockedMap[string, registryContext](),
-		catalogMethodByURL: newLockedMap[string, string](),
-		pageCounts:         make(map[string]int),
-		pageOrder:          list.New(),
-		pageElems:          make(map[string]*list.Element),
+		cfg:      cfg,
+		store:    st,
+		frontier: fr,
+		fetch:    fetchClient,
+		logger:   logger,
+		opts:     opts,
 	}
 }
 
@@ -170,7 +122,7 @@ func (e *Engine) EnqueueSeedURL(rawURL string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("crawler: enqueue seed url: %w", err)
 	}
-	return e.enqueue(store.KindPageFetch, rawURL, host, 0)
+	return e.enqueue(store.KindPageFetch, rawURL, host, 0, provenance{})
 }
 
 // EnqueueSeedHost enqueues a host_probe item at depth 0 for host, the entry
@@ -179,33 +131,79 @@ func (e *Engine) EnqueueSeedHost(host, discoverySource string) (bool, error) {
 	if _, err := e.store.UpsertDomain(host, discoverySource); err != nil {
 		return false, fmt.Errorf("crawler: enqueue seed host: %w", err)
 	}
-	return e.enqueue(store.KindHostProbe, "", host, 0)
+	return e.enqueue(store.KindHostProbe, "", host, 0, provenance{})
 }
 
-// enqueue builds and enqueues a frontier item for kind, deriving the dedup
-// key from the item's natural key (host for host_probe, URL otherwise) in
-// one place so keys cannot drift across call sites. An enqueue failure is
-// warn-logged here — the crawl always continues without the item — and
-// also returned for the callers that must react to it (seed enqueues,
-// page-budget release).
-func (e *Engine) enqueue(kind, url, host string, depth int) (bool, error) {
-	natural := url
-	if kind == store.KindHostProbe {
-		natural = host
-	}
-	added, err := e.frontier.Enqueue(&store.FrontierItem{
-		RunID:    e.opts.RunID,
-		Kind:     kind,
-		URL:      url,
-		Host:     host,
-		Depth:    depth,
-		DedupKey: dedupKey(kind, natural),
-	})
+// provenance carries the frontier_items provenance columns (see
+// store.FrontierItem's "Provenance columns" doc comment) that a handler
+// will need once the item it is attached to is dequeued. Callers fill in
+// only the fields relevant to the item's kind; the rest are left zero.
+type provenance struct {
+	ParentCatalogID   *uint
+	ArtifactEntryID   *uint
+	RegistryEntryID   *uint
+	RegistryCatalogID *uint
+	RegistryRowID     *uint
+	ProbeMethod       string
+}
+
+// enqueue builds (via buildItem) and enqueues a frontier item for kind. An
+// enqueue failure is warn-logged here — the crawl always continues without
+// the item — and also returned for the callers that must react to it (seed
+// enqueues). Page-fetch fan-out uses enqueuePageFetch instead, which applies
+// the maxPagesPerDomain budget.
+func (e *Engine) enqueue(kind, url, host string, depth int, prov provenance) (bool, error) {
+	added, err := e.frontier.Enqueue(e.buildItem(kind, url, host, depth, prov))
 	if err != nil {
 		e.logger.Warn("crawler: failed to enqueue item", "kind", kind, "url", url, "host", host, "error", err)
 		return false, err
 	}
 	return added, nil
+}
+
+// enqueuePageFetch enqueues a page_fetch item like enqueue, but subject to the
+// crawler.maxPagesPerDomain page budget: a NEW page_fetch URL for host is
+// only created while host has fewer than maxPagesPerDomain page_fetch rows in
+// the frontier, whereas re-activating a page URL host already reached is
+// always permitted and never consumes budget (see
+// frontier.EnqueueBudgeted and the maxPagesPerDomain doc comment).
+//
+// The budget is enforced per call, so invoking this once per link in a page's
+// fan-out loop guarantees a single page cannot overshoot: each call re-counts
+// and thus sees every page_fetch row the earlier iterations added.
+func (e *Engine) enqueuePageFetch(url, host string, depth int) (bool, error) {
+	item := e.buildItem(store.KindPageFetch, url, host, depth, provenance{})
+	added, err := e.frontier.EnqueueBudgeted(item, e.maxPagesPerDomain())
+	if err != nil {
+		e.logger.Warn("crawler: failed to enqueue item", "kind", store.KindPageFetch, "url", url, "host", host, "error", err)
+		return false, err
+	}
+	return added, nil
+}
+
+// buildItem constructs a frontier item for kind, deriving the dedup key from
+// the item's natural key (host for host_probe, URL otherwise) in one place so
+// keys cannot drift across call sites, and stamping prov onto the row so a
+// handler can read it back after the item is dequeued.
+func (e *Engine) buildItem(kind, url, host string, depth int, prov provenance) *store.FrontierItem {
+	natural := url
+	if kind == store.KindHostProbe {
+		natural = host
+	}
+	return &store.FrontierItem{
+		RunID:             e.opts.RunID,
+		Kind:              kind,
+		URL:               url,
+		Host:              host,
+		Depth:             depth,
+		DedupKey:          dedupKey(kind, natural),
+		ParentCatalogID:   prov.ParentCatalogID,
+		ArtifactEntryID:   prov.ArtifactEntryID,
+		RegistryEntryID:   prov.RegistryEntryID,
+		RegistryCatalogID: prov.RegistryCatalogID,
+		RegistryRowID:     prov.RegistryRowID,
+		ProbeMethod:       prov.ProbeMethod,
+	}
 }
 
 // Run drains the frontier with a continuous worker pool: concurrency()
@@ -214,17 +212,42 @@ func (e *Engine) enqueue(kind, url, host string, depth int) (bool, error) {
 // in_flight atomically, so the single dispatcher is the only frontier
 // reader and workers never race for items). A slow item therefore occupies
 // one worker, not the whole pool. Run returns nil once the frontier is
-// empty and every worker is idle — "queue empty" alone is not termination,
-// since an in-flight item may enqueue new work — or when ctx is cancelled
-// (graceful shutdown: items already dequeued are still dispatched, and
-// process requeues them once it sees ctx.Err).
+// globally empty — this worker's dequeue comes back empty, this worker has
+// no items in flight, AND Frontier.Counts() reports zero pending and zero
+// in_flight — or when ctx is cancelled (graceful shutdown: items already
+// dequeued are still dispatched, and process requeues them once it sees
+// ctx.Err).
+//
+// The global check matters for distributed crawling (mysql/postgres,
+// multiple worker processes sharing one frontier): this process's own
+// queue being empty says nothing about whether a peer process is still
+// working on (or holding pending) items that could enqueue more work, so
+// "locally idle" alone is never sufficient to terminate.
 func (e *Engine) Run(ctx context.Context) error {
-	// Reclaim items left in_flight by a previously killed process (ardvark
-	// runs one crawl at a time, so any in_flight row at startup is stale).
-	if n, err := e.frontier.ReclaimInFlight(); err != nil {
-		return fmt.Errorf("crawler: reclaim in-flight: %w", err)
-	} else if n > 0 {
-		e.logger.Info("crawler: reclaimed stale in-flight items", "count", n)
+	sqliteBackend := isSQLiteDriver(e.cfg.Storage.Driver)
+
+	if sqliteBackend {
+		// sqlite's storage backend supports exactly one crawl process at a
+		// time (see store.Open), so any in_flight row at startup is always
+		// the residue of a previous process killed mid-batch: reclaim all
+		// of them unconditionally.
+		if n, err := e.frontier.ReclaimInFlight(); err != nil {
+			return fmt.Errorf("crawler: reclaim in-flight: %w", err)
+		} else if n > 0 {
+			e.logger.Info("crawler: reclaimed stale in-flight items", "count", n)
+		}
+	} else {
+		// mysql/postgres may have other worker processes concurrently
+		// holding legitimate in_flight items, so only leases that have
+		// actually expired are reclaimed (see ReclaimExpired). Run once at
+		// startup in addition to the periodic sweep in the dispatcher loop
+		// below, so a crash-and-restart doesn't wait a full
+		// expiredLeaseReclaimInterval before resuming stranded work.
+		if n, err := e.frontier.ReclaimExpired(); err != nil {
+			return fmt.Errorf("crawler: reclaim expired: %w", err)
+		} else if n > 0 {
+			e.logger.Info("crawler: reclaimed expired in-flight items", "count", n)
+		}
 	}
 
 	workers := e.concurrency()
@@ -243,11 +266,22 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 
 	var runErr error
+	lastReclaim := time.Now()
+	var lastCountsCheck time.Time
 	for ctx.Err() == nil {
+		if !sqliteBackend && time.Since(lastReclaim) >= expiredLeaseReclaimInterval {
+			if n, err := e.frontier.ReclaimExpired(); err != nil {
+				e.logger.Error("crawler: periodic reclaim expired failed", "error", err)
+			} else if n > 0 {
+				e.logger.Info("crawler: reclaimed expired in-flight items", "count", n)
+			}
+			lastReclaim = time.Now()
+		}
+
 		// Snapshot idleness before dequeuing: if nothing was in flight then
-		// and the dequeue still comes back empty, no worker can have
-		// enqueued new work in between (workers commit all enqueues before
-		// their in-flight count drops), so the crawl is done.
+		// and the dequeue still comes back empty, no worker goroutine of
+		// *this* process can have enqueued new work in between (workers
+		// commit all enqueues before their in-flight count drops).
 		idle := inFlight.Load() == 0
 		batch, err := e.frontier.Dequeue(workers)
 		if err != nil {
@@ -256,7 +290,22 @@ func (e *Engine) Run(ctx context.Context) error {
 		}
 		if len(batch) == 0 {
 			if idle {
-				break
+				// Locally idle, but other worker processes may still hold
+				// pending or in_flight work that could enqueue more.
+				// Counts() is a real query, so it is only checked at
+				// globalCountsCheckInterval granularity rather than on
+				// every idlePollInterval tick.
+				if time.Since(lastCountsCheck) >= globalCountsCheckInterval {
+					pending, globalInFlight, cerr := e.frontier.Counts()
+					lastCountsCheck = time.Now()
+					if cerr != nil {
+						runErr = fmt.Errorf("crawler: counts: %w", cerr)
+						break
+					}
+					if pending == 0 && globalInFlight == 0 {
+						break
+					}
+				}
 			}
 			select {
 			case <-ctx.Done():
@@ -272,6 +321,18 @@ func (e *Engine) Run(ctx context.Context) error {
 	close(items)
 	wg.Wait()
 	return runErr
+}
+
+// isSQLiteDriver reports whether driver names ardvark's sqlite storage
+// backend ("sqlite" or "sqlite3"). An empty driver string is also treated
+// as sqlite here — this is not something store.Open does (it errors on ""
+// rather than defaulting to sqlite); it is this function's own conservative
+// default, chosen because the sqlite branch's unconditional reclaim is the
+// safe failure mode if the driver were ever unset. In practice "" never
+// reaches here: config.Defaults() always fills in a non-empty driver before
+// the store is opened.
+func isSQLiteDriver(driver string) bool {
+	return driver == "" || driver == "sqlite" || driver == "sqlite3"
 }
 
 // concurrency returns the configured worker pool size.
@@ -307,14 +368,18 @@ func (e *Engine) process(ctx context.Context, item store.FrontierItem) {
 	err := e.handleItem(ctx, item)
 	if err == nil {
 		if cerr := e.frontier.Complete(item.ID); cerr != nil {
+			if errors.Is(cerr, frontier.ErrLeaseLost) {
+				// Our lease expired mid-handler and a peer reclaimed and
+				// re-dequeued the item (see frontier.ErrLeaseLost). Completing
+				// it now would clobber the new owner; the peer will redo (and
+				// re-persist) the work, so our local result is safely
+				// discarded. Expected under contention, not an error.
+				e.logger.Warn("crawler: item lease expired and was reclaimed by another worker; discarding local result", "item_id", item.ID, "kind", item.Kind, "url", item.URL, "host", item.Host)
+				return
+			}
 			e.logger.Error("crawler: failed to mark item complete", "item_id", item.ID, "kind", item.Kind, "error", cerr)
 			return
 		}
-		// The item will never be dispatched again (barring a future
-		// re-enqueue of the same dedup key, which always calls the
-		// matching setXxx before re-enqueueing — see releaseProvenance's
-		// doc comment), so its in-memory provenance entry can be dropped.
-		e.releaseProvenance(item)
 		e.logger.Info("crawler: item complete", "item_id", item.ID, "kind", item.Kind, "url", item.URL, "host", item.Host)
 		return
 	}
@@ -324,6 +389,10 @@ func (e *Engine) process(ctx context.Context, item store.FrontierItem) {
 	// it permanently failed and silently losing the work.
 	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 		if rerr := e.frontier.Requeue(item.ID); rerr != nil {
+			if errors.Is(rerr, frontier.ErrLeaseLost) {
+				e.logger.Warn("crawler: item lease expired and was reclaimed by another worker; discarding local result", "item_id", item.ID, "kind", item.Kind, "url", item.URL, "host", item.Host)
+				return
+			}
 			e.logger.Error("crawler: failed to requeue interrupted item", "item_id", item.ID, "error", rerr)
 		}
 		return
@@ -338,15 +407,15 @@ func (e *Engine) process(ctx context.Context, item store.FrontierItem) {
 		}
 	}
 
-	permanent, ferr := e.frontier.Fail(item.ID, err, max)
-	if ferr != nil {
+	if _, ferr := e.frontier.Fail(item.ID, err, max); ferr != nil {
+		if errors.Is(ferr, frontier.ErrLeaseLost) {
+			// See the Complete branch above: the item is a peer's now, so our
+			// failure record would be stale. Discard it and move on.
+			e.logger.Warn("crawler: item lease expired and was reclaimed by another worker; discarding local result", "item_id", item.ID, "kind", item.Kind, "url", item.URL, "host", item.Host)
+			return
+		}
 		e.logger.Error("crawler: failed to record item failure", "item_id", item.ID, "kind", item.Kind, "error", ferr)
 		return
-	}
-	// A still-pending item (more retries left) still needs its provenance
-	// entry for the next attempt; a permanently failed one never will.
-	if permanent {
-		e.releaseProvenance(item)
 	}
 	e.logger.Warn("crawler: item failed", "item_id", item.ID, "kind", item.Kind, "url", item.URL, "host", item.Host, "transient", transient, "error", err.Error())
 }
@@ -424,163 +493,36 @@ func (e *Engine) registryHTTPClient() *http.Client {
 	return e.httpClient
 }
 
-// -- Provenance tracking (see package doc for the resumability caveat) ----
+// -- Page budget for maxPagesPerDomain -------------------------------------
+
+// maxPagesPerDomain returns the configured page budget per domain: the
+// maximum number of distinct page_fetch URLs a single host may have present
+// in the frontier at once. The budget is enforced by frontier.EnqueueBudgeted
+// (via enqueuePageFetch), which counts existing page_fetch rows for the host
+// directly in the frontier_items table — the dedup key guarantees at most one
+// row per distinct URL, so within a single process this count is exact.
 //
-// Lifecycle: each entry is written by a setXxx call immediately before the
-// frontier item that will consume it is enqueued, and read once by the
-// item's handler while it is being processed. Once process() learns the
-// item will never be dispatched again — it completed successfully, or it
-// failed permanently (attempts exhausted) — releaseProvenance drops the
-// entry so these maps do not grow for the lifetime of a long crawl,
-// retaining only entries for work still pending or in flight (including
-// items with retries remaining, which still need their entry for the next
-// attempt).
+// Precise semantics: the budget caps DISTINCT page URLs per host present in
+// the frontier, not pages fetched per database lifetime. Re-activating a page
+// URL the host already has (flipping a done/failed row back to pending, as a
+// refresh crawl or --force does through the dedup re-enqueue path) creates no
+// new row and so never consumes budget — a capped host therefore re-fetches
+// all its known pages on later crawls, not just its seed. Only creating a
+// NEW page URL is gated. The check runs at enqueue time (not fetch time) and
+// per enqueue call, so a single page's link fan-out cannot overshoot: each
+// call re-counts and sees every row the earlier iterations added.
 //
-// A reference cycle (catalog A -> B -> A, or registry referrals pointing
-// back at each other) re-enqueues an already-completed dedup key at a
-// deeper depth (frontier.Enqueue's doc comment); the corresponding setXxx
-// call always happens again before that re-enqueue, so the entry exists by
-// the time the item is redispatched even though it was dropped after the
-// first completion. This ordering — set-then-enqueue, dequeue-then-read,
-// complete-then-release — is what makes eager release safe.
-
-// lockedMap is a mutex-guarded map: the minimal get/set/delete shape the
-// provenance tracking needs, shared across the four maps instead of four
-// hand-rolled accessor pairs.
-type lockedMap[K comparable, V any] struct {
-	mu sync.Mutex
-	m  map[K]V
-}
-
-func newLockedMap[K comparable, V any]() *lockedMap[K, V] {
-	return &lockedMap[K, V]{m: make(map[K]V)}
-}
-
-func (l *lockedMap[K, V]) get(k K) (V, bool) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	v, ok := l.m[k]
-	return v, ok
-}
-
-func (l *lockedMap[K, V]) set(k K, v V) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.m[k] = v
-}
-
-func (l *lockedMap[K, V]) delete(k K) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	delete(l.m, k)
-}
-
-func (e *Engine) setParentCatalog(url string, catalogID uint) {
-	e.parentCatalogByURL.set(url, catalogID)
-}
-
-func (e *Engine) parentCatalogFor(url string) *uint {
-	if id, ok := e.parentCatalogByURL.get(url); ok {
-		return &id
-	}
-	return nil
-}
-
-func (e *Engine) setArtifactEntry(url string, entryID uint) {
-	e.artifactEntryByURL.set(url, entryID)
-}
-
-func (e *Engine) artifactEntry(url string) uint {
-	id, _ := e.artifactEntryByURL.get(url)
-	return id
-}
-
-func (e *Engine) setCatalogMethod(url, method string) {
-	e.catalogMethodByURL.set(url, method)
-}
-
-func (e *Engine) catalogMethodFor(url string) string {
-	method, _ := e.catalogMethodByURL.get(url)
-	return method
-}
-
-func (e *Engine) setRegistryContext(url string, entryID, catalogID, regRowID uint) {
-	e.registryCtxByURL.set(url, registryContext{entryID: entryID, catalogID: catalogID, regRowID: regRowID})
-}
-
-func (e *Engine) registryContextFor(url string) (registryContext, bool) {
-	return e.registryCtxByURL.get(url)
-}
-
-// releaseProvenance drops item's in-memory provenance entry (parent
-// catalog, artifact entry, catalog discovery method, or registry context)
-// once process() knows item will never be dispatched again. See the
-// "Provenance tracking" doc comment above for why this is safe.
-func (e *Engine) releaseProvenance(item store.FrontierItem) {
-	switch item.Kind {
-	case store.KindCatalogFetch:
-		e.parentCatalogByURL.delete(item.URL)
-		e.catalogMethodByURL.delete(item.URL)
-	case store.KindArtifactFetch:
-		e.artifactEntryByURL.delete(item.URL)
-	case store.KindRegistryHarvest:
-		e.registryCtxByURL.delete(item.URL)
-	}
-}
-
-// -- Page-count tracking for maxPagesPerDomain -----------------------------
-
-// reservePage atomically checks-and-reserves one unit of host's
-// maxPagesPerDomain budget, returning false without reserving if the budget
-// is already exhausted. Reservation happens at enqueue time (not fetch
-// time) so that a single page fan-out cannot enqueue far more page_fetch
-// items than the budget allows before any of them have actually been
-// fetched and counted.
-func (e *Engine) reservePage(host string, budget int) bool {
-	e.pagesMu.Lock()
-	defer e.pagesMu.Unlock()
-	e.touchPageLocked(host)
-	if e.pageCounts[host] >= budget {
-		return false
-	}
-	e.pageCounts[host]++
-	return true
-}
-
-// releasePage undoes a reservePage call, used when an enqueue attempt made
-// after a successful reservation ultimately fails (so the budget isn't
-// permanently consumed by dead reservations).
-func (e *Engine) releasePage(host string) {
-	e.pagesMu.Lock()
-	defer e.pagesMu.Unlock()
-	e.touchPageLocked(host)
-	if e.pageCounts[host] > 0 {
-		e.pageCounts[host]--
-	}
-}
-
-// touchPageLocked records host as the most-recently-used entry in the
-// pageCounts LRU, creating it (at count 0) if new. Callers must hold
-// pagesMu. If host is new and the tracker is already at maxTrackedDomains,
-// the least-recently-touched host is evicted first (see the pagesMu doc
-// comment on Engine for the correctness tradeoff this implies).
-func (e *Engine) touchPageLocked(host string) {
-	if el, ok := e.pageElems[host]; ok {
-		e.pageOrder.MoveToFront(el)
-		return
-	}
-	if e.pageOrder.Len() >= maxTrackedDomains {
-		if oldest := e.pageOrder.Back(); oldest != nil {
-			evicted := oldest.Value.(string)
-			e.pageOrder.Remove(oldest)
-			delete(e.pageElems, evicted)
-			delete(e.pageCounts, evicted)
-		}
-	}
-	e.pageElems[host] = e.pageOrder.PushFront(host)
-}
-
-// maxPagesPerDomain returns the configured page budget per domain.
+// Under distributed crawling (mysql/postgres, multiple worker processes) the
+// count is exact per-process but not globally atomic: two workers racing to
+// enqueue page_fetch items for the same host could each observe a count just
+// under the limit and both enqueue, overshooting by a small, bounded amount.
+// Host-affinity sharding (store.FrontierItem.HostShard) makes this race rare
+// — normally only one worker ever owns a given host — but it is not
+// eliminated for hosts discovered mid-crawl before sharding routes their
+// future items consistently. This is a deliberate, documented tradeoff rather
+// than a bug: closing it fully would require a cross-process lock or a DB-side
+// atomic counter for a budget whose entire purpose is a soft cap.
+//
 // config.Load/config.Defaults already fill in the documented default (50)
 // for any key absent from the config file, so an explicit 0 here reflects
 // the operator's own choice (permitted by the config schema's minimum:0)

@@ -50,6 +50,14 @@ func TestLoad_ValidConfig(t *testing.T) {
 	}
 }
 
+func TestDefaults_LeaseSeconds(t *testing.T) {
+	// 600s covers the slowest legitimate handler (registry_harvest
+	// pagination + retry backoff); see frontier.defaultLeaseSeconds.
+	if got := Defaults().Crawler.LeaseSeconds; got != 600 {
+		t.Errorf("Defaults().Crawler.LeaseSeconds = %d, want 600", got)
+	}
+}
+
 // Relative storage.dsn (sqlite) and log.file in a config file must resolve
 // against the config file's directory, not the process's working directory.
 // Absolute paths, sqlite special forms, and server DSNs pass through.
@@ -137,6 +145,21 @@ func TestLoadBytes_InvalidCases(t *testing.T) {
 			name:       "negative max depth",
 			json:       `{"crawler": {"maxDepth": -1}}`,
 			wantSubstr: `config.crawler.maxDepth`,
+		},
+		{
+			name:       "negative lease seconds",
+			json:       `{"crawler": {"leaseSeconds": -1}}`,
+			wantSubstr: `config.crawler.leaseSeconds`,
+		},
+		{
+			name:       "negative worker index",
+			json:       `{"crawler": {"worker": {"index": -1}}}`,
+			wantSubstr: `config.crawler.worker.index`,
+		},
+		{
+			name:       "zero worker count",
+			json:       `{"crawler": {"worker": {"count": 0}}}`,
+			wantSubstr: `config.crawler.worker.count`,
 		},
 		{
 			name:       "unknown top-level key",
@@ -263,5 +286,39 @@ func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("writing test fixture %s: %v", path, err)
+	}
+}
+
+func TestDefaults_Worker(t *testing.T) {
+	w := Defaults().Crawler.Worker
+	if w.Index != 0 || w.Count != 1 {
+		t.Errorf("Defaults().Crawler.Worker = %+v, want {Index:0 Count:1}", w)
+	}
+}
+
+func TestLoadBytes_WorkerIndexMustBeLessThanCount(t *testing.T) {
+	tests := []struct {
+		name    string
+		json    string
+		wantErr bool
+	}{
+		{name: "index equal to count", json: `{"crawler": {"worker": {"index": 1, "count": 1}}}`, wantErr: true},
+		{name: "index greater than count", json: `{"crawler": {"worker": {"index": 3, "count": 2}}}`, wantErr: true},
+		{name: "index less than count", json: `{"crawler": {"worker": {"index": 1, "count": 4}}}`, wantErr: false},
+		{name: "default (unset) is valid", json: `{}`, wantErr: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := LoadBytes([]byte(tt.json))
+			if tt.wantErr && err == nil {
+				t.Fatalf("LoadBytes(%q) expected error, got nil", tt.json)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("LoadBytes(%q) unexpected error: %v", tt.json, err)
+			}
+			if tt.wantErr && err != nil && !strings.Contains(err.Error(), "crawler.worker.index") {
+				t.Fatalf("LoadBytes(%q) error = %q, want mention of crawler.worker.index", tt.json, err.Error())
+			}
+		})
 	}
 }

@@ -495,9 +495,9 @@ func TestHandleArtifactFetch_SavesArtifact(t *testing.T) {
 	defer srv.Close()
 
 	eng, st := newTestEngine(t, testCrawlerConfig())
-	eng.setArtifactEntry(srv.URL+"/card.json", 42)
+	entryID := uint(42)
 
-	item := store.FrontierItem{URL: srv.URL + "/card.json"}
+	item := store.FrontierItem{URL: srv.URL + "/card.json", ArtifactEntryID: &entryID}
 	if err := eng.handleArtifactFetch(context.Background(), item); err != nil {
 		t.Fatalf("handleArtifactFetch: %v", err)
 	}
@@ -518,9 +518,9 @@ func TestHandleArtifactFetch_PermanentFailureRecordsErrorArtifact(t *testing.T) 
 	defer srv.Close()
 
 	eng, st := newTestEngine(t, testCrawlerConfig())
-	eng.setArtifactEntry(srv.URL+"/missing.json", 7)
+	entryID := uint(7)
 
-	item := store.FrontierItem{URL: srv.URL + "/missing.json"}
+	item := store.FrontierItem{URL: srv.URL + "/missing.json", ArtifactEntryID: &entryID}
 	if err := eng.handleArtifactFetch(context.Background(), item); err != nil {
 		t.Fatalf("expected permanent failure to be swallowed as an errored artifact, got %v", err)
 	}
@@ -565,34 +565,54 @@ func TestProcess_CompletesSuccessfulItem(t *testing.T) {
 	defer srv.Close()
 
 	eng, st := newTestEngine(t, testCrawlerConfig())
-	eng.setArtifactEntry(srv.URL+"/ok.json", 1)
+	entryID := uint(1)
 
-	item := store.FrontierItem{Kind: store.KindArtifactFetch, URL: srv.URL + "/ok.json", DedupKey: "x", Status: store.FrontierStatusInFlight}
-	if err := st.DB.Create(&item).Error; err != nil {
-		t.Fatalf("seed item: %v", err)
-	}
+	// Enqueue+dequeue through the engine's own frontier so the in_flight row
+	// carries that frontier's worker_id: Complete's ownership guard only
+	// touches rows this worker still holds the lease on.
+	item := store.FrontierItem{Kind: store.KindArtifactFetch, URL: srv.URL + "/ok.json", DedupKey: "x", ArtifactEntryID: &entryID}
+	got := seedInFlight(t, eng, &item)
 
-	eng.process(context.Background(), item)
+	eng.process(context.Background(), got)
 
 	var reloaded store.FrontierItem
-	st.DB.First(&reloaded, item.ID)
+	st.DB.First(&reloaded, got.ID)
 	if reloaded.Status != store.FrontierStatusDone {
 		t.Errorf("expected status done, got %q", reloaded.Status)
 	}
 }
 
+// seedInFlight enqueues item into eng's frontier and dequeues it back,
+// returning the dequeued copy (now in_flight, stamped with eng's worker_id).
+// process()'s Complete/Fail/Requeue ownership guards require the frontier to
+// own the item's lease, which a bare st.DB.Create with Status=in_flight does
+// not establish (worker_id would be empty) — so tests exercising process()
+// must claim the item the same way Run's dispatcher does.
+func seedInFlight(t *testing.T, eng *Engine, item *store.FrontierItem) store.FrontierItem {
+	t.Helper()
+	if _, err := eng.frontier.Enqueue(item); err != nil {
+		t.Fatalf("seedInFlight enqueue: %v", err)
+	}
+	got, err := eng.frontier.Dequeue(1)
+	if err != nil {
+		t.Fatalf("seedInFlight dequeue: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("seedInFlight: expected 1 dequeued item, got %d", len(got))
+	}
+	return got[0]
+}
+
 func TestProcess_FailsPermanentlyOnUnknownKind(t *testing.T) {
 	eng, st := newTestEngine(t, testCrawlerConfig())
 
-	item := store.FrontierItem{Kind: "bogus", DedupKey: "y", Status: store.FrontierStatusInFlight}
-	if err := st.DB.Create(&item).Error; err != nil {
-		t.Fatalf("seed item: %v", err)
-	}
+	item := store.FrontierItem{Kind: "bogus", DedupKey: "y"}
+	got := seedInFlight(t, eng, &item)
 
-	eng.process(context.Background(), item)
+	eng.process(context.Background(), got)
 
 	var reloaded store.FrontierItem
-	st.DB.First(&reloaded, item.ID)
+	st.DB.First(&reloaded, got.ID)
 	if reloaded.Status != store.FrontierStatusFailed {
 		t.Errorf("expected status failed for a permanent, non-transient error, got %q", reloaded.Status)
 	}
@@ -601,68 +621,13 @@ func TestProcess_FailsPermanentlyOnUnknownKind(t *testing.T) {
 	}
 }
 
-// -- provenance map housekeeping ------------------------------------------
+// -- provenance persistence ------------------------------------------------
 
-// TestProcess_ReleasesProvenanceOnCompletion is the regression test for the
-// FOLLOWUPS.md housekeeping item: once a catalog_fetch/artifact_fetch item
-// finishes successfully (so it will never be dispatched again), its
-// in-memory provenance entry (parentCatalogByURL / catalogMethodByURL /
-// artifactEntryByURL) must be dropped rather than retained for the rest of
-// the crawl.
-func TestProcess_ReleasesProvenanceOnCompletion(t *testing.T) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/catalog.json", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/ai-catalog+json")
-		w.Write([]byte(`{"specVersion":"1.0","host":{"displayName":"C"},"entries":[]}`))
-	})
-	mux.HandleFunc("/artifact.json", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"ok":true}`))
-	})
-	srv := httptest.NewServer(mux)
-	defer srv.Close()
-
-	eng, st := newTestEngine(t, testCrawlerConfig())
-	host := strings.TrimPrefix(srv.URL, "http://")
-	catalogURL := srv.URL + "/catalog.json"
-	artifactURL := srv.URL + "/artifact.json"
-
-	eng.setParentCatalog(catalogURL, 99)
-	eng.setCatalogMethod(catalogURL, "well_known")
-	eng.setArtifactEntry(artifactURL, 42)
-
-	catalogItem := store.FrontierItem{
-		Kind: store.KindCatalogFetch, URL: catalogURL, Host: host,
-		DedupKey: dedupKey(store.KindCatalogFetch, catalogURL), Status: store.FrontierStatusInFlight,
-	}
-	if err := st.DB.Create(&catalogItem).Error; err != nil {
-		t.Fatalf("seed catalog_fetch item: %v", err)
-	}
-	artifactItem := store.FrontierItem{
-		Kind: store.KindArtifactFetch, URL: artifactURL, Host: host,
-		DedupKey: dedupKey(store.KindArtifactFetch, artifactURL), Status: store.FrontierStatusInFlight,
-	}
-	if err := st.DB.Create(&artifactItem).Error; err != nil {
-		t.Fatalf("seed artifact_fetch item: %v", err)
-	}
-
-	eng.process(context.Background(), catalogItem)
-	eng.process(context.Background(), artifactItem)
-
-	if _, ok := eng.parentCatalogByURL.get(catalogURL); ok {
-		t.Error("expected parentCatalogByURL entry to be released after the catalog_fetch item completed")
-	}
-	if _, ok := eng.catalogMethodByURL.get(catalogURL); ok {
-		t.Error("expected catalogMethodByURL entry to be released after the catalog_fetch item completed")
-	}
-	if _, ok := eng.artifactEntryByURL.get(artifactURL); ok {
-		t.Error("expected artifactEntryByURL entry to be released after the artifact_fetch item completed")
-	}
-}
-
-// TestProcess_RetainsProvenanceAcrossTransientRetry ensures a transient
-// failure (retries remaining) does NOT release the provenance entry: the
-// next retry of the same item still needs it.
-func TestProcess_RetainsProvenanceAcrossTransientRetry(t *testing.T) {
+// TestProcess_PersistsProvenanceAcrossRetry ensures a transient failure
+// (retries remaining) leaves the frontier row's provenance columns intact:
+// the next attempt at the same item — possibly dequeued by a different
+// worker process — still needs them to attribute its result.
+func TestProcess_PersistsProvenanceAcrossRetry(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/flaky.json", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -672,28 +637,218 @@ func TestProcess_RetainsProvenanceAcrossTransientRetry(t *testing.T) {
 
 	eng, st := newTestEngine(t, testCrawlerConfig())
 	artifactURL := srv.URL + "/flaky.json"
-	eng.setArtifactEntry(artifactURL, 7)
+	entryID := uint(7)
 
 	item := store.FrontierItem{
 		Kind: store.KindArtifactFetch, URL: artifactURL,
-		DedupKey: dedupKey(store.KindArtifactFetch, artifactURL), Status: store.FrontierStatusInFlight,
+		DedupKey:        dedupKey(store.KindArtifactFetch, artifactURL),
+		ArtifactEntryID: &entryID,
 	}
-	if err := st.DB.Create(&item).Error; err != nil {
-		t.Fatalf("seed item: %v", err)
-	}
+	got := seedInFlight(t, eng, &item)
 
 	// MaxAttempts is 2 in newTestEngine's Options, so the first failure
 	// still has a retry left.
-	eng.process(context.Background(), item)
+	eng.process(context.Background(), got)
 
 	var reloaded store.FrontierItem
-	st.DB.First(&reloaded, item.ID)
+	st.DB.First(&reloaded, got.ID)
 	if reloaded.Status != store.FrontierStatusPending {
 		t.Fatalf("expected item still pending (retry remaining), got %q", reloaded.Status)
 	}
+	if reloaded.ArtifactEntryID == nil || *reloaded.ArtifactEntryID != 7 {
+		t.Errorf("expected artifact_entry_id to survive a retryable failure, got %v", reloaded.ArtifactEntryID)
+	}
+}
 
-	if got := eng.artifactEntry(artifactURL); got != 7 {
-		t.Errorf("expected artifactEntryByURL to survive a retryable failure, got %d", got)
+// TestProcess_DiscardsResultOnLostLease verifies process() treats a lost
+// lease as a non-fatal outcome. When this worker's handler outlives its
+// lease and a peer reclaims and re-dequeues the item, Complete fails with
+// frontier.ErrLeaseLost; process must log-and-continue rather than error,
+// and must leave the peer's fresh in_flight claim untouched (no double
+// "done", no clobbered worker_id).
+func TestProcess_DiscardsResultOnLostLease(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ok.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := testCrawlerConfig()
+	st := newTestStore(t)
+	fc := fetch.New(cfg.Crawler)
+
+	frA := frontier.New(st.DB, frontier.WithWorkerID("worker-a"))
+	frB := frontier.New(st.DB, frontier.WithWorkerID("worker-b"))
+	engA := New(cfg, st, frA, fc, discardLogger(), Options{MaxAttempts: 2})
+
+	entryID := uint(1)
+	item := &store.FrontierItem{Kind: store.KindArtifactFetch, URL: srv.URL + "/ok.json", DedupKey: "lost", ArtifactEntryID: &entryID}
+	if _, err := frA.Enqueue(item); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	gotA, err := frA.Dequeue(1)
+	if err != nil || len(gotA) != 1 {
+		t.Fatalf("A Dequeue: err=%v got=%d", err, len(gotA))
+	}
+
+	// Peer B steals the lease: force-expire it, reclaim it, re-dequeue it.
+	past := time.Now().Add(-time.Hour)
+	if err := st.DB.Model(&store.FrontierItem{}).Where("id = ?", gotA[0].ID).
+		Update("leased_until", &past).Error; err != nil {
+		t.Fatalf("force expire: %v", err)
+	}
+	if n, err := frB.ReclaimExpired(); err != nil || n != 1 {
+		t.Fatalf("B ReclaimExpired: n=%d err=%v", n, err)
+	}
+	if _, err := frB.Dequeue(1); err != nil {
+		t.Fatalf("B Dequeue: %v", err)
+	}
+
+	// A processes its now-stale item. The handler succeeds, but Complete is a
+	// no-op because A no longer holds the lease.
+	engA.process(context.Background(), gotA[0])
+
+	var reloaded store.FrontierItem
+	if err := st.DB.First(&reloaded, gotA[0].ID).Error; err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if reloaded.Status != store.FrontierStatusInFlight {
+		t.Errorf("status = %q, want in_flight (peer B still owns it, A must not mark it done)", reloaded.Status)
+	}
+	if reloaded.WorkerID != "worker-b" {
+		t.Errorf("worker_id = %q, want worker-b (A must not clobber B's claim)", reloaded.WorkerID)
+	}
+}
+
+// TestProvenance_SurvivesFreshEngineInstance is the regression test for
+// cross-process provenance (see internal/crawler's package doc): a
+// catalog_fetch/artifact_fetch/registry_harvest item enqueued by one
+// worker's *Engine must still carry full provenance when dequeued and
+// processed by a completely different *Engine instance sharing the same
+// store/frontier — simulating a second worker process — rather than only
+// the instance that enqueued it.
+func TestProvenance_SurvivesFreshEngineInstance(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/nested-catalog.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/ai-catalog+json")
+		w.Write([]byte(`{"specVersion":"1.0","host":{"displayName":"Nested"},"entries":[]}`))
+	})
+	mux.HandleFunc("/artifact.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok":true}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := testCrawlerConfig()
+	st := newTestStore(t)
+	fr := frontier.New(st.DB)
+	fc := fetch.New(cfg.Crawler)
+	host := strings.TrimPrefix(srv.URL, "http://")
+
+	// "Worker A" enqueues the items with provenance set, as
+	// enqueueEntryFollowups/handleHostProbe would.
+	workerA := New(cfg, st, fr, fc, discardLogger(), Options{MaxAttempts: 2})
+
+	parentCatalogID := uint(99)
+	if _, err := workerA.enqueue(store.KindCatalogFetch, srv.URL+"/nested-catalog.json", host, 1, provenance{
+		ParentCatalogID: &parentCatalogID,
+		ProbeMethod:     store.ProbeMethodWellKnown,
+	}); err != nil {
+		t.Fatalf("enqueue catalog_fetch: %v", err)
+	}
+
+	artifactEntryID := uint(42)
+	if _, err := workerA.enqueue(store.KindArtifactFetch, srv.URL+"/artifact.json", host, 0, provenance{
+		ArtifactEntryID: &artifactEntryID,
+	}); err != nil {
+		t.Fatalf("enqueue artifact_fetch: %v", err)
+	}
+
+	// Seed a store.Catalog and a registries row for the registry_harvest
+	// item to attribute its harvested entries to.
+	cat := &store.Catalog{SourceURL: "https://registry.example/parent", VerificationStatus: "valid"}
+	if err := st.DB.Create(cat).Error; err != nil {
+		t.Fatalf("seed catalog: %v", err)
+	}
+	regRow := &store.Registry{EntryID: 1, BaseURL: "https://registry.invalid/api", HarvestStatus: store.HarvestStatusPending}
+	if err := st.DB.Create(regRow).Error; err != nil {
+		t.Fatalf("seed registry row: %v", err)
+	}
+	regEntryID := uint(1)
+	regCatalogID := cat.ID
+	if _, err := workerA.enqueue(store.KindRegistryHarvest, "https://registry.invalid/api", host, 0, provenance{
+		RegistryEntryID:   &regEntryID,
+		RegistryCatalogID: &regCatalogID,
+		RegistryRowID:     &regRow.ID,
+	}); err != nil {
+		t.Fatalf("enqueue registry_harvest: %v", err)
+	}
+
+	// "Worker B" is a brand new Engine over the same store/frontier — it
+	// shares no in-process state with workerA whatsoever, unlike the old
+	// in-memory maps.
+	workerB := New(cfg, st, fr, fc, discardLogger(), Options{MaxAttempts: 2})
+
+	items, err := fr.Dequeue(3)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("expected 3 dequeued items, got %d", len(items))
+	}
+
+	for _, item := range items {
+		switch item.Kind {
+		case store.KindCatalogFetch:
+			if item.ParentCatalogID == nil || *item.ParentCatalogID != parentCatalogID {
+				t.Errorf("catalog_fetch item missing ParentCatalogID, got %v", item.ParentCatalogID)
+			}
+			if item.ProbeMethod != store.ProbeMethodWellKnown {
+				t.Errorf("catalog_fetch item missing ProbeMethod, got %q", item.ProbeMethod)
+			}
+			if err := workerB.handleCatalogFetch(context.Background(), item); err != nil {
+				t.Fatalf("handleCatalogFetch: %v", err)
+			}
+			var nested store.Catalog
+			if err := st.DB.Where("source_url = ?", srv.URL+"/nested-catalog.json").First(&nested).Error; err != nil {
+				t.Fatalf("expected nested catalog persisted: %v", err)
+			}
+			if nested.ParentCatalogID == nil || *nested.ParentCatalogID != parentCatalogID {
+				t.Errorf("expected nested catalog's parent_catalog_id %d, got %v", parentCatalogID, nested.ParentCatalogID)
+			}
+
+		case store.KindArtifactFetch:
+			if item.ArtifactEntryID == nil || *item.ArtifactEntryID != artifactEntryID {
+				t.Errorf("artifact_fetch item missing ArtifactEntryID, got %v", item.ArtifactEntryID)
+			}
+			if err := workerB.handleArtifactFetch(context.Background(), item); err != nil {
+				t.Fatalf("handleArtifactFetch: %v", err)
+			}
+			var artifact store.Artifact
+			if err := st.DB.Where("entry_id = ?", artifactEntryID).First(&artifact).Error; err != nil {
+				t.Fatalf("expected artifact row attributed to entry %d: %v", artifactEntryID, err)
+			}
+
+		case store.KindRegistryHarvest:
+			if item.RegistryEntryID == nil || *item.RegistryEntryID != regEntryID {
+				t.Errorf("registry_harvest item missing RegistryEntryID, got %v", item.RegistryEntryID)
+			}
+			if item.RegistryCatalogID == nil || *item.RegistryCatalogID != regCatalogID {
+				t.Errorf("registry_harvest item missing RegistryCatalogID, got %v", item.RegistryCatalogID)
+			}
+			if item.RegistryRowID == nil || *item.RegistryRowID != regRow.ID {
+				t.Errorf("registry_harvest item missing RegistryRowID, got %v", item.RegistryRowID)
+			}
+			// registry.invalid does not resolve to a real server; the
+			// assertions above are what this test cares about (provenance
+			// surviving to a fresh engine instance), so the resulting fetch
+			// error is expected and ignored.
+			_ = workerB.handleRegistryHarvest(context.Background(), item)
+
+		default:
+			t.Fatalf("unexpected item kind %q", item.Kind)
+		}
 	}
 }
 
@@ -784,13 +939,14 @@ func TestRun_SlowItemDoesNotBlockWorkers(t *testing.T) {
 	for i := 0; i < fastCount; i++ {
 		urls = append(urls, fmt.Sprintf("%s/fast/%d.json", srv.URL, i))
 	}
+	entryID := uint(1)
 	for _, u := range urls {
-		eng.setArtifactEntry(u, 1)
 		if _, err := eng.frontier.Enqueue(&store.FrontierItem{
-			Kind:     store.KindArtifactFetch,
-			URL:      u,
-			Host:     host,
-			DedupKey: dedupKey(store.KindArtifactFetch, u),
+			Kind:            store.KindArtifactFetch,
+			URL:             u,
+			Host:            host,
+			DedupKey:        dedupKey(store.KindArtifactFetch, u),
+			ArtifactEntryID: &entryID,
 		}); err != nil {
 			t.Fatalf("Enqueue %s: %v", u, err)
 		}
@@ -899,6 +1055,94 @@ func TestRun_ForceCatalogCycleTerminates(t *testing.T) {
 	}
 }
 
+// -- distributed termination (Frontier.Counts) ----------------------------
+
+func TestIsSQLiteDriver(t *testing.T) {
+	cases := map[string]bool{
+		"":         true,
+		"sqlite":   true,
+		"sqlite3":  true,
+		"mysql":    false,
+		"postgres": false,
+	}
+	for driver, want := range cases {
+		if got := isSQLiteDriver(driver); got != want {
+			t.Errorf("isSQLiteDriver(%q) = %v, want %v", driver, got, want)
+		}
+	}
+}
+
+// TestRun_DoesNotTerminateWhileGloballyInFlight is the regression test for
+// distributed crawling's termination fix: this worker's own queue and
+// in-flight counter being empty must not be enough to exit when a peer
+// worker process (simulated here by dequeuing an item through the same
+// frontier without ever routing it through this Engine's Run loop) still
+// holds an in_flight item, since it could enqueue more work. cfg.Storage
+// .Driver is set to "postgres" purely to route Run through the
+// distributed (ReclaimExpired, not blanket ReclaimInFlight) branch; the
+// underlying store is still sqlite (see newTestStore).
+func TestRun_DoesNotTerminateWhileGloballyInFlight(t *testing.T) {
+	cfg := testCrawlerConfig()
+	cfg.Storage.Driver = "postgres"
+	eng, _ := newTestEngine(t, cfg)
+
+	if _, err := eng.frontier.Enqueue(&store.FrontierItem{
+		Kind: store.KindHostProbe, Host: "peer.example", DedupKey: "hp:peer",
+	}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := eng.frontier.Dequeue(1); err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if err := eng.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if ctx.Err() == nil {
+		t.Fatal("expected Run to keep polling (hitting the context deadline) while a peer's item is globally in_flight, not exit early")
+	}
+}
+
+// TestRun_TerminatesOnceGloballyInFlightItemCompletes complements the test
+// above: once the peer's item completes (frontier.Counts reports zero
+// pending and zero in_flight), Run must notice and return well before its
+// context deadline.
+func TestRun_TerminatesOnceGloballyInFlightItemCompletes(t *testing.T) {
+	cfg := testCrawlerConfig()
+	cfg.Storage.Driver = "postgres"
+	eng, _ := newTestEngine(t, cfg)
+
+	item := &store.FrontierItem{Kind: store.KindHostProbe, Host: "peer2.example", DedupKey: "hp:peer2"}
+	if _, err := eng.frontier.Enqueue(item); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, err := eng.frontier.Dequeue(1); err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		if err := eng.frontier.Complete(item.ID); err != nil {
+			t.Errorf("Complete: %v", err)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := eng.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("Run hit the context deadline instead of noticing the peer's item had completed")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("Run took %v to notice the peer's item completed; expected roughly one globalCountsCheckInterval (~1s)", elapsed)
+	}
+}
+
 // -- fixtures -------------------------------------------------------------
 
 const hostPlaceholder = "__HOST__"
@@ -932,4 +1176,280 @@ func rootCatalogJSON(base string) string {
 			}
 		]
 	}`
+}
+
+// -- maxPagesPerDomain (DB-backed page budget) -------------------------------
+
+func TestHandlePageFetch_RespectsMaxPagesPerDomainBudget(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		var links strings.Builder
+		for i := 0; i < 10; i++ {
+			fmt.Fprintf(&links, `<a href="/link%d">link</a>`, i)
+		}
+		w.Write([]byte("<html><body>" + links.String() + "</body></html>"))
+	})
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(404) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := testCrawlerConfig()
+	cfg.Crawler.MaxDepth = 5
+	cfg.Crawler.MaxPagesPerDomain = 3
+	eng, st := newTestEngine(t, cfg)
+	host := strings.TrimPrefix(srv.URL, "http://")
+
+	item := store.FrontierItem{URL: srv.URL + "/", Host: host, Depth: 0}
+	if err := eng.handlePageFetch(context.Background(), item); err != nil {
+		t.Fatalf("handlePageFetch: %v", err)
+	}
+
+	var count int64
+	if err := st.DB.Model(&store.FrontierItem{}).
+		Where("kind = ? AND host = ?", store.KindPageFetch, host).
+		Count(&count).Error; err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("expected exactly maxPagesPerDomain=3 page_fetch items enqueued for %s despite 10 candidate links, got %d", host, count)
+	}
+}
+
+func TestHandlePageFetch_MaxPagesPerDomainIsPerHost(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<a href="https://host-a.example/1">a1</a>
+			<a href="https://host-a.example/2">a2</a>
+			<a href="https://host-b.example/1">b1</a>
+			<a href="https://host-b.example/2">b2</a>`))
+	})
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(404) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := testCrawlerConfig()
+	cfg.Crawler.MaxDepth = 5
+	cfg.Crawler.MaxPagesPerDomain = 1
+	eng, st := newTestEngine(t, cfg)
+	host := strings.TrimPrefix(srv.URL, "http://")
+
+	item := store.FrontierItem{URL: srv.URL + "/", Host: host, Depth: 0}
+	if err := eng.handlePageFetch(context.Background(), item); err != nil {
+		t.Fatalf("handlePageFetch: %v", err)
+	}
+
+	for _, h := range []string{"host-a.example", "host-b.example"} {
+		var count int64
+		if err := st.DB.Model(&store.FrontierItem{}).
+			Where("kind = ? AND host = ?", store.KindPageFetch, h).
+			Count(&count).Error; err != nil {
+			t.Fatalf("count(%s): %v", h, err)
+		}
+		if count != 1 {
+			t.Errorf("expected exactly 1 page_fetch enqueued for %s (budget is per-host, not shared), got %d", h, count)
+		}
+	}
+}
+
+// TestEnqueuePageFetch_GatesNewButAllowsReactivationAtBudget verifies the
+// engine-level budget wiring at exactly the cap: a NEW url is refused, while
+// re-enqueueing an EXISTING done url succeeds (flipping it to pending)
+// without creating a new row. This is the regression guard for the finding
+// that the count-only gate froze a capped host's known pages out of every
+// later crawl.
+func TestEnqueuePageFetch_GatesNewButAllowsReactivationAtBudget(t *testing.T) {
+	cfg := testCrawlerConfig()
+	cfg.Crawler.MaxPagesPerDomain = 2
+	eng, st := newTestEngine(t, cfg)
+
+	const host = "fresh.example"
+	for i := 0; i < 2; i++ {
+		url := fmt.Sprintf("https://%s/%d", host, i)
+		added, err := eng.enqueuePageFetch(url, host, 1)
+		if err != nil {
+			t.Fatalf("enqueuePageFetch(fill %d): %v", i, err)
+		}
+		if !added {
+			t.Fatalf("expected fill enqueue %d to be added", i)
+		}
+	}
+
+	// Complete the first URL so re-enqueue exercises the re-activation path.
+	fr := frontier.New(st.DB)
+	items, err := fr.Dequeue(2)
+	if err != nil {
+		t.Fatalf("Dequeue: %v", err)
+	}
+	doneURL := items[0].URL
+	if err := fr.Complete(items[0].ID); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	// A brand-new URL at budget is refused.
+	added, err := eng.enqueuePageFetch(fmt.Sprintf("https://%s/brand-new", host), host, 1)
+	if err != nil {
+		t.Fatalf("enqueuePageFetch(new): %v", err)
+	}
+	if added {
+		t.Fatal("expected a NEW url at budget to be refused")
+	}
+
+	// The existing done URL re-activates for free.
+	added, err = eng.enqueuePageFetch(doneURL, host, 1)
+	if err != nil {
+		t.Fatalf("enqueuePageFetch(reactivate): %v", err)
+	}
+	if !added {
+		t.Fatal("expected re-enqueue of an existing done url at budget to succeed")
+	}
+
+	var count int64
+	if err := st.DB.Model(&store.FrontierItem{}).
+		Where("kind = ? AND host = ?", store.KindPageFetch, host).
+		Count(&count).Error; err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("re-activation must not create a row: want 2 page_fetch rows, got %d", count)
+	}
+}
+
+// TestHandlePageFetch_ReCrawlReactivatesCappedHostPages simulates the
+// refresh-crawl regression end to end: a host that already reached
+// maxPagesPerDomain (its budget rows all "done") must, on a later crawl of
+// the same seed page, re-activate those existing page rows rather than only
+// re-fetching the seed. Before the fix the budget blocked every re-enqueue,
+// so the done rows stayed done and the host silently stopped re-crawling its
+// known pages.
+func TestHandlePageFetch_ReCrawlReactivatesCappedHostPages(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		var links strings.Builder
+		for i := 0; i < 6; i++ {
+			fmt.Fprintf(&links, `<a href="/link%d">link</a>`, i)
+		}
+		w.Write([]byte("<html><body>" + links.String() + "</body></html>"))
+	})
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(404) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := testCrawlerConfig()
+	cfg.Crawler.MaxDepth = 5
+	cfg.Crawler.MaxPagesPerDomain = 3
+	eng, st := newTestEngine(t, cfg)
+	host := strings.TrimPrefix(srv.URL, "http://")
+
+	item := store.FrontierItem{URL: srv.URL + "/", Host: host, Depth: 0}
+
+	// First crawl: fan-out fills the host to its budget of 3 page rows.
+	if err := eng.handlePageFetch(context.Background(), item); err != nil {
+		t.Fatalf("handlePageFetch (first): %v", err)
+	}
+
+	fr := frontier.New(st.DB)
+	drainToDone := func() []store.FrontierItem {
+		items, err := fr.Dequeue(100)
+		if err != nil {
+			t.Fatalf("Dequeue: %v", err)
+		}
+		for _, it := range items {
+			if err := fr.Complete(it.ID); err != nil {
+				t.Fatalf("Complete: %v", err)
+			}
+		}
+		return items
+	}
+	firstBatch := drainToDone()
+	var firstPageIDs []uint
+	for _, it := range firstBatch {
+		if it.Kind == store.KindPageFetch && it.Host == host {
+			firstPageIDs = append(firstPageIDs, it.ID)
+		}
+	}
+	if len(firstPageIDs) != 3 {
+		t.Fatalf("precondition: want 3 page_fetch rows at budget, got %d", len(firstPageIDs))
+	}
+
+	// Second crawl of the same seed: the fan-out sees the same 6 links. The 3
+	// already-known ones must re-activate (done -> pending); the other 3 are
+	// refused because the host is at budget. Net: still 3 rows, now pending.
+	if err := eng.handlePageFetch(context.Background(), item); err != nil {
+		t.Fatalf("handlePageFetch (re-crawl): %v", err)
+	}
+
+	var total, pending int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ? AND host = ?", store.KindPageFetch, host).Count(&total)
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ? AND host = ? AND status = ?", store.KindPageFetch, host, store.FrontierStatusPending).Count(&pending)
+	if total != 3 {
+		t.Fatalf("re-crawl must not create new page rows past budget: want 3, got %d", total)
+	}
+	if pending != 3 {
+		t.Fatalf("re-crawl must re-activate the capped host's done pages: want 3 pending, got %d", pending)
+	}
+}
+
+func TestEnqueueFollowups_UnsuffixedRegistryPointerIsFollowed(t *testing.T) {
+	mux := http.NewServeMux()
+	catalog := `{"specVersion":"1.0","host":{"displayName":"H"},"entries":[
+		{"identifier":"urn:air:example.com:registry:r","displayName":"R","type":"application/ai-registry","url":"https://registry.example/api"}
+	]}`
+	mux.HandleFunc("/reg.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/ai-catalog+json")
+		w.Write([]byte(catalog))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	host := strings.TrimPrefix(srv.URL, "http://")
+	item := store.FrontierItem{URL: srv.URL + "/reg.json", Host: host, Depth: 0}
+	if err := eng.handleCatalogFetch(context.Background(), item); err != nil {
+		t.Fatalf("handleCatalogFetch: %v", err)
+	}
+
+	var harvests int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ?", store.KindRegistryHarvest).Count(&harvests)
+	if harvests != 1 {
+		t.Fatalf("expected 1 registry_harvest for unsuffixed application/ai-registry, got %d", harvests)
+	}
+	var regRows int64
+	st.DB.Model(&store.Registry{}).Count(&regRows)
+	if regRows != 1 {
+		t.Fatalf("expected 1 registries row, got %d", regRows)
+	}
+}
+
+func TestEnqueueFollowups_UnsuffixedCatalogPointerIsFollowed(t *testing.T) {
+	mux := http.NewServeMux()
+	var catalog string
+	mux.HandleFunc("/root.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/ai-catalog+json")
+		w.Write([]byte(catalog))
+	})
+	mux.HandleFunc("/nested.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/ai-catalog+json")
+		w.Write([]byte(`{"specVersion":"1.0","host":{"displayName":"N"},"entries":[]}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	catalog = `{"specVersion":"1.0","host":{"displayName":"H"},"entries":[
+		{"identifier":"urn:air:example.com:catalog:c","displayName":"C","type":"application/ai-catalog","url":"` + srv.URL + `/nested.json"}
+	]}`
+
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	host := strings.TrimPrefix(srv.URL, "http://")
+	item := store.FrontierItem{URL: srv.URL + "/root.json", Host: host, Depth: 0}
+	if err := eng.handleCatalogFetch(context.Background(), item); err != nil {
+		t.Fatalf("handleCatalogFetch: %v", err)
+	}
+
+	var fetches int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ? AND url = ?", store.KindCatalogFetch, srv.URL+"/nested.json").Count(&fetches)
+	if fetches != 1 {
+		t.Fatalf("expected 1 catalog_fetch for unsuffixed application/ai-catalog, got %d", fetches)
+	}
 }

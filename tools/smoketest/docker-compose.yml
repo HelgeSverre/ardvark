@@ -1,0 +1,115 @@
+# Distributed-crawling smoke test topology: one MySQL, one multi-host TLS
+# fixture, and an ardvark image invoked once per worker via `docker compose run`
+# (each `run` overrides the command with a distinct --worker i/10). The workers
+# are not long-lived services because each needs its own worker index and its
+# own lifecycle (start after seeding, get SIGKILL'd, restart) — the harness
+# (run.sh) drives that from the host. Only mysql and fixture are up'd as
+# services; `ardvark` is a template service used purely as a `run` target.
+#
+# Build context is the repo root (..) so images build from the worktree source.
+
+name: ardvark-smoketest
+
+services:
+  mysql:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: ardvark
+      MYSQL_USER: ardvark
+      MYSQL_PASSWORD: ardvark
+    ports:
+      - "13399:3306"   # exposed to host so the assert tool can connect
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    networks:
+      default: {}
+
+  # Alternative frontier backend, selected by run.sh's DB=postgres switch. Only
+  # one of mysql/postgres is ever brought up per run (the harness `up`s the
+  # chosen service and runs the ardvark containers with --no-deps). Exposed on a
+  # deliberately uncommon host port so it never collides with a pre-existing
+  # local postgres (e.g. an ardvark-postgres container this harness did not
+  # create, which may own 5432).
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ardvark
+      POSTGRES_USER: ardvark
+      POSTGRES_PASSWORD: ardvark
+    ports:
+      - "15499:5432"   # exposed to host so the assert tool can connect
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "ardvark", "-d", "ardvark"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    networks:
+      default: {}
+
+  fixture:
+    build:
+      context: ../..
+      dockerfile: tools/smoketest/Dockerfile.fixture
+    environment:
+      # Artificial per-response latency, so the crawl runs long enough that the
+      # kill-and-reclaim scenario can reliably catch a worker mid-flight (the
+      # harness polls for an in-flight item and kills immediately, but the
+      # latency widens the window so the item is still in-flight at kill time).
+      FIXTURE_DELAY_MS: "1000"
+    volumes:
+      - ./certs:/certs:ro
+    healthcheck:
+      # The fixture serves a plaintext-over-TLS health endpoint; -k because the
+      # health probe runs inside the container and need not validate the chain.
+      test: ["CMD", "curl", "-kfsS", "https://localhost/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    networks:
+      default:
+        aliases:
+          - site1.test
+          - site2.test
+          - site3.test
+          - site4.test
+          - site5.test
+          - site6.test
+          - site7.test
+          - site8.test
+          - site9.test
+          - site10.test
+          - site11.test
+          - site12.test
+          - site13.test
+          - site14.test
+          - site15.test
+          - site16.test
+          - site17.test
+          - site18.test
+          - site19.test
+          - site20.test
+
+  # Template service used only via `docker compose run ardvark <cmd>`. The
+  # default command is a no-op help; the harness always overrides it.
+  ardvark:
+    build:
+      context: ../..
+      dockerfile: tools/smoketest/Dockerfile.ardvark
+    depends_on:
+      mysql:
+        condition: service_healthy
+      fixture:
+        condition: service_healthy
+    volumes:
+      - ./config:/config:ro
+      - ./seeds:/seeds:ro
+      - ./logs:/logs
+    networks:
+      default: {}
+
+networks:
+  default: {}

@@ -150,9 +150,90 @@ type FrontierItem struct {
 	LastError string `gorm:"type:text"`
 	DedupKey  string `gorm:"uniqueIndex;size:512"`
 
+	// HostShard is fnv32a(fetchHost) % HostShardCount, computed once at
+	// enqueue time (see internal/frontier.Enqueue), where fetchHost is the
+	// hostname of URL when URL is non-empty and parses, or Host otherwise.
+	// It must be derived from the host that will actually be dialed, not
+	// from Host: entry follow-ups (catalog_fetch/artifact_fetch/
+	// registry_harvest built from an entry or ref URL) set Host to the
+	// *parent* catalog's host for attribution purposes even when URL points
+	// at a completely different host (e.g. an artifact hosted on a CDN
+	// domain), so using Host for sharding would route the HTTP request to a
+	// worker that does not own that foreign host. HostShard partitions the
+	// frontier by fetch-target host for distributed crawling: N worker
+	// processes each configured with a distinct crawler.worker.index
+	// (0..count-1) can restrict Dequeue to "host_shard % count = index", so
+	// every host is owned by exactly one worker for the crawl's lifetime.
+	// This is what makes per-process politeness (internal/fetch's in-memory
+	// rate limiter) correct without any cross-process coordination — see
+	// internal/fetch's package doc.
+	HostShard int `gorm:"index"`
+
+	// -- Provenance columns -------------------------------------------------
+	//
+	// These carry the context a handler needs to attribute its result (which
+	// catalog a nested catalog_fetch belongs to, which entry an
+	// artifact_fetch/registry_harvest was declared by, ...). They are set by
+	// the enqueuing side immediately before the item is written to the
+	// frontier and read by the dequeuing side's handler, so this data
+	// survives both process restarts and, critically, a different worker
+	// process dequeuing the item than the one that enqueued it (see
+	// internal/crawler's package doc).
+
+	// ParentCatalogID is the catalogs.id of the catalog that referenced this
+	// catalog_fetch item's URL as a nested catalog entry. Nil for
+	// top-level catalogs (discovered via host_probe or a link_tag hint).
+	ParentCatalogID *uint `gorm:"index"`
+	// ArtifactEntryID is the catalog_entries.id that declared this
+	// artifact_fetch item's URL.
+	ArtifactEntryID *uint `gorm:"index"`
+	// RegistryEntryID is the catalog_entries.id that declared this
+	// registry_harvest item's registry (the entry whose media type is
+	// application/ai-registry+json).
+	RegistryEntryID *uint `gorm:"index"`
+	// RegistryCatalogID is the catalogs.id that harvested registry entries
+	// should be attributed to.
+	RegistryCatalogID *uint `gorm:"index"`
+	// RegistryRowID is the registries.id row for this registry_harvest
+	// item's registry (or referral), whose harvest_status/last_harvested_at
+	// the handler updates.
+	RegistryRowID *uint `gorm:"index"`
+	// ProbeMethod is which probe method (well_known, robots_agentmap,
+	// link_tag) discovered this catalog_fetch item's URL, reported on the
+	// verified-catalog ProbeEvent.
+	ProbeMethod string `gorm:"size:32"`
+
+	// LeasedUntil is set when a worker dequeues an item (status moves to
+	// in_flight): it is now plus the frontier's configured lease duration.
+	// A distributed reclaimer (frontier.ReclaimExpired) resets any in_flight
+	// row whose lease has passed back to pending, so a worker process that
+	// dies mid-item does not strand that item forever — this is what makes
+	// multiple worker processes sharing one mysql/postgres database safe.
+	// Expiry is judged by comparing this timestamp (written by the leasing
+	// worker's clock) against the reclaimer's own clock, which may be a
+	// different worker process entirely — so distributed deployments must
+	// keep worker clocks reasonably synchronized (e.g. NTP). Clock skew
+	// approaching the configured lease duration can cause premature
+	// reclaim: a worker still legitimately processing an item may have its
+	// lease stolen out from under it by a reclaimer whose clock runs ahead.
+	// Cleared (nil) whenever an item leaves in_flight (Complete/Fail/Requeue).
+	LeasedUntil *time.Time `gorm:"index"`
+	// WorkerID identifies which worker process currently holds the lease
+	// (informational — reclaiming is decided purely by LeasedUntil, not by
+	// which worker is recorded here). Cleared alongside LeasedUntil.
+	WorkerID string `gorm:"size:64"`
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
+
+// HostShardCount is the modulus FrontierItem.HostShard is computed against.
+// 8192 is large enough that even a huge worker count (far beyond any
+// realistic deployment) still gets a reasonably even distribution, while
+// staying a cheap, fixed, portable modulus across sqlite/mysql/postgres (the
+// '%' operator works identically on all three; MOD() does not exist on
+// sqlite).
+const HostShardCount = 8192
 
 // Domain is a discovered host and its ARD probing state.
 type Domain struct {

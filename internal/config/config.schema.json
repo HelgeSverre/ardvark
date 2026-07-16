@@ -46,7 +46,16 @@
         "maxBodyBytes": { "type": "integer", "minimum": 1 },
         "userAgent": { "type": "string", "minLength": 1 },
         "respectRobotsTxt": { "type": "boolean" },
-        "refreshAfterHours": { "type": "integer", "minimum": 0 }
+        "refreshAfterHours": { "type": "integer", "minimum": 0 },
+        "leaseSeconds": { "type": "integer", "minimum": 0 },
+        "worker": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "index": { "type": "integer", "minimum": 0 },
+            "count": { "type": "integer", "minimum": 1 }
+          }
+        }
       }
     },
     "ard": {

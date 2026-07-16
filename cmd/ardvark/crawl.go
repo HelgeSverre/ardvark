@@ -28,7 +28,12 @@ var crawlCmd = &cobra.Command{
 	Short: "Seed the frontier and drain it with the crawl engine",
 	Long: "crawl seeds the persistent frontier from the given URLs and/or bare domains " +
 		"(and/or a --list file), then runs the crawler until the frontier is empty. " +
-		"Pending work from prior runs is resumed automatically.",
+		"Pending work from prior runs is resumed automatically. When a worker fleet is " +
+		"configured (crawler.worker.count > 1), this process only dequeues its own " +
+		"shard (crawler.worker.index) but still waits for the whole frontier to drain " +
+		"before exiting, so a lone crawl run will seed every shard yet sit idle waiting " +
+		"for peers on the shards it does not own — run \"ardvark work\" for the other " +
+		"worker indices to drain them.",
 	RunE: runCrawl,
 }
 
@@ -63,22 +68,12 @@ func runCrawl(cmd *cobra.Command, args []string) error {
 		}
 	} else {
 		p := printer(cmd)
-		// The engine's worker pool fires OnProbe from multiple goroutines,
-		// and ui.Printer is not goroutine-safe, so serialize the row writes.
-		var rowMu sync.Mutex
-		cb = jsonout.CrawlCallbacks{
-			OnProbe: func(ev crawler.ProbeEvent) {
-				rowMu.Lock()
-				defer rowMu.Unlock()
-				status, result, extra := probeRow(ev)
-				p.Row(status, ev.Host, ev.Method, result, extra)
-			},
-			SeedError: func(seed string, err error) {
-				p.Errorf("crawl: failed to seed %q: %v", seed, err)
-			},
-			Seeded: func(seeded, requested int) {
-				p.Mutedf("seeded %d of %d requested seed(s)", seeded, requested)
-			},
+		cb = crawlCallbacks(p)
+		cb.SeedError = func(seed string, err error) {
+			p.Errorf("crawl: failed to seed %q: %v", seed, err)
+		}
+		cb.Seeded = func(seeded, requested int) {
+			p.Mutedf("seeded %d of %d requested seed(s)", seeded, requested)
 		}
 	}
 
@@ -94,14 +89,40 @@ func runCrawl(cmd *cobra.Command, args []string) error {
 		return printJSON(cmd, res)
 	}
 
-	printer(cmd).Summary("run complete",
+	printCrawlSummary(printer(cmd), res)
+	return nil
+}
+
+// crawlCallbacks builds the jsonout.CrawlCallbacks shared by "crawl" and
+// "work" for non-JSON output: both commands drive the same engine and print
+// live per-host rows the same way, so the OnProbe wiring (including the
+// mutex that serializes writes against ui.Printer, which is not
+// goroutine-safe, against the engine's concurrent worker pool) lives here
+// once rather than being copy-pasted per command. Callers that need
+// additional callbacks (crawl's SeedError/Seeded) set them on the returned
+// value.
+func crawlCallbacks(p *ui.Printer) jsonout.CrawlCallbacks {
+	var rowMu sync.Mutex
+	return jsonout.CrawlCallbacks{
+		OnProbe: func(ev crawler.ProbeEvent) {
+			rowMu.Lock()
+			defer rowMu.Unlock()
+			status, result, extra := probeRow(ev)
+			p.Row(status, ev.Host, ev.Method, result, extra)
+		},
+	}
+}
+
+// printCrawlSummary prints the final run-complete summary line shared by
+// "crawl" and "work" in non-JSON mode.
+func printCrawlSummary(p *ui.Printer, res jsonout.CrawlResult) {
+	p.Summary("run complete",
 		ui.Count(res.PagesFetched, "page fetched", "pages fetched"),
 		ui.Count(res.HostsProbed, "host probed", "hosts probed"),
 		ui.Count(res.CatalogsFound, "catalog found", "catalogs found"),
 		fmt.Sprintf("%d valid", res.CatalogsValid),
 		ui.Count(res.Errors, "error", "errors"),
 	)
-	return nil
 }
 
 // probeRow maps a live crawler.ProbeEvent onto the status, result, and

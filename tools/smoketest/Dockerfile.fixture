@@ -1,0 +1,18 @@
+# Build stage for the synthetic fixture web server (tools/smoketest/fixture).
+# Build context is the repo root so the fixture (part of the module) builds
+# against the same go.mod. The server itself only uses the standard library;
+# the TLS material (server.crt/server.key) is mounted at runtime, not baked in.
+FROM golang:1.26-bookworm AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/fixture ./tools/smoketest/fixture
+
+FROM debian:bookworm-slim
+# curl is used only by the compose healthcheck (-k, chain not validated).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/fixture /usr/local/bin/fixture
+ENTRYPOINT ["/usr/local/bin/fixture"]

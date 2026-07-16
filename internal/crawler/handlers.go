@@ -14,6 +14,7 @@ import (
 	"github.com/helgesverre/ardvark/internal/ard"
 	"github.com/helgesverre/ardvark/internal/fetch"
 	"github.com/helgesverre/ardvark/internal/harvest"
+	"github.com/helgesverre/ardvark/internal/mediatype"
 	"github.com/helgesverre/ardvark/internal/probe"
 	"github.com/helgesverre/ardvark/internal/registry"
 	"github.com/helgesverre/ardvark/internal/store"
@@ -62,7 +63,7 @@ func (e *Engine) handlePageFetch(ctx context.Context, item store.FrontierItem) e
 			e.logger.Warn("crawler: failed to upsert domain from anchor", "host", host, "error", err)
 			continue
 		}
-		e.enqueue(store.KindHostProbe, "", host, 0)
+		e.enqueue(store.KindHostProbe, "", host, 0, provenance{})
 	}
 
 	for _, hintURL := range result.AICatalogHints {
@@ -84,31 +85,23 @@ func (e *Engine) handlePageFetch(ctx context.Context, item store.FrontierItem) e
 		}); err != nil {
 			e.logger.Warn("crawler: failed to record link_tag probe", "url", hintURL, "error", err)
 		}
-		e.setCatalogMethod(hintURL, store.ProbeMethodLinkTag)
-		e.enqueue(store.KindCatalogFetch, hintURL, hintHost, 0)
+		e.enqueue(store.KindCatalogFetch, hintURL, hintHost, 0, provenance{ProbeMethod: store.ProbeMethodLinkTag})
 	}
 
 	if item.Depth < e.maxDepth() {
-		budget := e.maxPagesPerDomain()
 		for _, link := range result.Links {
 			linkHost, err := hostOf(link)
 			if err != nil {
 				continue
 			}
-			if !e.reservePage(linkHost, budget) {
+			// enqueuePageFetch applies the maxPagesPerDomain budget per call,
+			// so it both refuses NEW URLs once linkHost is capped and lets an
+			// already-known URL be re-activated for free (see its doc comment).
+			// Checked here inside the fan-out loop, the budget reflects every
+			// page_fetch row the earlier iterations added, so one page cannot
+			// overshoot.
+			if _, err := e.enqueuePageFetch(link, linkHost, item.Depth+1); err != nil {
 				continue
-			}
-			added, err := e.enqueue(store.KindPageFetch, link, linkHost, item.Depth+1)
-			if err != nil {
-				e.releasePage(linkHost)
-				continue
-			}
-			if !added {
-				// Dedup no-op: the link was already queued, so no new page
-				// was enqueued — free the budget unit we reserved, or
-				// repeated nav links would exhaust the per-domain budget
-				// without fetching that many distinct pages.
-				e.releasePage(linkHost)
 			}
 		}
 	}
@@ -162,8 +155,7 @@ func (e *Engine) handleHostProbe(ctx context.Context, item store.FrontierItem) e
 		}
 		hadHit = true
 		for _, catalogURL := range r.CatalogURLs {
-			e.setCatalogMethod(catalogURL, r.Method)
-			e.enqueue(store.KindCatalogFetch, catalogURL, item.Host, 0)
+			e.enqueue(store.KindCatalogFetch, catalogURL, item.Host, 0, provenance{ProbeMethod: r.Method})
 		}
 	}
 
@@ -194,7 +186,7 @@ func (e *Engine) handleCatalogFetch(ctx context.Context, item store.FrontierItem
 
 	transportChecks := ard.TransportChecks(fetched.ContentType, fetched.Body, e.cfg.Crawler.MaxBodyBytes)
 
-	return e.processCatalog(ctx, fetched.Body, fetched.SHA256, item.Host, item.URL, e.parentCatalogFor(item.URL), item.Depth, transportChecks)
+	return e.processCatalog(ctx, fetched.Body, fetched.SHA256, item.Host, item.URL, item.ParentCatalogID, item.ProbeMethod, item.Depth, transportChecks)
 }
 
 // processCatalog verifies raw catalog bytes, persists the catalog, its
@@ -205,8 +197,10 @@ func (e *Engine) handleCatalogFetch(ctx context.Context, item store.FrontierItem
 // everything else. transportChecks (step 1 of the verification pipeline)
 // are supplied by the caller since they depend on HTTP transport metadata;
 // pass nil for data-embedded nested catalogs, which were never
-// independently fetched over HTTP.
-func (e *Engine) processCatalog(ctx context.Context, raw []byte, contentHash, host, sourceURL string, parentCatalogID *uint, depth int, transportChecks []ard.Check) error {
+// independently fetched over HTTP. probeMethod is which probe method
+// discovered sourceURL (empty for data-embedded nested catalogs, which were
+// never independently discovered), reported on ProbeEvents.
+func (e *Engine) processCatalog(ctx context.Context, raw []byte, contentHash, host, sourceURL string, parentCatalogID *uint, probeMethod string, depth int, transportChecks []ard.Check) error {
 	report := ard.Verify(raw, host).MergeChecks(transportChecks)
 
 	var parsed ard.Catalog
@@ -222,7 +216,7 @@ func (e *Engine) processCatalog(ctx context.Context, raw []byte, contentHash, ho
 			e.logger.Debug("crawler: catalog unchanged since last fetch, skipping re-save", "url", sourceURL, "host", host)
 			e.emit(ProbeEvent{
 				Host:    host,
-				Method:  e.catalogMethodFor(sourceURL),
+				Method:  probeMethod,
 				Outcome: probe.OutcomeHit,
 				Verdict: prior.VerificationStatus,
 				Detail:  "unchanged",
@@ -260,7 +254,7 @@ func (e *Engine) processCatalog(ctx context.Context, raw []byte, contentHash, ho
 	}
 
 	e.logger.Info("crawler: catalog verified", "url", sourceURL, "host", host, "verdict", report.Verdict, "entries", len(parsed.Entries))
-	e.emit(catalogEvent(host, e.catalogMethodFor(sourceURL), report, len(parsed.Entries)))
+	e.emit(catalogEvent(host, probeMethod, report, len(parsed.Entries)))
 
 	if depth >= e.maxCatalogDepth() {
 		return nil
@@ -279,21 +273,22 @@ func (e *Engine) processCatalog(ctx context.Context, raw []byte, contentHash, ho
 func (e *Engine) enqueueEntryFollowups(ctx context.Context, cat *store.Catalog, entries []ard.Entry, host, sourceURL string, depth int) {
 	for i, en := range entries {
 		entryID := cat.Entries[i].ID
+		kind := mediatype.Parse(en.Type).Kind()
 
 		switch {
-		case en.Type == mediaTypeAICatalog && en.URL != "":
-			e.setParentCatalog(en.URL, cat.ID)
-			e.enqueue(store.KindCatalogFetch, en.URL, host, depth+1)
+		case kind == mediatype.KindCatalog && en.URL != "":
+			catID := cat.ID
+			e.enqueue(store.KindCatalogFetch, en.URL, host, depth+1, provenance{ParentCatalogID: &catID})
 
-		case en.Type == mediaTypeAICatalog && hasEmbeddedData(en.Data):
+		case kind == mediatype.KindCatalog && hasEmbeddedData(en.Data):
 			sum := sha256.Sum256(en.Data)
 			nestedSource := sourceURL + "#" + en.Identifier
 			catID := cat.ID
-			if err := e.processCatalog(ctx, en.Data, hex.EncodeToString(sum[:]), host, nestedSource, &catID, depth+1, nil); err != nil {
+			if err := e.processCatalog(ctx, en.Data, hex.EncodeToString(sum[:]), host, nestedSource, &catID, "", depth+1, nil); err != nil {
 				e.logger.Warn("crawler: failed to process embedded nested catalog", "identifier", en.Identifier, "error", err)
 			}
 
-		case en.Type == mediaTypeAIRegistry && en.URL != "" && e.cfg.Registry.Harvest:
+		case kind == mediatype.KindRegistry && en.URL != "" && e.cfg.Registry.Harvest:
 			regRow := &store.Registry{
 				EntryID:       entryID,
 				BaseURL:       en.URL,
@@ -303,12 +298,15 @@ func (e *Engine) enqueueEntryFollowups(ctx context.Context, cat *store.Catalog, 
 				e.logger.Warn("crawler: failed to save registry row", "url", en.URL, "error", err)
 				continue
 			}
-			e.setRegistryContext(en.URL, entryID, cat.ID, regRow.ID)
-			e.enqueue(store.KindRegistryHarvest, en.URL, host, 0)
+			catID := cat.ID
+			e.enqueue(store.KindRegistryHarvest, en.URL, host, 0, provenance{
+				RegistryEntryID:   &entryID,
+				RegistryCatalogID: &catID,
+				RegistryRowID:     &regRow.ID,
+			})
 
 		case en.URL != "" && e.cfg.ARD.FetchArtifacts:
-			e.setArtifactEntry(en.URL, entryID)
-			e.enqueue(store.KindArtifactFetch, en.URL, host, 0)
+			e.enqueue(store.KindArtifactFetch, en.URL, host, 0, provenance{ArtifactEntryID: &entryID})
 		}
 	}
 }
@@ -428,7 +426,7 @@ func splitChecks(checks []ard.Check, entries []ard.Entry) ([]*store.Verification
 // than propagated, since it is a terminal, expected outcome, not a crawl
 // bug.
 func (e *Engine) handleArtifactFetch(ctx context.Context, item store.FrontierItem) error {
-	entryID := e.artifactEntry(item.URL)
+	entryID := uintOrZero(item.ArtifactEntryID)
 
 	fetched, skip, err := e.get(ctx, item.URL)
 	if skip {
@@ -475,7 +473,7 @@ func (e *Engine) handleRegistryHarvest(ctx context.Context, item store.FrontierI
 		return nil
 	}
 
-	regCtx, known := e.registryContextFor(item.URL)
+	known := item.RegistryRowID != nil
 
 	client := registry.New(item.URL, e.registryHTTPClient())
 	result, err := client.HarvestAll(ctx, registry.HarvestOptions{
@@ -484,7 +482,7 @@ func (e *Engine) handleRegistryHarvest(ctx context.Context, item store.FrontierI
 	if err != nil {
 		if registry.IsNotImplemented(err) {
 			if known {
-				e.updateRegistryStatus(regCtx.regRowID, store.HarvestStatusError)
+				e.updateRegistryStatus(*item.RegistryRowID, store.HarvestStatusError)
 			}
 			e.logger.Info("crawler: registry does not implement search", "url", item.URL)
 			return nil
@@ -493,21 +491,25 @@ func (e *Engine) handleRegistryHarvest(ctx context.Context, item store.FrontierI
 	}
 
 	if !known {
-		// Provenance lost (e.g. resumed after a restart): we cannot
-		// attribute harvested entries to a catalog/registry row we don't
-		// know, so log and stop here rather than guessing.
+		// Provenance lost (e.g. resumed after a restart with a stale row
+		// predating the provenance columns): we cannot attribute harvested
+		// entries to a catalog/registry row we don't know, so log and stop
+		// here rather than guessing.
 		e.logger.Warn("crawler: registry_harvest has no known provenance, skipping persistence", "url", item.URL)
 		return nil
 	}
 
-	e.updateRegistryStatus(regCtx.regRowID, store.HarvestStatusOK)
+	regRowID := *item.RegistryRowID
+	entryID := uintOrZero(item.RegistryEntryID)
+	catalogID := uintOrZero(item.RegistryCatalogID)
+
+	e.updateRegistryStatus(regRowID, store.HarvestStatusOK)
 
 	if len(result.Results) > 0 {
 		rows := make([]store.CatalogEntry, len(result.Results))
-		regRowID := regCtx.regRowID
 		for i, res := range result.Results {
 			row := buildEntryRow(res.Entry, store.EntrySourceRegistry, &regRowID)
-			row.CatalogID = regCtx.catalogID
+			row.CatalogID = catalogID
 			rows[i] = row
 		}
 		if err := e.store.SaveEntries(rows); err != nil {
@@ -524,17 +526,20 @@ func (e *Engine) handleRegistryHarvest(ctx context.Context, item store.FrontierI
 			continue
 		}
 		refRow := &store.Registry{
-			EntryID:          regCtx.entryID,
+			EntryID:          entryID,
 			BaseURL:          ref.URL,
 			HarvestStatus:    store.HarvestStatusPending,
-			ReferralSourceID: uintPtr(regCtx.regRowID),
+			ReferralSourceID: uintPtr(regRowID),
 		}
 		if err := e.store.SaveRegistry(refRow); err != nil {
 			e.logger.Warn("crawler: failed to save referral registry row", "url", ref.URL, "error", err)
 			continue
 		}
-		e.setRegistryContext(ref.URL, regCtx.entryID, regCtx.catalogID, refRow.ID)
-		e.enqueue(store.KindRegistryHarvest, ref.URL, item.Host, nextDepth)
+		e.enqueue(store.KindRegistryHarvest, ref.URL, item.Host, nextDepth, provenance{
+			RegistryEntryID:   &entryID,
+			RegistryCatalogID: &catalogID,
+			RegistryRowID:     &refRow.ID,
+		})
 	}
 
 	return nil
@@ -550,3 +555,13 @@ func (e *Engine) updateRegistryStatus(regRowID uint, status string) {
 }
 
 func uintPtr(v uint) *uint { return &v }
+
+// uintOrZero dereferences p, returning 0 for a nil pointer (the "provenance
+// unknown" case, e.g. an item enqueued before this frontier_items column
+// existed).
+func uintOrZero(p *uint) uint {
+	if p == nil {
+		return 0
+	}
+	return *p
+}

@@ -38,7 +38,10 @@ func RunSeeder(ctx context.Context, cfg config.Config, st *store.Store, s seed.S
 		return SeedResult{}, fmt.Errorf("seed %s: %w", s.Source(), err)
 	}
 
-	fr := frontier.New(st.DB)
+	fr := frontier.New(st.DB,
+		frontier.WithLeaseSeconds(cfg.Crawler.LeaseSeconds),
+		frontier.WithWorkerShard(cfg.Crawler.Worker.Index, cfg.Crawler.Worker.Count),
+	)
 	fc := fetch.New(cfg.Crawler)
 	eng := crawler.New(cfg, st, fr, fc, logger, crawler.Options{})
 

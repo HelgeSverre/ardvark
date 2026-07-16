@@ -1,0 +1,24 @@
+# Smoke-test seeds. site1.test is seeded as a URL so it enters the frontier as
+# a page_fetch (exercising the maxPagesPerDomain page budget) in addition to a
+# host_probe of its origin. site2.test..site20.test are bare-domain seeds
+# (host_probe only). 20 distinct hosts total.
+https://site1.test/
+site2.test
+site3.test
+site4.test
+site5.test
+site6.test
+site7.test
+site8.test
+site9.test
+site10.test
+site11.test
+site12.test
+site13.test
+site14.test
+site15.test
+site16.test
+site17.test
+site18.test
+site19.test
+site20.test
