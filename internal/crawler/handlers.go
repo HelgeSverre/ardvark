@@ -273,42 +273,53 @@ func (e *Engine) processCatalog(ctx context.Context, raw []byte, contentHash, ho
 func (e *Engine) enqueueEntryFollowups(ctx context.Context, cat *store.Catalog, entries []ard.Entry, host, sourceURL string, depth int) {
 	for i, en := range entries {
 		entryID := cat.Entries[i].ID
+		catID := cat.ID
 		kind := mediatype.Parse(en.Type).Kind()
 
 		switch {
-		case kind == mediatype.KindCatalog && en.URL != "":
-			catID := cat.ID
-			e.enqueue(store.KindCatalogFetch, en.URL, host, depth+1, provenance{ParentCatalogID: &catID})
-
-		case kind == mediatype.KindCatalog && hasEmbeddedData(en.Data):
-			sum := sha256.Sum256(en.Data)
-			nestedSource := sourceURL + "#" + en.Identifier
-			catID := cat.ID
-			if err := e.processCatalog(ctx, en.Data, hex.EncodeToString(sum[:]), host, nestedSource, &catID, "", depth+1, nil); err != nil {
-				e.logger.Warn("crawler: failed to process embedded nested catalog", "identifier", en.Identifier, "error", err)
-			}
+		case kind == mediatype.KindCatalog:
+			e.followCatalogPointer(ctx, en, host, sourceURL, depth+1, &catID)
 
 		case kind == mediatype.KindRegistry && en.URL != "" && e.cfg.Registry.Harvest:
-			regRow := &store.Registry{
-				EntryID:       entryID,
-				BaseURL:       en.URL,
-				HarvestStatus: store.HarvestStatusPending,
-			}
-			if err := e.store.SaveRegistry(regRow); err != nil {
-				e.logger.Warn("crawler: failed to save registry row", "url", en.URL, "error", err)
-				continue
-			}
-			catID := cat.ID
-			e.enqueue(store.KindRegistryHarvest, en.URL, host, 0, provenance{
-				RegistryEntryID:   &entryID,
-				RegistryCatalogID: &catID,
-				RegistryRowID:     &regRow.ID,
-			})
+			e.followRegistryPointer(en.URL, host, 0,
+				&store.Registry{EntryID: entryID, BaseURL: en.URL, HarvestStatus: store.HarvestStatusPending},
+				provenance{RegistryEntryID: &entryID, RegistryCatalogID: &catID})
 
 		case en.URL != "" && e.cfg.ARD.FetchArtifacts:
 			e.enqueue(store.KindArtifactFetch, en.URL, host, 0, provenance{ArtifactEntryID: &entryID})
 		}
 	}
+}
+
+// followCatalogPointer follows an ai-catalog pointer entry: a url-referenced
+// nested catalog becomes a catalog_fetch at depth; an embedded-data catalog is
+// processed recursively at depth. A pointer with neither url nor data is a
+// no-op. Shared by the catalog fan-out and the registry-result fan-out.
+func (e *Engine) followCatalogPointer(ctx context.Context, en ard.Entry, host, sourceURL string, depth int, parentCatID *uint) {
+	switch {
+	case en.URL != "":
+		e.enqueue(store.KindCatalogFetch, en.URL, host, depth, provenance{ParentCatalogID: parentCatID})
+	case hasEmbeddedData(en.Data):
+		sum := sha256.Sum256(en.Data)
+		nestedSource := sourceURL + "#" + en.Identifier
+		if err := e.processCatalog(ctx, en.Data, hex.EncodeToString(sum[:]), host, nestedSource, parentCatID, "", depth, nil); err != nil {
+			e.logger.Warn("crawler: failed to process embedded nested catalog", "identifier", en.Identifier, "error", err)
+		}
+	}
+}
+
+// followRegistryPointer persists a registries row and enqueues a
+// registry_harvest for it at depth. The caller supplies the row (with its
+// provenance columns) and the frontier-item provenance; this sets
+// prov.RegistryRowID to the newly-saved row's ID. Shared by the catalog
+// fan-out and the registry-result fan-out.
+func (e *Engine) followRegistryPointer(url, host string, depth int, regRow *store.Registry, prov provenance) {
+	if err := e.store.SaveRegistry(regRow); err != nil {
+		e.logger.Warn("crawler: failed to save registry row", "url", url, "error", err)
+		return
+	}
+	prov.RegistryRowID = &regRow.ID
+	e.enqueue(store.KindRegistryHarvest, url, host, depth, prov)
 }
 
 // hasEmbeddedData reports whether raw carries a real JSON value: an absent
@@ -514,6 +525,24 @@ func (e *Engine) handleRegistryHarvest(ctx context.Context, item store.FrontierI
 		}
 		if err := e.store.SaveEntries(rows); err != nil {
 			return err
+		}
+
+		// Follow catalog/registry POINTERS among the results (pointers only —
+		// ordinary results are already persisted and are not artifact-fetched).
+		// SaveEntries populated rows[i].ID.
+		for i, res := range result.Results {
+			switch mediatype.Parse(res.Type).Kind() {
+			case mediatype.KindCatalog:
+				e.followCatalogPointer(ctx, res.Entry, item.Host, item.URL, 0, &catalogID)
+			case mediatype.KindRegistry:
+				if res.URL == "" || !e.cfg.Registry.Harvest {
+					continue
+				}
+				resultEntryID := rows[i].ID
+				e.followRegistryPointer(res.URL, item.Host, item.Depth+1,
+					&store.Registry{EntryID: resultEntryID, BaseURL: res.URL, HarvestStatus: store.HarvestStatusPending, ReferralSourceID: uintPtr(regRowID)},
+					provenance{RegistryEntryID: &resultEntryID, RegistryCatalogID: &catalogID})
+			}
 		}
 	}
 

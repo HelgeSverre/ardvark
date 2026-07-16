@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/helgesverre/ardvark/internal/ard"
 	"github.com/helgesverre/ardvark/internal/config"
 	"github.com/helgesverre/ardvark/internal/fetch"
 	"github.com/helgesverre/ardvark/internal/frontier"
@@ -1451,5 +1452,115 @@ func TestEnqueueFollowups_UnsuffixedCatalogPointerIsFollowed(t *testing.T) {
 	st.DB.Model(&store.FrontierItem{}).Where("kind = ? AND url = ?", store.KindCatalogFetch, srv.URL+"/nested.json").Count(&fetches)
 	if fetches != 1 {
 		t.Fatalf("expected 1 catalog_fetch for unsuffixed application/ai-catalog, got %d", fetches)
+	}
+}
+
+// TestHandleRegistryHarvest_FollowsPointerResults verifies that catalog and
+// registry POINTERS returned as registry search results are followed (decision
+// A: pointers only — ordinary results are not artifact-fetched).
+func TestHandleRegistryHarvest_FollowsPointerResults(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/registry/search", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"results": []map[string]any{
+				{"identifier": "urn:air:reg.example:catalogs:c", "displayName": "C", "type": "application/ai-catalog", "url": "https://found.example/catalog.json"},
+				{"identifier": "urn:air:reg.example:registries:r", "displayName": "R", "type": "application/ai-registry+json", "url": "https://found.example/registry"},
+				{"identifier": "urn:air:reg.example:agents:a", "displayName": "A", "type": "application/mcp-server-card+json", "url": "https://found.example/agent.json"},
+			},
+			"referrals": []any{},
+			"pageToken": "",
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	reg := &store.Registry{BaseURL: srv.URL + "/registry", HarvestStatus: store.HarvestStatusPending}
+	if err := st.SaveRegistry(reg); err != nil {
+		t.Fatalf("SaveRegistry: %v", err)
+	}
+	item := store.FrontierItem{
+		Kind:          store.KindRegistryHarvest,
+		URL:           srv.URL + "/registry",
+		Host:          strings.TrimPrefix(srv.URL, "http://"),
+		Depth:         0,
+		RegistryRowID: &reg.ID,
+	}
+	if err := eng.handleRegistryHarvest(context.Background(), item); err != nil {
+		t.Fatalf("handleRegistryHarvest: %v", err)
+	}
+
+	var catalogFetch int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ? AND url = ?", store.KindCatalogFetch, "https://found.example/catalog.json").Count(&catalogFetch)
+	if catalogFetch != 1 {
+		t.Errorf("expected 1 catalog_fetch for unsuffixed ai-catalog result, got %d", catalogFetch)
+	}
+	var regHarvest int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ? AND url = ?", store.KindRegistryHarvest, "https://found.example/registry").Count(&regHarvest)
+	if regHarvest != 1 {
+		t.Errorf("expected 1 registry_harvest for ai-registry result, got %d", regHarvest)
+	}
+	var artifactFetch int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ?", store.KindArtifactFetch).Count(&artifactFetch)
+	if artifactFetch != 0 {
+		t.Errorf("expected 0 artifact_fetch (pointers-only), got %d", artifactFetch)
+	}
+}
+
+// -- pointer-follow primitives ----------------------------------------------
+
+func TestFollowCatalogPointer_EnqueuesCatalogFetch(t *testing.T) {
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	parent := uint(42)
+	en := ard.Entry{Identifier: "urn:air:example.com:catalogs:c", Type: "application/ai-catalog", URL: "https://x.example/c.json"}
+	eng.followCatalogPointer(context.Background(), en, "x.example", "https://x.example/root.json", 3, &parent)
+
+	var it store.FrontierItem
+	if err := st.DB.Where("kind = ? AND url = ?", store.KindCatalogFetch, "https://x.example/c.json").First(&it).Error; err != nil {
+		t.Fatalf("expected 1 catalog_fetch enqueued: %v", err)
+	}
+	if it.ParentCatalogID == nil || *it.ParentCatalogID != parent {
+		t.Errorf("ParentCatalogID = %v, want %d", it.ParentCatalogID, parent)
+	}
+	if it.Depth != 3 {
+		t.Errorf("Depth = %d, want 3", it.Depth)
+	}
+}
+
+func TestFollowCatalogPointer_EmbeddedRecurses(t *testing.T) {
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	en := ard.Entry{Identifier: "urn:air:example.com:catalogs:emb", Type: "application/ai-catalog", Data: json.RawMessage(`{"specVersion":"1.0","host":{"displayName":"E"},"entries":[]}`)}
+	eng.followCatalogPointer(context.Background(), en, "x.example", "https://x.example/root.json", 1, nil)
+
+	var fetch int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ?", store.KindCatalogFetch).Count(&fetch)
+	if fetch != 0 {
+		t.Errorf("expected 0 catalog_fetch for embedded pointer, got %d", fetch)
+	}
+	var cats int64
+	st.DB.Model(&store.Catalog{}).Count(&cats)
+	if cats != 1 {
+		t.Errorf("expected 1 persisted nested catalog, got %d", cats)
+	}
+}
+
+func TestFollowRegistryPointer_SavesRowAndEnqueues(t *testing.T) {
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	regRow := &store.Registry{BaseURL: "https://x.example/reg", HarvestStatus: store.HarvestStatusPending}
+	eng.followRegistryPointer("https://x.example/reg", "x.example", 2, regRow, provenance{})
+
+	if regRow.ID == 0 {
+		t.Fatal("expected registries row saved with a nonzero ID")
+	}
+	var it store.FrontierItem
+	if err := st.DB.Where("kind = ? AND url = ?", store.KindRegistryHarvest, "https://x.example/reg").First(&it).Error; err != nil {
+		t.Fatalf("expected 1 registry_harvest enqueued: %v", err)
+	}
+	if it.RegistryRowID == nil || *it.RegistryRowID != regRow.ID {
+		t.Errorf("RegistryRowID = %v, want %d", it.RegistryRowID, regRow.ID)
+	}
+	if it.Depth != 2 {
+		t.Errorf("Depth = %d, want 2", it.Depth)
 	}
 }
