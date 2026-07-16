@@ -19,6 +19,8 @@ package crawler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -551,8 +553,32 @@ func (e *Engine) maxReferralDepth() int {
 	return e.cfg.Registry.MaxReferralDepth
 }
 
-// dedupKey builds a frontier dedup key from a kind and a natural key (URL
-// or host).
+// dedupKey builds a frontier dedup key from a kind and a natural key (URL or
+// host) by hashing "kind:natural" with SHA-256 and hex-encoding it, always
+// yielding exactly 64 lowercase hex characters regardless of input length.
+//
+// The fixed width is load-bearing, not cosmetic. The natural key derives from
+// FrontierItem.URL (size:2048), but the dedup key is stored in a much narrower
+// uniqueIndex column (store.FrontierItem.DedupKey, size:64). Using the raw
+// "kind:natural" string there would overflow on any long URL — common via
+// anchor fan-out — with driver-dependent, data-losing consequences:
+// Postgres/MySQL-strict reject the insert (the item is dropped, since enqueue
+// only warn-logs), while MySQL non-strict silently truncates to the column
+// width, so two distinct long URLs sharing a prefix collide and one is lost.
+// Hashing bounds the key to 64 hex chars — well under MySQL's utf8mb4 768-char
+// unique-index key limit — while keeping collisions cryptographically
+// negligible, so distinct URLs of any length always get distinct keys.
+//
+// This is the single source of truth for key derivation: every enqueue routes
+// through Engine.enqueue -> buildItem -> dedupKey, and frontier.Enqueue treats
+// DedupKey as an opaque required value. Changing the derivation therefore
+// re-keys the whole frontier: upgrading from <=0.4.0 (which stored raw
+// "kind:natural" keys) means pre-existing frontier_items rows no longer match
+// the hashed lookups of new enqueues. That is benign for a crawler — worst
+// case a still-pending or already-done URL is re-discovered and re-enqueued
+// once (status guards prevent duplicating live work); no corruption results —
+// so no data migration rewrites the old keys.
 func dedupKey(kind, natural string) string {
-	return kind + ":" + natural
+	sum := sha256.Sum256([]byte(kind + ":" + natural))
+	return hex.EncodeToString(sum[:])
 }

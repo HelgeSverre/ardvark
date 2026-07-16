@@ -148,7 +148,18 @@ type FrontierItem struct {
 	Status    string `gorm:"index;size:16"`
 	Attempts  int
 	LastError string `gorm:"type:text"`
-	DedupKey  string `gorm:"uniqueIndex;size:512"`
+	// DedupKey is the frontier's uniqueness key: at most one row per distinct
+	// (kind, natural key) may exist. It is a hex-encoded SHA-256 of
+	// "kind:natural" (see internal/crawler.dedupKey), so it is always exactly
+	// 64 lowercase hex chars — fixed width, driver-independent, and safely
+	// under MySQL's utf8mb4 768-char unique-index key limit — regardless of how
+	// long the source URL is. The column must stay at size:64: it must not be
+	// widened toward the URL column's size:2048, which would exceed the index
+	// key limit and fail migration. Upgrading from <=0.4.0 (which stored raw
+	// "kind:natural" strings here) re-keys existing rows because new enqueues
+	// hash the key; AutoMigrate narrows the column and old rows simply stop
+	// dedup-matching new lookups, which is benign for a crawler (see dedupKey).
+	DedupKey string `gorm:"uniqueIndex;size:64"`
 
 	// HostShard is fnv32a(fetchHost) % HostShardCount, computed once at
 	// enqueue time (see internal/frontier.Enqueue), where fetchHost is the
