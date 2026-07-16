@@ -47,6 +47,9 @@ func TestParseWorkerFlag(t *testing.T) {
 		{name: "negative index", in: "-1/4", wantErr: true},
 		{name: "zero count", in: "0/0", wantErr: true},
 		{name: "empty", in: "", wantErr: true},
+		{name: "index within shard space, count beyond it", in: "9000/100000", wantErr: true},
+		{name: "count one past shard space ceiling", in: "8192/8193", wantErr: true},
+		{name: "count at shard space ceiling, max valid index", in: "8191/8192", wantIndex: 8191, wantCount: 8192},
 	}
 
 	for _, tt := range tests {

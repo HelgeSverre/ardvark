@@ -1322,6 +1322,7 @@ ardvark work --worker 3/4">copy</button>
       <h4 id="distributed-dead-worker">Dead workers and clocks</h4>
       <ul>
         <li><b>Sharding is static</b> — a host belongs to a shard, and a shard belongs to a fixed <code>(index, count)</code> partition. If a worker dies permanently, its shard's not-yet-started items are never leased, so lease-expiry reclaim never touches them, and its peers keep polling forever because the global pending count stays non-zero. Recovery is operational, not automatic: restart the missing worker with the <em>same</em> <code>--worker index/count</code>, or restart the whole fleet with a new <code>count</code>.</li>
+        <li><b>Changing <code>count</code> is fleet-wide</b> — every worker sharing a frontier must use the same <code>count</code>; fully stop and drain the existing fleet before starting workers with a new one. Running old (<code>count=N</code>) and new (<code>count=M</code>) workers at the same time (e.g. a rolling deploy) violates one-worker-per-host for roughly 1/lcm(N,M) of shards — a politeness overshoot, not data corruption.</li>
         <li><b>Keep clocks in sync</b> — lease expiry compares timestamps written by different machines, so run the workers' hosts under NTP. A badly skewed clock can reclaim a live worker's items early or leave a dead worker's items stranded too long.</li>
       </ul>
     </section>

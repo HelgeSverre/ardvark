@@ -282,6 +282,28 @@ func TestDefaults_SeedSourcesHaveOwnCounts(t *testing.T) {
 	}
 }
 
+func TestLoadBytes_WorkerCountMustNotExceedHostShardSpace(t *testing.T) {
+	tests := []struct {
+		name    string
+		json    string
+		wantErr bool
+	}{
+		{name: "count far beyond shard space", json: `{"crawler": {"worker": {"index": 0, "count": 100000}}}`, wantErr: true},
+		{name: "count at shard space ceiling, max valid index", json: `{"crawler": {"worker": {"index": 8191, "count": 8192}}}`, wantErr: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := LoadBytes([]byte(tt.json))
+			if tt.wantErr && err == nil {
+				t.Fatalf("LoadBytes(%q) expected error, got nil", tt.json)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("LoadBytes(%q) unexpected error: %v", tt.json, err)
+			}
+		})
+	}
+}
+
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {

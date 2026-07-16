@@ -502,7 +502,8 @@ func (e *Engine) registryHTTPClient() *http.Client {
 // in the frontier at once. The budget is enforced by frontier.EnqueueBudgeted
 // (via enqueuePageFetch), which counts existing page_fetch rows for the host
 // directly in the frontier_items table — the dedup key guarantees at most one
-// row per distinct URL, so within a single process this count is exact.
+// row per distinct URL, but see the concurrency note below for why that count
+// is not the same as an exact, race-free budget.
 //
 // Precise semantics: the budget caps DISTINCT page URLs per host present in
 // the frontier, not pages fetched per database lifetime. Re-activating a page
@@ -510,24 +511,27 @@ func (e *Engine) registryHTTPClient() *http.Client {
 // refresh crawl or --force does through the dedup re-enqueue path) creates no
 // new row and so never consumes budget — a capped host therefore re-fetches
 // all its known pages on later crawls, not just its seed. Only creating a
-// NEW page URL is gated. The check runs at enqueue time (not fetch time) and
-// per enqueue call, so a single page's link fan-out cannot overshoot: each
-// call re-counts and sees every row the earlier iterations added.
+// NEW page URL is gated.
 //
-// Under distributed crawling (mysql/postgres, multiple worker processes) the
-// count is exact per-process but not globally atomic: two workers racing to
-// enqueue page_fetch items for the same host could each observe a count just
-// under the limit and both enqueue, overshooting by a small, bounded amount.
-// Host-affinity sharding (store.FrontierItem.HostShard) makes this race rare
-// — normally only one worker ever owns a given host — but it is not
-// eliminated for hosts discovered mid-crawl before sharding routes their
-// future items consistently. This is a deliberate, documented tradeoff rather
-// than a bug: closing it fully would require a cross-process lock or a DB-side
-// atomic counter for a budget whose entire purpose is a soft cap.
+// The check runs at enqueue time (not fetch time), and it is a count-then-
+// insert read followed by a write, not one atomic operation. Overshoot can
+// occur whenever more than one worker goroutine concurrently enqueues
+// page_fetch items for the same host — i.e. any crawler.concurrency > 1 (the
+// default worker pool is 8), single process or distributed — because two
+// goroutines can each observe a count just under the limit and both enqueue,
+// overshooting by a small, bounded amount. Host-affinity sharding
+// (store.FrontierItem.HostShard) only partitions which worker PROCESS
+// dequeues a host in distributed crawling; it does not serialize enqueue-side
+// fan-out, so within one process's worker pool, or when several page fetches
+// on different hosts link to the same third-party host, the same race
+// applies. This is a deliberate, documented tradeoff rather than a bug:
+// closing it fully would require a lock or an atomic counter for a budget
+// whose entire purpose is a soft cap.
 //
 // config.Load/config.Defaults already fill in the documented default (50)
-// for any key absent from the config file, so an explicit 0 here reflects
-// the operator's own choice (permitted by the config schema's minimum:0)
+// for any key absent from the config file, so an explicit value here
+// reflects the operator's own choice (the config schema requires
+// maxPagesPerDomain >= 1; 0 is rejected at load and thus unreachable here)
 // and must not be silently overridden.
 func (e *Engine) maxPagesPerDomain() int {
 	return e.cfg.Crawler.MaxPagesPerDomain

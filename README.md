@@ -151,7 +151,7 @@ ardvark runs with sensible defaults and no config file. To change anything, drop
 | `crawler.refreshAfterHours` | `168` | Skip hosts probed within this window |
 | `crawler.leaseSeconds` | `600` | How long a claimed work item can stay in progress before it's treated as stalled and reclaimed (must outlast the slowest handler; distributed crawling only) |
 | `crawler.worker.index` | `0` | This process's 0-based shard among `crawler.worker.count` cooperating workers (must be `< count`); overridden by `--worker i/n` |
-| `crawler.worker.count` | `1` | Total workers sharing one mysql/postgres frontier; `1` disables sharding (single-process) |
+| `crawler.worker.count` | `1` | Total workers sharing one mysql/postgres frontier; `1` disables sharding (single-process); max `8192`; changing it is fleet-wide — stop and drain every worker before restarting with a new value |
 | `ard.maxCatalogDepth` | `3` | Nested-catalog recursion bound |
 | `registry.maxReferralDepth` | `2` | Registry referral-following bound |
 | `seed.crtsh.count` | `1000` | Default `seed crtsh` domain count (own key, not shared with `seed.ct.entryCount`) |
