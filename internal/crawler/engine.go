@@ -19,6 +19,8 @@ package crawler
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -500,7 +502,8 @@ func (e *Engine) registryHTTPClient() *http.Client {
 // in the frontier at once. The budget is enforced by frontier.EnqueueBudgeted
 // (via enqueuePageFetch), which counts existing page_fetch rows for the host
 // directly in the frontier_items table — the dedup key guarantees at most one
-// row per distinct URL, so within a single process this count is exact.
+// row per distinct URL, but see the concurrency note below for why that count
+// is not the same as an exact, race-free budget.
 //
 // Precise semantics: the budget caps DISTINCT page URLs per host present in
 // the frontier, not pages fetched per database lifetime. Re-activating a page
@@ -508,24 +511,27 @@ func (e *Engine) registryHTTPClient() *http.Client {
 // refresh crawl or --force does through the dedup re-enqueue path) creates no
 // new row and so never consumes budget — a capped host therefore re-fetches
 // all its known pages on later crawls, not just its seed. Only creating a
-// NEW page URL is gated. The check runs at enqueue time (not fetch time) and
-// per enqueue call, so a single page's link fan-out cannot overshoot: each
-// call re-counts and sees every row the earlier iterations added.
+// NEW page URL is gated.
 //
-// Under distributed crawling (mysql/postgres, multiple worker processes) the
-// count is exact per-process but not globally atomic: two workers racing to
-// enqueue page_fetch items for the same host could each observe a count just
-// under the limit and both enqueue, overshooting by a small, bounded amount.
-// Host-affinity sharding (store.FrontierItem.HostShard) makes this race rare
-// — normally only one worker ever owns a given host — but it is not
-// eliminated for hosts discovered mid-crawl before sharding routes their
-// future items consistently. This is a deliberate, documented tradeoff rather
-// than a bug: closing it fully would require a cross-process lock or a DB-side
-// atomic counter for a budget whose entire purpose is a soft cap.
+// The check runs at enqueue time (not fetch time), and it is a count-then-
+// insert read followed by a write, not one atomic operation. Overshoot can
+// occur whenever more than one worker goroutine concurrently enqueues
+// page_fetch items for the same host — i.e. any crawler.concurrency > 1 (the
+// default worker pool is 8), single process or distributed — because two
+// goroutines can each observe a count just under the limit and both enqueue,
+// overshooting by a small, bounded amount. Host-affinity sharding
+// (store.FrontierItem.HostShard) only partitions which worker PROCESS
+// dequeues a host in distributed crawling; it does not serialize enqueue-side
+// fan-out, so within one process's worker pool, or when several page fetches
+// on different hosts link to the same third-party host, the same race
+// applies. This is a deliberate, documented tradeoff rather than a bug:
+// closing it fully would require a lock or an atomic counter for a budget
+// whose entire purpose is a soft cap.
 //
 // config.Load/config.Defaults already fill in the documented default (50)
-// for any key absent from the config file, so an explicit 0 here reflects
-// the operator's own choice (permitted by the config schema's minimum:0)
+// for any key absent from the config file, so an explicit value here
+// reflects the operator's own choice (the config schema requires
+// maxPagesPerDomain >= 1; 0 is rejected at load and thus unreachable here)
 // and must not be silently overridden.
 func (e *Engine) maxPagesPerDomain() int {
 	return e.cfg.Crawler.MaxPagesPerDomain
@@ -551,8 +557,35 @@ func (e *Engine) maxReferralDepth() int {
 	return e.cfg.Registry.MaxReferralDepth
 }
 
-// dedupKey builds a frontier dedup key from a kind and a natural key (URL
-// or host).
+// dedupKey builds a frontier dedup key from a kind and a natural key (URL or
+// host) by hashing "kind:natural" with SHA-256 and hex-encoding it, always
+// yielding exactly 64 lowercase hex characters regardless of input length.
+//
+// The fixed width is load-bearing, not cosmetic. The natural key derives from
+// FrontierItem.URL (size:2048), but the dedup key is stored in a much narrower
+// uniqueIndex column (store.FrontierItem.DedupKey, size:64). Using the raw
+// "kind:natural" string there would overflow on any long URL — common via
+// anchor fan-out — with driver-dependent, data-losing consequences:
+// Postgres/MySQL-strict reject the insert (the item is dropped, since enqueue
+// only warn-logs), while MySQL non-strict silently truncates to the column
+// width, so two distinct long URLs sharing a prefix collide and one is lost.
+// Hashing bounds the key to 64 hex chars — well under MySQL's utf8mb4 768-char
+// unique-index key limit — while keeping collisions cryptographically
+// negligible, so distinct URLs of any length always get distinct keys.
+//
+// This is the single source of truth for key derivation: every enqueue routes
+// through Engine.enqueue -> buildItem -> dedupKey, and frontier.Enqueue treats
+// DedupKey as an opaque required value. Changing the derivation therefore
+// re-keys the whole frontier: upgrading from <=0.4.0 (which stored raw
+// "kind:natural" keys) means pre-existing frontier_items rows no longer match
+// the hashed lookups of new enqueues. That is benign for a crawler — worst
+// case a still-pending or already-done URL is re-discovered and re-enqueued
+// once (status guards prevent duplicating live work); no corruption results.
+// Rather than rewrite the old keys in place (impossible under the narrowed
+// varchar(64) column — see store.migrateFrontierDedupKey), store.Open discards
+// the stale <=0.4.0 frontier table on the first 0.4.1 open so those rows are
+// simply re-discovered.
 func dedupKey(kind, natural string) string {
-	return kind + ":" + natural
+	sum := sha256.Sum256([]byte(kind + ":" + natural))
+	return hex.EncodeToString(sum[:])
 }

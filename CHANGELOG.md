@@ -6,6 +6,33 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-16
+
+### Fixed
+
+- **Frontier dedup key is hashed to a fixed 64-char width** — long URLs no
+  longer overflow the `frontier_items.dedup_key` column on MySQL/Postgres,
+  where a raw `kind:natural` key past the varchar limit would truncate and
+  silently collide distinct pending URLs onto the unique index (SQLite was
+  unaffected). The key is now a SHA-256 digest, so it is fixed-width and
+  driver-independent regardless of URL length.
+- **`crawler.worker.count` is capped at the host-shard space (8192)** — a count
+  above 8192 with an index at or beyond it matched no shard and silently
+  dequeued nothing forever; it is now rejected at config load and by the
+  `--worker i/n` flag, matching the existing fail-fast validation for an
+  out-of-range index.
+
+### Upgrading from 0.4.0 on MySQL/Postgres
+
+- The `dedup_key` column narrows from `varchar(512)` to `varchar(64)`. A
+  populated 0.4.0 frontier almost always holds keys longer than 64 chars, which
+  an in-place `ALTER` cannot narrow (strict `sql_mode` aborts; non-strict would
+  truncate-and-collide), so **the first 0.4.1 start drops and recreates the
+  `frontier_items` table automatically.** Pending frontier work is discarded and
+  re-discovered from the seed/domain tables on the next crawl — no other tables
+  are touched. Finish or drain any in-progress 0.4.0 crawl before upgrading if
+  you need its pending queue preserved. SQLite deployments are unaffected.
+
 ## [0.4.0] - 2026-07-16
 
 ### Added
@@ -174,7 +201,8 @@ First release.
   with live per-host result rows and a JSON config validated with friendly
   error messages.
 
-[Unreleased]: https://github.com/helgesverre/ardvark/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/helgesverre/ardvark/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/helgesverre/ardvark/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/helgesverre/ardvark/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/helgesverre/ardvark/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/helgesverre/ardvark/compare/v0.1.0...v0.2.0

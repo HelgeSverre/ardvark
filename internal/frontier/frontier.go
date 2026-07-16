@@ -274,13 +274,17 @@ func (f *Frontier) enqueue(item *store.FrontierItem, maxRowsForHostKind int) (bo
 		// existence probe below, so at exactly the budget the sole enqueue we
 		// still allow is a re-activation of a key that already exists.
 		//
-		// Count-first is not atomic with the Create/re-activate below — a peer
-		// could insert another row for the same host in the gap — so under
-		// distributed crawling the cap is a soft, per-process bound that can be
-		// overshot by a small, bounded amount. That is an accepted, documented
-		// tradeoff (see the Engine's maxPagesPerDomain doc comment); host-
-		// affinity sharding makes the race rare because one worker normally owns
-		// a given host.
+		// Count-first is not atomic with the Create/re-activate below — another
+		// goroutine could insert another row for the same host in the gap — so
+		// the cap is a soft bound that can be overshot by a small, bounded
+		// amount whenever more than one worker goroutine concurrently enqueues
+		// page_fetch items for the same host, i.e. any concurrency > 1 (the
+		// default worker pool is 8), single process or distributed. Host-
+		// affinity sharding (store.FrontierItem.HostShard) only partitions
+		// which worker PROCESS dequeues a host in distributed crawling; it does
+		// not serialize enqueue-side fan-out, so the race is not confined to
+		// distributed setups. That is an accepted, documented tradeoff (see the
+		// Engine's maxPagesPerDomain doc comment).
 		var count int64
 		if err := f.db.Model(&store.FrontierItem{}).
 			Where("host = ? AND kind = ?", item.Host, item.Kind).

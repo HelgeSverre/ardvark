@@ -17,6 +17,8 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
+
+	"github.com/helgesverre/ardvark/internal/store"
 )
 
 var defaultPrinter = message.NewPrinter(language.English)
@@ -90,6 +92,17 @@ type CrawlerConfig struct {
 // because the global pending count stays non-zero. Recovery is
 // operational, not automatic: restart the missing worker (same Index and
 // Count), or restart the fleet with a new Count.
+//
+// Changing Count is a fleet-wide operation, not a per-process one: every
+// worker sharing the frontier must agree on the same Count, because the
+// partition ("host_shard % count = index") is only exhaustive and
+// non-overlapping when every worker computes it with the same modulus. A
+// rolling deploy that runs old (Count=N) and new (Count=M) workers at the
+// same time violates one-worker-per-host for roughly 1/lcm(N,M) of shards
+// — those hosts get dequeued by two workers concurrently, which is a
+// politeness overshoot (extra requests against per-host rate limits), not
+// data corruption. Stop and drain the existing fleet fully before starting
+// workers with the new Count.
 type WorkerConfig struct {
 	// Index is this process's position among Count cooperating workers
 	// (0-based). Must be less than Count — validated at config load (see
@@ -100,6 +113,10 @@ type WorkerConfig struct {
 	// Count is the total number of cooperating worker processes sharing
 	// the frontier. 1 (the default) means "no distributed sharding" — every
 	// host is dequeued by this one process, matching today's behavior.
+	// Must not exceed store.HostShardCount (validated at config load):
+	// FrontierItem.HostShard only takes values in [0, HostShardCount), so a
+	// larger Count would create shard indices that no item can ever match,
+	// silently dequeuing nothing forever for whichever worker(s) hold them.
 	Count int `json:"count"`
 }
 
@@ -373,6 +390,19 @@ func validateSemantics(cfg Config) error {
 		return fmt.Errorf(
 			"config: crawler.worker.index (%d) must be less than crawler.worker.count (%d)",
 			cfg.Crawler.Worker.Index, cfg.Crawler.Worker.Count,
+		)
+	}
+	// Every FrontierItem.HostShard is computed mod store.HostShardCount, so
+	// a worker Count beyond that ceiling creates shard indices ("modular
+	// classes") that no item can ever land in — a worker with, say, Index
+	// 8192 in a Count-9000 fleet would pass the check above yet still
+	// silently dequeue nothing forever, the exact failure mode Index<Count
+	// validation exists to prevent. Reject it here for the same fail-fast
+	// reason (see WorkerConfig.Index and frontier.WithWorkerShard).
+	if cfg.Crawler.Worker.Count > store.HostShardCount {
+		return fmt.Errorf(
+			"config: crawler.worker.count (%d) must not exceed the host-shard space (%d)",
+			cfg.Crawler.Worker.Count, store.HostShardCount,
 		)
 	}
 	return nil

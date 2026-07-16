@@ -61,6 +61,10 @@ func Open(driver, dsn string) (*Store, error) {
 		return nil, fmt.Errorf("store: opening %s database: %w", driver, err)
 	}
 
+	if err := migrateFrontierDedupKey(db); err != nil {
+		return nil, fmt.Errorf("store: reconciling frontier_items before migration: %w", err)
+	}
+
 	if err := db.AutoMigrate(allModels...); err != nil {
 		return nil, fmt.Errorf("store: migrating schema: %w", err)
 	}
@@ -78,6 +82,79 @@ func Open(driver, dsn string) (*Store, error) {
 	}
 
 	return &Store{DB: db}, nil
+}
+
+// migrateFrontierDedupKey reconciles a pre-0.4.1 frontier_items table so that
+// the subsequent AutoMigrate can succeed, and must run before it.
+//
+// Versions <=0.4.0 declared FrontierItem.DedupKey as varchar(512) and stored
+// the raw "kind:natural" string there. 0.4.1 hashes that key to a fixed-width
+// 64-char SHA-256 digest and narrows the column to varchar(64) (see
+// FrontierItem.DedupKey and internal/crawler.dedupKey). On mysql/postgres,
+// AutoMigrate reconciles that difference by issuing ALTER ... varchar(512) ->
+// varchar(64), which HARD-FAILS on any table that already holds a key longer
+// than 64 chars — the near-universal case for a populated 0.4.0 frontier,
+// since even the shortest "page_fetch:https://..." prefix is 22 chars and any
+// real URL pushes the raw key well past 64. Strict sql_mode (the default)
+// aborts the ALTER with "Data truncated for column 'dedup_key'" and store.Open
+// returns an error, so ardvark cannot start; non-strict mode would instead
+// truncate every long key to 64 chars, collapsing distinct pending URLs onto
+// the unique index — the exact silent data loss the 0.4.1 change exists to
+// prevent.
+//
+// The old rows cannot be preserved under the narrower, re-keyed column anyway:
+// new enqueues hash their keys, so pre-existing raw-key rows would never match
+// a lookup again even if the ALTER somehow kept them. The only correct
+// reconciliation is therefore to discard the stale frontier: we drop the table
+// and let AutoMigrate recreate it with the 0.4.1 schema. Discarding pending
+// frontier work is benign for a crawler — those URLs are re-discovered from
+// the seed/domain tables on the next crawl, and status guards prevent
+// duplicating anything already recorded — which is precisely why no data
+// migration tries to rewrite the keys in place (see dedupKey's doc comment).
+//
+// sqlite is exempt on two counts: it treats VARCHAR(n) as unlimited TEXT so
+// the narrowing never truncates and AutoMigrate never fails, and its single
+// in-memory/on-disk frontier has no cross-version upgrade path worth eroding.
+// The drop is gated on the column actually being wider than 64, so a fresh
+// database (no table yet) and any frontier already on the 0.4.1 schema are
+// both left untouched — this runs on every Open and must be a no-op once
+// reconciled.
+func migrateFrontierDedupKey(db *gorm.DB) error {
+	switch db.Dialector.Name() {
+	case "mysql", "postgres":
+		// Only these dialects enforce varchar length; see doc comment.
+	default:
+		return nil
+	}
+
+	m := db.Migrator()
+	// A fresh database has no frontier_items yet: AutoMigrate will create it
+	// correctly, so there is nothing to reconcile.
+	if !m.HasTable(&FrontierItem{}) || !m.HasColumn(&FrontierItem{}, "DedupKey") {
+		return nil
+	}
+
+	cols, err := m.ColumnTypes(&FrontierItem{})
+	if err != nil {
+		return fmt.Errorf("inspecting frontier_items columns: %w", err)
+	}
+	for _, c := range cols {
+		if c.Name() != "dedup_key" {
+			continue
+		}
+		// Length reports the declared varchar width on mysql/postgres. A width
+		// > 64 means this is a pre-0.4.1 (raw-key) column that AutoMigrate
+		// could not safely narrow in place, so drop the whole table and let
+		// AutoMigrate rebuild it. length==64 (already reconciled) or an
+		// unreported length leaves the table as-is.
+		if length, ok := c.Length(); ok && length > 64 {
+			if err := m.DropTable(&FrontierItem{}); err != nil {
+				return fmt.Errorf("dropping pre-0.4.1 frontier_items for re-key: %w", err)
+			}
+		}
+		break
+	}
+	return nil
 }
 
 // Close releases the underlying database connection.

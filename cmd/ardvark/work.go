@@ -12,6 +12,7 @@ import (
 
 	"github.com/helgesverre/ardvark/internal/frontier"
 	"github.com/helgesverre/ardvark/internal/jsonout"
+	"github.com/helgesverre/ardvark/internal/store"
 )
 
 var (
@@ -122,6 +123,17 @@ func parseWorkerFlag(s string) (index, count int, err error) {
 	}
 	if count < 1 {
 		return 0, 0, fmt.Errorf("work: --worker %q: count must be >= 1", s)
+	}
+	// count beyond the host-shard space would create shard indices that no
+	// FrontierItem.HostShard value can ever match — see
+	// config.WorkerConfig.Count and store.HostShardCount — so reject it
+	// here for the same fail-fast reason as the index bound below, rather
+	// than letting the worker silently dequeue nothing forever.
+	if count > store.HostShardCount {
+		return 0, 0, fmt.Errorf(
+			"work: --worker %q: count must not exceed the host-shard space (%d)",
+			s, store.HostShardCount,
+		)
 	}
 	if index < 0 || index >= count {
 		return 0, 0, fmt.Errorf("work: --worker %q: index must satisfy 0 <= index < count", s)
