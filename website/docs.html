@@ -373,6 +373,7 @@
         <summary><svg class="chev" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 2.5 8 6l-3.5 3.5"/></svg><a href="#commands">Commands</a></summary>
         <ul>
           <li><a href="#cmd-crawl">crawl</a></li>
+          <li><a href="#cmd-work">work</a></li>
           <li><a href="#cmd-probe">probe</a></li>
           <li><a href="#cmd-seed">seed</a></li>
           <li><a href="#cmd-verify">verify</a></li>
@@ -385,6 +386,7 @@
       </details>
       <a class="docs-side-link" href="#configuration">Configuration</a>
       <a class="docs-side-link" href="#storage">Storage</a>
+      <a class="docs-side-link" href="#distributed">Distributed crawling</a>
       <a class="docs-side-link" href="#operations">Operational notes</a>
     </div>
   </nav>
@@ -945,11 +947,12 @@ ardvark verify https://example.com/.well-known/ai-catalog.json">copy</button>
 
     <section id="commands">
       <h2>Commands</h2>
-      <p class="section-sub-docs">Every command accepts the global flags <code>--config &lt;path&gt;</code> (default: <code>./ardvark.json</code>, then <code>~/.config/ardvark/ardvark.json</code> on Unix/macOS or <code>%AppData%\ardvark\ardvark.json</code> on Windows) and <code>--color auto|always|never</code>. <code>crawl</code>, <code>probe</code>, every <code>seed</code> source, <code>verify</code>, <code>stats</code>, and <code>info</code> also accept <code>--json</code> — see <a href="#json-output">JSON output</a>.</p>
+      <p class="section-sub-docs">Every command accepts the global flags <code>--config &lt;path&gt;</code> (default: <code>./ardvark.json</code>, then <code>~/.config/ardvark/ardvark.json</code> on Unix/macOS or <code>%AppData%\ardvark\ardvark.json</code> on Windows) and <code>--color auto|always|never</code>. <code>crawl</code>, <code>work</code>, <code>probe</code>, every <code>seed</code> source, <code>verify</code>, <code>stats</code>, and <code>info</code> also accept <code>--json</code> — see <a href="#json-output">JSON output</a>.</p>
 
       <article id="cmd-crawl">
         <h3>crawl</h3>
         <p>Seeds the persistent frontier from the given URLs and/or bare domains (and/or a <code>--list</code> file), then runs the crawler until the frontier is empty. Pending work from prior runs is resumed automatically. Spidering depth and page budget come from <code>crawler.maxDepth</code> and <code>crawler.maxPagesPerDomain</code>; pace and politeness from <code>crawler.concurrency</code>, <code>crawler.perHostRequestsPerSecond</code>, and <code>crawler.respectRobotsTxt</code> (see <a href="#configuration">Configuration</a>).</p>
+        <p>With a worker fleet configured (<code>crawler.worker.count</code> &gt; 1), this process seeds every shard but only dequeues its own (<code>crawler.worker.index</code>), so run <a href="#cmd-work"><code>ardvark work</code></a> for the other worker indices to drain them — see <a href="#distributed">Distributed crawling</a>.</p>
         <pre class="docs-synopsis">ardvark crawl [url|domain]... [flags]</pre>
         <table class="docs-flags">
           <thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
@@ -969,6 +972,20 @@ ardvark verify https://example.com/.well-known/ai-catalog.json">copy</button>
 <span class="c-m">  miss</span>  static.acme.example    robots_agentmap  no Agentmap directive
 <span class="c-m">run complete: 12 pages fetched · 3 hosts probed · 2 catalogs found · 2 valid · 0 errors</span></pre>
         </div>
+      </article>
+
+      <article id="cmd-work">
+        <h3>work</h3>
+        <p>Drains the shared frontier with the crawl engine <em>without seeding it</em> — the worker half of a <a href="#distributed">distributed crawl</a>. Several <code>work</code> processes can point at the same MySQL/Postgres database, each taking a disjoint <code>--worker</code> share of hosts so they crawl cooperatively instead of duplicating each other's requests. Like <code>crawl</code>, it waits for the whole shared frontier to drain before exiting; an empty frontier is a friendly no-op, not an error (seed it first with <code>ardvark seed</code> or <code>ardvark crawl</code>). SQLite is single-process, so running more than one <code>work</code> process against a SQLite database is not supported.</p>
+        <pre class="docs-synopsis">ardvark work [flags]</pre>
+        <table class="docs-flags">
+          <thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>--worker string</code></td><td>this process's share of the frontier as <code>i/n</code> — 0-based index / total worker count (e.g. <code>2/4</code>), overriding config <code>crawler.worker</code></td></tr>
+            <tr><td><code>--force</code></td><td>bypass the host_probe freshness window (<code>crawler.refreshAfterHours</code>) and re-probe hosts probed recently</td></tr>
+            <tr><td><code>--json</code></td><td>emit the run summary as JSON instead of live rows</td></tr>
+          </tbody>
+        </table>
       </article>
 
       <article id="cmd-probe">
@@ -1120,6 +1137,9 @@ log
           <tr><td><code>crawler.userAgent</code></td><td><code>ardvark/0.1 (+https://github.com/helgesverre/ardvark)</code></td><td>User-Agent header sent on every request</td></tr>
           <tr><td><code>crawler.respectRobotsTxt</code></td><td><code>true</code></td><td>Honor robots.txt disallow rules</td></tr>
           <tr><td><code>crawler.refreshAfterHours</code></td><td><code>168</code></td><td>Skip hosts probed within this window (see <code>--force</code>)</td></tr>
+          <tr><td><code>crawler.leaseSeconds</code></td><td><code>600</code></td><td>How long a dequeued frontier item stays leased before a peer may reclaim it; only matters for <a href="#distributed">distributed crawling</a>. Must outlast the slowest handler.</td></tr>
+          <tr><td><code>crawler.worker.index</code></td><td><code>0</code></td><td>This process's 0-based position among <code>crawler.worker.count</code> cooperating workers; must be less than <code>count</code>. See <a href="#distributed">Distributed crawling</a>.</td></tr>
+          <tr><td><code>crawler.worker.count</code></td><td><code>1</code></td><td>Total cooperating workers sharing the frontier; <code>1</code> means no sharding (single-process)</td></tr>
           <tr><td><code>ard.maxCatalogDepth</code></td><td><code>3</code></td><td>Nested-catalog recursion bound</td></tr>
           <tr><td><code>ard.fetchArtifacts</code></td><td><code>true</code></td><td>Fetch the agent/MCP-server cards entries point at</td></tr>
           <tr><td><code>registry.harvest</code></td><td><code>true</code></td><td>Harvest registries discovered via catalog entries</td></tr>
@@ -1248,6 +1268,62 @@ log
 }'>copy</button>
       </div>
       <p><code>ardvark migrate</code> creates or updates the schema for whichever driver is configured; <code>crawl</code>, <code>verify</code>, and every other command that touches the database run the same migration on open. The schema is identical across all three drivers — see <a href="#querying">Querying the dataset</a> for working with it directly.</p>
+    </section>
+
+    <section id="distributed">
+      <h2>Distributed crawling</h2>
+      <p>One frontier, many workers. When the frontier lives in MySQL or Postgres, several <code>ardvark</code> processes — on one machine or many — can drain it cooperatively. Each worker owns a fixed share of hosts, so exactly one worker ever talks to a given host: per-host politeness (<code>crawler.perHostRequestsPerSecond</code>, robots.txt) stays correct with no cross-process coordination. SQLite is single-process only — distributed crawling needs a shared MySQL/Postgres database.</p>
+      <p>Hosts are partitioned by hash across <code>crawler.worker.count</code> shards; each worker claims the shard matching its <code>crawler.worker.index</code> (0-based, less than <code>count</code>). Configure the count once in the shared <code>ardvark.json</code> and give each process its index with the <code>--worker i/n</code> flag. Seed the frontier, then run one worker per shard:</p>
+      <div class="docs-code" data-copy='{
+  "storage": {
+    "driver": "postgres",
+    "dsn": "postgres://user:pass@db:5432/ardvark?sslmode=disable"
+  },
+  "crawler": { "worker": { "count": 4 } }
+}'>
+        <pre><span class="c-m">// shared ardvark.json — every worker points at the same database</span>
+{
+  "storage": {
+    "driver": "postgres",
+    "dsn": "postgres://user:pass@db:5432/ardvark?sslmode=disable"
+  },
+  "crawler": { "worker": { "count": 4 } }
+}</pre>
+        <button class="copy" data-copy='{
+  "storage": {
+    "driver": "postgres",
+    "dsn": "postgres://user:pass@db:5432/ardvark?sslmode=disable"
+  },
+  "crawler": { "worker": { "count": 4 } }
+}'>copy</button>
+      </div>
+      <div class="docs-code" data-copy="ardvark seed ct --count 5000
+ardvark work --worker 0/4
+ardvark work --worker 1/4
+ardvark work --worker 2/4
+ardvark work --worker 3/4">
+        <pre><span class="c-m"># seed the shared frontier once...</span>
+ardvark seed ct --count 5000
+<span class="c-m"># ...then start one worker per shard (each on its own machine or core)</span>
+ardvark work --worker 0/4
+ardvark work --worker 1/4
+ardvark work --worker 2/4
+ardvark work --worker 3/4</pre>
+        <button class="copy" data-copy="ardvark seed ct --count 5000
+ardvark work --worker 0/4
+ardvark work --worker 1/4
+ardvark work --worker 2/4
+ardvark work --worker 3/4">copy</button>
+      </div>
+      <p>The <code>--worker i/n</code> flag overrides <code>crawler.worker</code> from config, so a single shared config plus a per-process flag is enough; you don't need a different config file per worker. A seeded <a href="#cmd-crawl"><code>ardvark crawl</code></a> can stand in for one of the workers — it seeds every shard but only dequeues its own — so a common pattern is one <code>crawl</code> that seeds and works shard 0, paired with <code>work</code> peers for the rest.</p>
+      <h4 id="distributed-leases">Leases and reclaim</h4>
+      <p>When a worker dequeues an item it takes a lease on it for <code>crawler.leaseSeconds</code> (default 600s). A worker that dies mid-item can't requeue the item itself, so once the lease expires a peer reclaims it back to pending and finishes it. The default outlasts the slowest legitimate handler (registry harvest pagination plus retry backoff), so a live worker's item is never reclaimed out from under it — raise <code>crawler.leaseSeconds</code> if you tune handlers to run longer, don't lower it below the slowest one.</p>
+      <p>Termination is global: each worker keeps polling until the <em>whole</em> shared frontier is empty, not just its own shard, then exits. Per-domain page budgets (<code>crawler.maxPagesPerDomain</code>) are enforced in the database, so they hold across the fleet rather than per process.</p>
+      <h4 id="distributed-dead-worker">Dead workers and clocks</h4>
+      <ul>
+        <li><b>Sharding is static</b> — a host belongs to a shard, and a shard belongs to a fixed <code>(index, count)</code> partition. If a worker dies permanently, its shard's not-yet-started items are never leased, so lease-expiry reclaim never touches them, and its peers keep polling forever because the global pending count stays non-zero. Recovery is operational, not automatic: restart the missing worker with the <em>same</em> <code>--worker index/count</code>, or restart the whole fleet with a new <code>count</code>.</li>
+        <li><b>Keep clocks in sync</b> — lease expiry compares timestamps written by different machines, so run the workers' hosts under NTP. A badly skewed clock can reclaim a live worker's items early or leave a dead worker's items stranded too long.</li>
+      </ul>
     </section>
 
     <section id="operations">

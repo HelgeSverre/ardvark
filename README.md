@@ -114,7 +114,8 @@ ardvark runs with sensible defaults and no config file. To change anything, drop
     "userAgent": "ardvark/0.1 (+https://github.com/helgesverre/ardvark)",
     "respectRobotsTxt": true,
     "refreshAfterHours": 168,
-    "leaseSeconds": 600
+    "leaseSeconds": 600,
+    "worker": { "index": 0, "count": 1 }
   },
   "ard":      { "maxCatalogDepth": 3, "fetchArtifacts": true },
   "registry": { "harvest": true, "maxReferralDepth": 2, "pageLimit": 20 },
@@ -148,7 +149,9 @@ ardvark runs with sensible defaults and no config file. To change anything, drop
 | `crawler.maxPagesPerDomain` | `50` | Page budget per domain |
 | `crawler.perHostRequestsPerSecond` | `1` | Politeness rate limit |
 | `crawler.refreshAfterHours` | `168` | Skip hosts probed within this window |
-| `crawler.leaseSeconds` | `600` | How long a claimed work item can stay in progress before it's treated as stalled and reclaimed (must outlast the slowest handler; see below) |
+| `crawler.leaseSeconds` | `600` | How long a claimed work item can stay in progress before it's treated as stalled and reclaimed (must outlast the slowest handler; distributed crawling only) |
+| `crawler.worker.index` | `0` | This process's 0-based shard among `crawler.worker.count` cooperating workers (must be `< count`); overridden by `--worker i/n` |
+| `crawler.worker.count` | `1` | Total workers sharing one mysql/postgres frontier; `1` disables sharding (single-process) |
 | `ard.maxCatalogDepth` | `3` | Nested-catalog recursion bound |
 | `registry.maxReferralDepth` | `2` | Registry referral-following bound |
 | `seed.crtsh.count` | `1000` | Default `seed crtsh` domain count (own key, not shared with `seed.ct.entryCount`) |

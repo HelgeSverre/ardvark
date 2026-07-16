@@ -6,6 +6,38 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Distributed crawling** — several `ardvark work` processes can share one
+  MySQL/Postgres database and drain a single frontier cooperatively. Hosts are
+  partitioned across workers by hash (`crawler.worker.index`/`crawler.worker.count`
+  or the `--worker i/n` flag), so exactly one worker ever talks to a given host —
+  keeping per-host politeness correct with no cross-process coordination. The
+  frontier now leases in-flight items (`crawler.leaseSeconds`, default 600s); a
+  worker that dies has its items reclaimed by peers after the lease expires.
+  Termination is global — a worker exits only when the whole shared frontier is
+  empty — and per-domain page budgets are enforced in the database. SQLite
+  remains single-process only.
+- **`ardvark work [--worker i/n] [--force] [--json]`** — drains the shared
+  frontier without seeding it, exiting cleanly with a friendly note when the
+  frontier is empty. Pair it with a seeded `ardvark crawl` (or other `work`
+  peers) when a worker fleet is configured.
+- **Config keys** — `crawler.leaseSeconds` (600), `crawler.worker.index` (0),
+  and `crawler.worker.count` (1); `index` must be less than `count`, validated
+  at config load.
+- **`tools/smoketest/`** — a Docker-based multi-worker test harness for
+  exercising distributed crawling end-to-end.
+
+### Changed
+
+- **Work-item provenance is persisted** — nested-catalog, artifact, and
+  registry attribution is now stored in the frontier, so crawls resume fully
+  across restarts instead of losing attribution that only lived in process
+  memory.
+- **Recognized entry media types** — the crawler now matches catalog and
+  registry entry media types by semantic kind rather than exact string suffix,
+  via a dedicated internal media-type parsing package.
+
 ## [0.3.0] - 2026-07-16
 
 ### Added
