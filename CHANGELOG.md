@@ -6,6 +6,67 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`ardvark verify --strict`** — validates against the exact published spec
+  schema, with format assertions (`uri`, `date-time`, …) enforced as errors.
+  The default remains ardvark's lenient verification, which accepts a few
+  deliberate deviations seen in real-world catalogs; every deviation is now
+  documented in `internal/ard/schema/PROVENANCE.md`.
+- **Verbatim schema vendoring** — `ai-catalog.schema.json` is restored
+  byte-identical to the pinned upstream spec commit (the previous copy carried
+  an undocumented local edit), and the sibling spec files `ard.cddl` and
+  `ard.openapi.yaml` are now vendored alongside it. All leniency (legacy
+  `urn:ai` NID, URN prefix casing, IDN publishers, explicit `data: null`) is
+  implemented in code instead of schema edits. A schema↔types drift test turns
+  a re-vendored schema change into a failing test, and `just sync-schema`
+  re-fetches all three files from upstream and shows the diff.
+
+### Changed
+
+- **Format assertions are enforced** — malformed `format: uri` / `date-time`
+  values (e.g. a garbage `updatedAt`) previously passed verification silently;
+  they now surface as warnings by default and as errors under `--strict`.
+- **`representativeQueries` count no longer hard-fails by default** — the
+  schema's `minItems: 2` made a one-query catalog `invalid`, contradicting the
+  design's warning-level `queries.count` check. Lenient mode now rolls this up
+  to `valid_with_warnings`; `--strict` keeps the schema's hard error.
+- **More specific schema failure messages** — schema validation now reports the
+  actual leaf error (e.g. the violated pattern) instead of an occasional
+  generic "validation failed" for `$ref`-nested failures.
+
+### Fixed
+
+- **Crash-resume no longer drops follow-on work** — killing a run between
+  saving a catalog and completing its frontier item permanently lost the
+  catalog's nested-catalog, registry-harvest, and artifact fetches on resume;
+  follow-ups are now re-enqueued idempotently on the content-unchanged path.
+- **Interrupted host probes recover all catalog hits** — probe hits are
+  recorded one row per discovered catalog URL (not per method), so a crash
+  midway through a multi-URL `Agentmap:` fan-out re-enqueues the remainder on
+  resume instead of silently dropping it. A host whose probe hits but whose
+  catalog fetch later fails now also emits its probe event.
+- **Verification checks attach to the right entry** — with duplicate
+  identifiers in one catalog, all per-entry check rows previously piled onto
+  the last duplicate, leaving earlier ones with none.
+- **robots.txt 429 is no longer cached as "allow everything"** — a rate-limited
+  robots.txt fetch was treated as "no robots.txt exists" for the client's
+  lifetime; 429 is now a transient error, while 4xx unavailability keeps its
+  RFC 9309 allow semantics.
+- **Seeders deliver the requested count** — `seed tranco` and `seed ct`
+  computed budgets from raw rows before sanitization/dedup and silently
+  returned fewer than `--count` domains.
+- **MCP server no longer leaks a file handle per tool call** — the JSONL event
+  log is now closed when each operation completes.
+
+### Upgrading
+
+- Default verdicts changed with the lenient rules above: catalogs previously
+  `invalid` only for a `representativeQueries` count, and catalogs with
+  malformed `uri`/`date-time` fields, now verify as `valid_with_warnings`.
+  Run `ardvark verify --stored` to re-verify catalogs already in your
+  database under the new pipeline.
+
 ## [0.4.1] - 2026-07-16
 
 ### Fixed
