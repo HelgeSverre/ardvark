@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -124,6 +125,21 @@ func (e *Engine) handleHostProbe(ctx context.Context, item store.FrontierItem) e
 			e.logger.Warn("crawler: recently-probed check failed", "host", item.Host, "error", err)
 		} else if recently {
 			e.logger.Debug("crawler: skipping recently-probed host", "host", item.Host)
+
+			// BUG 2 fix: a recently-recorded hit doesn't prove THIS item's
+			// own catalog_fetch fan-out ever completed. A prior process may
+			// have crashed after store.RecordProbe durably persisted a hit
+			// (which is what RecentlyProbed keys on) but before the
+			// catalog_fetch enqueue loop below ran for it (or ran for all of
+			// it: robots_agentmap can discover more than one catalog URL per
+			// probe attempt, so a crash partway through that loop can lose
+			// some but not all of them), permanently losing that catalog on
+			// every future resume, since this branch used to return
+			// unconditionally. Re-deriving and re-enqueuing every durably
+			// recorded hit here is idempotent (see dedupKey's doc comment),
+			// so it can only ensure the follow-up exists, never duplicate
+			// it.
+			e.reenqueueKnownCatalogHits(item.Host)
 			return nil
 		}
 	}
@@ -136,25 +152,43 @@ func (e *Engine) handleHostProbe(ctx context.Context, item store.FrontierItem) e
 	results := probe.Probe(ctx, e.fetch, item.Host)
 	hadHit := false
 	for _, r := range results {
-		if err := e.store.RecordProbe(&store.Probe{
-			DomainID:    domain.ID,
-			Method:      r.Method,
-			URL:         r.URL,
-			HTTPStatus:  r.HTTPStatus,
-			ContentType: r.ContentType,
-			Outcome:     r.Outcome,
-			ErrorDetail: r.ErrorDetail,
-			ProbedAt:    time.Now(),
-		}); err != nil {
-			return err
-		}
-
 		if r.Outcome != probe.OutcomeHit {
+			if err := e.store.RecordProbe(&store.Probe{
+				DomainID:    domain.ID,
+				Method:      r.Method,
+				URL:         r.URL,
+				HTTPStatus:  r.HTTPStatus,
+				ContentType: r.ContentType,
+				Outcome:     r.Outcome,
+				ErrorDetail: r.ErrorDetail,
+				ProbedAt:    time.Now(),
+			}); err != nil {
+				return err
+			}
 			e.emit(ProbeEvent{Host: item.Host, Method: r.Method, Outcome: r.Outcome, Detail: probeDetail(r)})
 			continue
 		}
+
 		hadHit = true
+		// One Probe row per discovered catalog URL, not one per method/
+		// result: recording (and enqueuing) per-URL is what makes a crash
+		// mid-fan-out recoverable for robots_agentmap too, not just
+		// well_known's inherently-single-URL case (see BUG 2 /
+		// reenqueueKnownCatalogHits). Each row's URL is itself a genuine
+		// catalog document URL, so "outcome = hit" alone identifies every
+		// recoverable follow-up for this host, uniformly across methods.
 		for _, catalogURL := range r.CatalogURLs {
+			if err := e.store.RecordProbe(&store.Probe{
+				DomainID:    domain.ID,
+				Method:      r.Method,
+				URL:         catalogURL,
+				HTTPStatus:  r.HTTPStatus,
+				ContentType: r.ContentType,
+				Outcome:     r.Outcome,
+				ProbedAt:    time.Now(),
+			}); err != nil {
+				return err
+			}
 			e.enqueue(store.KindCatalogFetch, catalogURL, item.Host, 0, provenance{ProbeMethod: r.Method})
 		}
 	}
@@ -169,6 +203,40 @@ func (e *Engine) handleHostProbe(ctx context.Context, item store.FrontierItem) e
 	return nil
 }
 
+// reenqueueKnownCatalogHits re-derives and idempotently re-enqueues
+// catalog_fetch for every durably recorded probe hit on host, closing the
+// gap documented at handleHostProbe's freshness-skip branch (BUG 2).
+//
+// This works uniformly across both probe methods because handleHostProbe
+// records one Probe row per discovered catalog URL (not one per method
+// attempt): every row with Outcome = hit therefore IS itself a catalog
+// document URL, whether it came from well_known's single URL or one of
+// robots_agentmap's possibly-several Agentmap directives. So "every hit row
+// for this domain" is exactly "every catalog_fetch this host_probe ever
+// durably promised", and re-enqueuing all of them recovers a crash at any
+// point in the original fan-out loop, not just after its first entry.
+// Anything discovered but not yet durably recorded before the crash is, by
+// construction, not recoverable here — it was never promised — and will be
+// rediscovered on the next non-skipped probe (window expiry or --force).
+func (e *Engine) reenqueueKnownCatalogHits(host string) {
+	domain, err := e.store.DomainByHost(host)
+	if err != nil {
+		e.logger.Warn("crawler: failed to look up domain for known-hit re-enqueue", "host", host, "error", err)
+		return
+	}
+	var hits []store.Probe
+	if err := e.store.DB.
+		Where("domain_id = ? AND outcome = ?", domain.ID, probe.OutcomeHit).
+		Order("id ASC").
+		Find(&hits).Error; err != nil {
+		e.logger.Warn("crawler: failed to look up known hits for re-enqueue", "host", host, "error", err)
+		return
+	}
+	for _, hit := range hits {
+		e.enqueue(store.KindCatalogFetch, hit.URL, host, 0, provenance{ProbeMethod: hit.Method})
+	}
+}
+
 // -- catalog_fetch --------------------------------------------------------
 
 // handleCatalogFetch fetches and verifies an ai-catalog.json document, and
@@ -181,12 +249,34 @@ func (e *Engine) handleHostProbe(ctx context.Context, item store.FrontierItem) e
 func (e *Engine) handleCatalogFetch(ctx context.Context, item store.FrontierItem) error {
 	fetched, err := e.fetch.GetWellKnown(ctx, item.URL)
 	if err != nil {
+		// LOW fix: a host_probe hit that leads to a catalog_fetch which then
+		// permanently fails (e.g. a 404 on a document that briefly existed)
+		// otherwise emits zero ProbeEvents for that host, breaking
+		// ProbeEvent's documented "one row per host" contract. Only
+		// non-transient failures are reported here: a transient failure will
+		// be retried (see fetch.Transient/Options.MaxAttempts), so emitting
+		// on every attempt would double- or triple-report the same host.
+		if !fetch.Transient(err) {
+			e.emit(ProbeEvent{Host: item.Host, Method: item.ProbeMethod, Outcome: probe.OutcomeError, Detail: fetchErrorDetail(err)})
+		}
 		return err
 	}
 
 	transportChecks := ard.TransportChecks(fetched.ContentType, fetched.Body, e.cfg.Crawler.MaxBodyBytes)
 
 	return e.processCatalog(ctx, fetched.Body, fetched.SHA256, item.Host, item.URL, item.ParentCatalogID, item.ProbeMethod, item.Depth, transportChecks)
+}
+
+// fetchErrorDetail summarizes a catalog_fetch failure for ProbeEvent.Detail:
+// the HTTP status if one was received, or the error text otherwise. Mirrors
+// probeDetail's precedence, minus the ErrorDetail field host_probe results
+// carry that a bare fetch error does not.
+func fetchErrorDetail(err error) string {
+	var fe *fetch.Error
+	if errors.As(err, &fe) && fe.Status > 0 {
+		return strconv.Itoa(fe.Status)
+	}
+	return err.Error()
 }
 
 // processCatalog verifies raw catalog bytes, persists the catalog, its
@@ -221,6 +311,33 @@ func (e *Engine) processCatalog(ctx context.Context, raw []byte, contentHash, ho
 				Verdict: prior.VerificationStatus,
 				Detail:  "unchanged",
 			})
+
+			// BUG 1 fix: "unchanged" only means the SAVE is redundant, not
+			// that this item's follow-on work was ever enqueued. A prior
+			// process may have crashed after store.SaveCatalog committed but
+			// before enqueueEntryFollowups ran (or before this branch even
+			// existed to run it), permanently losing that catalog's nested
+			// fetches/harvests/artifacts on every future resume, since this
+			// short-circuit used to return before fan-out. Re-running the
+			// fan-out here is always safe: every enqueue routes through
+			// frontier.Enqueue, which re-activates an existing dedup key
+			// instead of duplicating it (see dedupKey's doc comment), so a
+			// follow-up that already completed is at worst harmlessly
+			// re-activated and redone, never duplicated.
+			if depth < e.maxCatalogDepth() {
+				if err := e.store.DB.Where("catalog_id = ?", prior.ID).Order("id ASC").Find(&prior.Entries).Error; err != nil {
+					e.logger.Warn("crawler: failed to load prior catalog entries for follow-up re-enqueue", "url", sourceURL, "error", err)
+					return nil
+				}
+				if len(prior.Entries) != len(parsed.Entries) {
+					// Should not happen (identical content hash implies
+					// identical entries), but a stale/foreign prior row must
+					// not be zipped against the wrong entries by index.
+					e.logger.Warn("crawler: prior catalog entry count mismatch, skipping follow-up re-enqueue", "url", sourceURL, "prior_entries", len(prior.Entries), "parsed_entries", len(parsed.Entries))
+					return nil
+				}
+				e.enqueueEntryFollowups(ctx, prior, parsed.Entries, host, sourceURL, depth)
+			}
 			return nil
 		}
 	}
@@ -397,13 +514,51 @@ func jsonOrEmpty(v any) string {
 // splitChecks partitions ard.Verify's flat check list into catalog-level
 // checks and per-entry checks (keyed by entry slice index), matching each
 // check's Subject against entry identifiers.
+//
+// BUG 3 / distribution invariant: a check's Subject is the entry's raw
+// identifier STRING (ard.Check has no entry-index field — see
+// ard.entrySubject/ard.schemaSubject, which resolve to identifier or
+// "catalog" and discard the index they had on hand), so when a catalog has
+// two or more entries sharing an identifier (itself an identifier.unique
+// violation, which the catalog will already be failing), Subject alone
+// cannot say which of the duplicate entries a given check belongs to. The
+// old code resolved Subject through a map[identifier]index built by
+// iterating entries in order, so the LAST entry with a given identifier
+// silently won every check for ALL of them — every earlier duplicate got
+// zero rows, not an approximation, none.
+//
+// This resolves it by evenly splitting all checks sharing identifier S
+// across S's occurrences, in contiguous chunks matching catalog order: the
+// first ceil(total/n) checks for S go to its first occurrence, the next
+// chunk to its second, and so on. This is EXACT when every duplicate entry
+// produces the same number of checks (the common case in practice: a
+// verbatim or near-verbatim copy-paste duplicate produces identical check
+// outcomes), and a documented best-effort approximation — not a guarantee —
+// when duplicates differ enough to produce different check counts each
+// (schema checks in particular arrive in JSON-Schema's own, not
+// necessarily catalog-order, sequence — see validateSchema). A fully exact
+// resolution needs an entry-index field on ard.Check, which is out of
+// scope here (internal/ard is not owned by this fix). Either way, this is
+// strictly better than the prior last-write-wins behavior, which is not an
+// approximation trade-off, just data loss.
 func splitChecks(checks []ard.Check, entries []ard.Entry) ([]*store.VerificationCheck, map[int][]*store.VerificationCheck) {
-	idxByIdentifier := make(map[string]int, len(entries))
+	idxsByIdentifier := make(map[string][]int, len(entries))
 	for i, en := range entries {
 		if en.Identifier != "" {
-			idxByIdentifier[en.Identifier] = i
+			idxsByIdentifier[en.Identifier] = append(idxsByIdentifier[en.Identifier], i)
 		}
 	}
+
+	totalByIdentifier := make(map[string]int, len(idxsByIdentifier))
+	for _, c := range checks {
+		if c.Subject != "" && c.Subject != ard.SubjectCatalog {
+			if _, ok := idxsByIdentifier[c.Subject]; ok {
+				totalByIdentifier[c.Subject]++
+			}
+		}
+	}
+
+	seenByIdentifier := make(map[string]int, len(idxsByIdentifier))
 
 	var catalogChecks []*store.VerificationCheck
 	entryChecks := make(map[int][]*store.VerificationCheck)
@@ -417,8 +572,11 @@ func splitChecks(checks []ard.Check, entries []ard.Entry) ([]*store.Verification
 			SpecRef:   c.SpecRef,
 			CheckedAt: time.Now(),
 		}
-		if c.Subject != "" && c.Subject != "catalog" {
-			if idx, ok := idxByIdentifier[c.Subject]; ok {
+		if c.Subject != "" && c.Subject != ard.SubjectCatalog {
+			if idxs, ok := idxsByIdentifier[c.Subject]; ok {
+				k := seenByIdentifier[c.Subject]
+				seenByIdentifier[c.Subject]++
+				idx := idxs[checkBucket(k, totalByIdentifier[c.Subject], len(idxs))]
 				entryChecks[idx] = append(entryChecks[idx], row)
 				continue
 			}
@@ -427,6 +585,23 @@ func splitChecks(checks []ard.Check, entries []ard.Entry) ([]*store.Verification
 	}
 
 	return catalogChecks, entryChecks
+}
+
+// checkBucket maps the k-th (0-based) check for a shared identifier, out of
+// total such checks, to one of that identifier's n duplicate-entry
+// occurrences: k*n/total, clamped to n-1. This splits [0,total) into n
+// contiguous, near-equal-sized chunks in occurrence order. For the common
+// non-duplicate case (n == 1) it always returns 0, exactly matching the
+// prior single-index behavior.
+func checkBucket(k, total, n int) int {
+	if n <= 1 || total <= 0 {
+		return 0
+	}
+	idx := k * n / total
+	if idx >= n {
+		idx = n - 1
+	}
+	return idx
 }
 
 // -- artifact_fetch -------------------------------------------------------

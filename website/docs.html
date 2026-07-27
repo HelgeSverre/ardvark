@@ -482,6 +482,7 @@ ardvark export --format jsonl --out resources.jsonl">copy</button>
     <section id="verification">
       <h2>Verification &amp; verdicts</h2>
       <p>Every fetched catalog is run through the same pipeline <code>ardvark verify</code> exposes standalone: official JSON Schema validation (Draft 2020-12) against the vendored ARD spec schema, followed by seven semantic checks the schema can't express. Each check is recorded pass/fail with a message — a report card per catalog, stored in <code>verification_checks</code>.</p>
+      <p>By default verification is deliberately lenient toward catalogs seen in the wild: the legacy <code>urn:ai:</code> NID, uppercase URN prefixes, Unicode-form IDN publishers, and an explicit <code>data: null</code> are accepted, while malformed <code>uri</code>/<code>date-time</code> values and an out-of-range <code>representativeQueries</code> count downgrade to warnings. Every deviation is documented in the vendored schema's <code>PROVENANCE.md</code>. Pass <code>--strict</code> to validate against the exact published spec schema instead, with format assertions enforced as errors.</p>
       <p>The rolled-up verdict is one of:</p>
       <ul>
         <li><b>valid</b> — every check passed.</li>
@@ -502,13 +503,16 @@ ardvark export --format jsonl --out resources.jsonl">copy</button>
           <tr><td><code>entry.media_type</code></td><td>warning</td><td>The entry's <code>type</code> is a recognized ARD media type. The spec doesn't strictly enforce this, so an unrecognized type only warns.</td></tr>
         </tbody>
       </table>
-      <p>Run it standalone against anything, local or remote:</p>
+      <p>Run it standalone against anything, local or remote — add <code>--strict</code> for exact spec conformance:</p>
       <div class="docs-code" data-copy="ardvark verify ./my-catalog.json
-ardvark verify https://example.com/.well-known/ai-catalog.json">
+ardvark verify https://example.com/.well-known/ai-catalog.json
+ardvark verify --strict ./my-catalog.json">
         <pre>ardvark verify ./my-catalog.json
-ardvark verify https://example.com/.well-known/ai-catalog.json</pre>
+ardvark verify https://example.com/.well-known/ai-catalog.json
+ardvark verify --strict ./my-catalog.json</pre>
         <button class="copy" data-copy="ardvark verify ./my-catalog.json
-ardvark verify https://example.com/.well-known/ai-catalog.json">copy</button>
+ardvark verify https://example.com/.well-known/ai-catalog.json
+ardvark verify --strict ./my-catalog.json">copy</button>
       </div>
       <h4 id="verification-failure">What failure looks like</h4>
       <p>A failing report renders <code>✗</code> for failed error-severity checks and <code>!</code> for failed warnings. Here's a catalog whose entry identifier isn't a URN and whose media type is made up — note that semantic checks on a field the schema already rejected are skipped rather than double-reported:</p>
@@ -516,7 +520,7 @@ ardvark verify https://example.com/.well-known/ai-catalog.json">copy</button>
         <div class="term-bar"><span></span><span></span><span></span><span class="term-title">ardvark verify — invalid</span></div>
         <pre><span class="c-p">$</span> ardvark verify ./broken.json
 <b>./broken.json</b>
-  <span class="c-err">✗</span> schema.validation          <span class="c-m">support-agent — at /entries/0/identifier: validation failed</span>
+  <span class="c-err">✗</span> schema.validation          <span class="c-m">support-agent — at /entries/0/identifier: 'support-agent' does not match pattern '^urn:air:[a-zA-Z0-9.-]+(:[a-zA-Z0-9._-]+)+$'</span>
   <span class="c-ok">✓</span> identifier.unique          <span class="c-m">all entry identifiers are unique</span>
   <span class="c-warn">!</span> queries.count              <span class="c-m">support-agent — 0 representativeQueries present (recommended: 2-5)</span>
   <span class="c-warn">!</span> entry.media_type           <span class="c-m">support-agent — type "application/x-agent" is not a recognized ARD media type (spec does not enforce this strictly)</span>
@@ -697,13 +701,13 @@ ardvark verify https://example.com/.well-known/ai-catalog.json">copy</button>
         </li>
       </ol>
       <h4 id="publishing-verify">Verify before you publish</h4>
-      <p>Run the file through <code>ardvark verify</code> locally, and again against the live URL after deploying. It exits 1 on an <code>invalid</code> verdict, so it works as a CI gate:</p>
-      <div class="docs-code" data-copy="ardvark verify ./ai-catalog.json
-ardvark verify https://example.com/.well-known/ai-catalog.json">
-        <pre>ardvark verify ./ai-catalog.json
-ardvark verify https://example.com/.well-known/ai-catalog.json</pre>
-        <button class="copy" data-copy="ardvark verify ./ai-catalog.json
-ardvark verify https://example.com/.well-known/ai-catalog.json">copy</button>
+      <p>Run the file through <code>ardvark verify</code> locally, and again against the live URL after deploying. It exits 1 on an <code>invalid</code> verdict, so it works as a CI gate. As a publisher, use <code>--strict</code>: ardvark's default is lenient about a few real-world quirks, but other ARD validators won't be — strict mode holds your catalog to the exact published spec schema:</p>
+      <div class="docs-code" data-copy="ardvark verify --strict ./ai-catalog.json
+ardvark verify --strict https://example.com/.well-known/ai-catalog.json">
+        <pre>ardvark verify --strict ./ai-catalog.json
+ardvark verify --strict https://example.com/.well-known/ai-catalog.json</pre>
+        <button class="copy" data-copy="ardvark verify --strict ./ai-catalog.json
+ardvark verify --strict https://example.com/.well-known/ai-catalog.json">copy</button>
       </div>
       <p>The failures seen most often on real published catalogs:</p>
       <ul>

@@ -11,14 +11,19 @@ import (
 )
 
 var verifyStored bool
+var verifyStrict bool
 
 var verifyCmd = &cobra.Command{
 	Use:   "verify <path|url>",
 	Short: "Verify a catalog document (local file, remote URL, or all stored catalogs) against the ARD spec",
 	Long: "verify runs the ARD verification pipeline (JSON Schema + semantic checks) against a single " +
 		"local file or remote URL and prints the check report, exiting 1 if the verdict is invalid. " +
-		"With --stored, every catalog already in the database is re-verified instead (useful after a " +
-		"spec/schema update); the stored verdict and checks are updated in place.",
+		"By default this is ardvark's lenient verification, which accepts a few deliberate deviations " +
+		"from the published spec schema (documented in internal/ard/schema/PROVENANCE.md); --strict " +
+		"validates against the exact published spec schema instead, with format assertions (uri, " +
+		"date-time, ...) enforced as errors rather than warnings. With --stored, every catalog already " +
+		"in the database is re-verified instead (useful after a spec/schema update); the stored verdict " +
+		"and checks are updated in place.",
 	Args: func(cmd *cobra.Command, args []string) error {
 		if verifyStored {
 			return cobra.MaximumNArgs(0)(cmd, args)
@@ -30,6 +35,7 @@ var verifyCmd = &cobra.Command{
 
 func init() {
 	verifyCmd.Flags().BoolVar(&verifyStored, "stored", false, "re-verify every catalog stored in the database instead of a single document")
+	verifyCmd.Flags().BoolVar(&verifyStrict, "strict", false, "validate against the exact published spec schema, with format assertions as errors, instead of ardvark's default lenient verification")
 	addJSONFlag(verifyCmd)
 	rootCmd.AddCommand(verifyCmd)
 }
@@ -46,7 +52,11 @@ func runVerify(cmd *cobra.Command, args []string) error {
 // non-nil error (causing os.Exit(1) via Execute) when the verdict is
 // invalid — in JSON mode too.
 func runVerifyOne(cmd *cobra.Command, target string) error {
-	report, err := jsonout.VerifyTarget(cmd.Context(), target)
+	verifyFn := jsonout.VerifyTarget
+	if verifyStrict {
+		verifyFn = jsonout.VerifyTargetStrict
+	}
+	report, err := verifyFn(cmd.Context(), target)
 	if err != nil {
 		return err
 	}
@@ -95,7 +105,7 @@ func runVerifyStored(cmd *cobra.Command) error {
 		onReport = func(r jsonout.VerifyReport) { printReport(p, r) }
 	}
 
-	res, err := jsonout.VerifyStored(st, onReport)
+	res, err := jsonout.VerifyStored(st, verifyStrict, onReport)
 	if err != nil {
 		return err
 	}

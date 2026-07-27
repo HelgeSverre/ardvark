@@ -20,7 +20,7 @@ Publishers advertise their AI agents, MCP servers, and skills in an `ai-catalog.
 - **Domain harvesting** — crawl from seed URLs or URL lists, follow anchors to collect hosts, then probe each host once
 - **Every ARD discovery mechanism** — `/.well-known/ai-catalog.json`, `Agentmap:` directives in robots.txt, and `<link rel="ai-catalog">` tags
 - **Full catalog resolution** — recurses into nested catalogs, fetches referenced artifact documents (agent cards, MCP server cards), and harvests discovered registries via `POST /search`, including registry referrals
-- **Spec verification** — official JSON Schema plus seven semantic checks (URN grammar, value-or-reference exclusivity, query counts, …), each recorded pass/fail with a message
+- **Spec verification** — official JSON Schema plus seven semantic checks (URN grammar, value-or-reference exclusivity, query counts, …), each recorded pass/fail with a message; lenient by default toward real-world catalogs, with `verify --strict` for the exact published spec
 - **Bootstrap seeding** — fill the frontier from Certificate Transparency logs, crt.sh, the Tranco top list, GitHub code search, the MCP registry, curated awesome-lists, or Common Crawl domain ranks (`ardvark seed ct|crtsh|tranco|github|mcp|curated|commoncrawl`)
 - **Swappable storage** — SQLite by default; MySQL and Postgres via one config key; append-only JSONL event log alongside
 - **Agent-ready** — `--json` on `crawl`, `work`, `probe`, `seed`, `verify`, and `stats` for machine-readable results, plus an embedded stdio MCP server (`ardvark mcp`) exposing the same operations as tools
@@ -87,7 +87,7 @@ ardvark export --format jsonl --out resources.jsonl
 | `ardvark seed mcp [--count N] [--registry URL]` | Harvest domains from the official MCP server registry: each server's remote endpoint host plus a domain decoded from its reverse-DNS-style name. |
 | `ardvark seed curated [--count N] [--url U]...` | Extract candidate domains from curated awesome-lists (community MCP server lists by default), dropping hosting/badge/social infrastructure so only real product domains remain. Repeated `--url` replaces the default list set. |
 | `ardvark seed commoncrawl [--top N] [--offset M] [--graph ID]` | Queue the top N domains from the latest Common Crawl web-graph domain ranks (~121M ranked domains vs Tranco's 1M). Streams the gzipped ranks file and stops reading as soon as N domains are collected; `--offset` skips the first M ranks to sample deeper slices. |
-| `ardvark verify <path\|url>` | Verify one catalog — local file or remote URL — and print the check report. Exits 1 if invalid. `--stored` re-verifies everything in the database. |
+| `ardvark verify <path\|url>` | Verify one catalog — local file or remote URL — and print the check report. Exits 1 if invalid. `--strict` validates against the exact published spec schema (format assertions as errors); `--stored` re-verifies everything in the database. |
 | `ardvark export [--format jsonl\|csv] [--out file]` | Dump discovered resources with their verification status. |
 | `ardvark stats` | Summarize the dataset: hosts probed, catalogs by verdict, entries by type. |
 | `ardvark info` | Show installation metadata: version, resolved config path, database and log locations. Never opens the database. |

@@ -2,6 +2,7 @@ package crawler
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -17,6 +18,7 @@ import (
 	"github.com/helgesverre/ardvark/internal/config"
 	"github.com/helgesverre/ardvark/internal/fetch"
 	"github.com/helgesverre/ardvark/internal/frontier"
+	"github.com/helgesverre/ardvark/internal/probe"
 	"github.com/helgesverre/ardvark/internal/store"
 )
 
@@ -1623,5 +1625,415 @@ func TestFollowRegistryPointer_SavesRowAndEnqueues(t *testing.T) {
 	}
 	if it.Depth != 2 {
 		t.Errorf("Depth = %d, want 2", it.Depth)
+	}
+}
+
+// -- BUG 1: unchanged-content resume must still enqueue follow-ons ---------
+
+// TestHandleCatalogFetch_UnchangedContentStillEnqueuesFollowups is the
+// baseline: even when content-hash change detection skips the re-save
+// (TestHandleCatalogFetch_UnchangedContentSkipsResave), fetching the exact
+// same catalog twice must not enqueue its follow-on work twice. Re-enqueue
+// through the frontier is idempotent (an already-existing dedup key is
+// re-activated, not duplicated — see dedupKey's doc comment), so the
+// follow-on counts below must stay at exactly 1 after the second fetch, not
+// grow to 2.
+func TestHandleCatalogFetch_UnchangedContentStillEnqueuesFollowups(t *testing.T) {
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	body := strings.ReplaceAll(rootCatalogJSON(hostPlaceholder), hostPlaceholder, srv.URL)
+	mux.HandleFunc("/catalog2.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/ai-catalog+json")
+		w.Write([]byte(body))
+	})
+	mux.HandleFunc("/artifact1.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok":true}`))
+	})
+
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	host := strings.TrimPrefix(srv.URL, "http://")
+	item := store.FrontierItem{URL: srv.URL + "/catalog2.json", Host: host, Depth: 0}
+
+	if err := eng.handleCatalogFetch(context.Background(), item); err != nil {
+		t.Fatalf("handleCatalogFetch (1st): %v", err)
+	}
+	if err := eng.handleCatalogFetch(context.Background(), item); err != nil {
+		t.Fatalf("handleCatalogFetch (2nd, unchanged): %v", err)
+	}
+
+	var artifactFetchCount int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ?", store.KindArtifactFetch).Count(&artifactFetchCount)
+	if artifactFetchCount != 1 {
+		t.Errorf("expected exactly 1 artifact_fetch enqueued after re-fetching unchanged content, got %d", artifactFetchCount)
+	}
+	var nestedCatalogFetchCount int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ? AND url = ?", store.KindCatalogFetch, srv.URL+"/nested.json").Count(&nestedCatalogFetchCount)
+	if nestedCatalogFetchCount != 1 {
+		t.Errorf("expected exactly 1 nested catalog_fetch enqueued, got %d", nestedCatalogFetchCount)
+	}
+	var registryHarvestCount int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ?", store.KindRegistryHarvest).Count(&registryHarvestCount)
+	if registryHarvestCount != 1 {
+		t.Errorf("expected exactly 1 registry_harvest enqueued, got %d", registryHarvestCount)
+	}
+}
+
+// TestHandleCatalogFetch_ResumeAfterCrashBeforeFollowupsStillEnqueues is
+// BUG 1's core regression test: simulate a process that saved the catalog
+// (store.SaveCatalog committed) but crashed before enqueueEntryFollowups
+// ran, by calling the store save directly rather than going through
+// processCatalog. Re-processing the identical item (same content hash) on
+// resume must still enqueue the follow-on work — the content-hash
+// "unchanged, skip re-save" branch must not also skip the fan-out.
+func TestHandleCatalogFetch_ResumeAfterCrashBeforeFollowupsStillEnqueues(t *testing.T) {
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	body := strings.ReplaceAll(rootCatalogJSON(hostPlaceholder), hostPlaceholder, srv.URL)
+	mux.HandleFunc("/catalog2.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/ai-catalog+json")
+		w.Write([]byte(body))
+	})
+	mux.HandleFunc("/artifact1.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok":true}`))
+	})
+
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	host := strings.TrimPrefix(srv.URL, "http://")
+	sourceURL := srv.URL + "/catalog2.json"
+	item := store.FrontierItem{URL: sourceURL, Host: host, Depth: 0}
+
+	// Simulate "crashed after SaveCatalog, before enqueueEntryFollowups":
+	// persist the catalog+entries exactly like processCatalog would, but
+	// never call enqueueEntryFollowups.
+	domain, err := st.UpsertDomain(host, store.DiscoverySourceCatalogRef)
+	if err != nil {
+		t.Fatalf("UpsertDomain: %v", err)
+	}
+	var parsed ard.Catalog
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		t.Fatalf("unmarshal fixture: %v", err)
+	}
+	sum := fmt.Sprintf("%x", sha256Sum(body))
+	cat := &store.Catalog{
+		DomainID:    domain.ID,
+		SourceURL:   sourceURL,
+		SpecVersion: parsed.SpecVersion,
+		RawJSON:     store.LongText(body),
+		ContentHash: sum,
+		FetchedAt:   time.Now(),
+		Entries:     buildEntryRows(parsed.Entries),
+	}
+	if err := st.SaveCatalog(cat, nil, nil); err != nil {
+		t.Fatalf("simulate pre-crash SaveCatalog: %v", err)
+	}
+
+	// No follow-on work exists yet, matching the crash scenario.
+	var preCount int64
+	st.DB.Model(&store.FrontierItem{}).Count(&preCount)
+	if preCount != 0 {
+		t.Fatalf("expected no frontier items before resume, got %d", preCount)
+	}
+
+	// Resume: re-process the identical item. handleCatalogFetch re-fetches
+	// and re-verifies (content hash matches what's already saved), so the
+	// unchanged-content branch runs — and must still enqueue follow-ons.
+	if err := eng.handleCatalogFetch(context.Background(), item); err != nil {
+		t.Fatalf("handleCatalogFetch (resume): %v", err)
+	}
+
+	var catalogCount int64
+	st.DB.Model(&store.Catalog{}).Where("source_url = ?", sourceURL).Count(&catalogCount)
+	if catalogCount != 1 {
+		t.Errorf("expected the resume NOT to re-save the catalog (still unchanged), got %d catalog rows", catalogCount)
+	}
+
+	var artifactFetchCount int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ?", store.KindArtifactFetch).Count(&artifactFetchCount)
+	if artifactFetchCount != 1 {
+		t.Errorf("expected the crash-interrupted artifact_fetch to be enqueued on resume, got %d", artifactFetchCount)
+	}
+	var nestedCatalogFetchCount int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ? AND url = ?", store.KindCatalogFetch, srv.URL+"/nested.json").Count(&nestedCatalogFetchCount)
+	if nestedCatalogFetchCount != 1 {
+		t.Errorf("expected the crash-interrupted nested catalog_fetch to be enqueued on resume, got %d", nestedCatalogFetchCount)
+	}
+	var registryHarvestCount int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ?", store.KindRegistryHarvest).Count(&registryHarvestCount)
+	if registryHarvestCount != 1 {
+		t.Errorf("expected the crash-interrupted registry_harvest to be enqueued on resume, got %d", registryHarvestCount)
+	}
+}
+
+func sha256Sum(body string) [32]byte {
+	return sha256.Sum256([]byte(body))
+}
+
+// -- BUG 2: host_probe resume after crash must still enqueue remaining hits
+
+// TestHandleHostProbe_ResumeAfterCrashBeforeCatalogEnqueueStillEnqueues is
+// BUG 2's regression test: simulate a crash that recorded a well_known hit
+// probe (and bumped domains.last_probed_at, which is what the freshness
+// check keys on) but died before the catalog_fetch enqueue ran. A resumed
+// dequeue of the same host_probe item must still land the catalog_fetch,
+// rather than being silently skipped by the recently-probed freshness
+// check.
+func TestHandleHostProbe_ResumeAfterCrashBeforeCatalogEnqueueStillEnqueues(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/ai-catalog.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/ai-catalog+json")
+		w.Write([]byte(`{"specVersion":"1.0","host":{"displayName":"Test"},"entries":[]}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	host := strings.TrimPrefix(srv.URL, "http://")
+
+	eng, st := newTestEngine(t, testCrawlerConfig())
+
+	domain, err := st.UpsertDomain(host, store.DiscoverySourceSeed)
+	if err != nil {
+		t.Fatalf("UpsertDomain: %v", err)
+	}
+	wellKnownURL := "https://" + host + "/.well-known/ai-catalog.json"
+	if err := st.RecordProbe(&store.Probe{
+		DomainID: domain.ID,
+		Method:   probe.MethodWellKnown,
+		URL:      wellKnownURL,
+		Outcome:  probe.OutcomeHit,
+		ProbedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("simulate pre-crash RecordProbe: %v", err)
+	}
+
+	// No catalog_fetch enqueued yet, matching the crash scenario.
+	var preCount int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ?", store.KindCatalogFetch).Count(&preCount)
+	if preCount != 0 {
+		t.Fatalf("expected no catalog_fetch before resume, got %d", preCount)
+	}
+
+	if err := eng.handleHostProbe(context.Background(), store.FrontierItem{Host: host}); err != nil {
+		t.Fatalf("handleHostProbe (resume): %v", err)
+	}
+
+	var catalogFetchCount int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ? AND url = ?", store.KindCatalogFetch, wellKnownURL).Count(&catalogFetchCount)
+	if catalogFetchCount != 1 {
+		t.Errorf("expected the crash-interrupted catalog_fetch to be enqueued on resume, got %d", catalogFetchCount)
+	}
+}
+
+// TestHandleHostProbe_ResumeAfterCrashMidAgentmapFanoutStillEnqueuesAll is
+// BUG 2's harder regression test, targeting the specific gap a reviewer
+// flagged in the first fix attempt: unlike well_known (which can only ever
+// discover a single catalog URL), a robots_agentmap hit can discover
+// MULTIPLE Agentmap-directive catalog URLs in one probe attempt. A crash
+// partway through recording/enqueuing that fan-out must not permanently
+// lose the ones recorded before the crash, on every future resume within
+// the freshness window. Simulates: both Agentmap catalog URLs already
+// durably recorded as probe hits (as handleHostProbe now records one row
+// per catalog URL, not one per method — see its doc comment), but the
+// crash happened before either catalog_fetch was enqueued. This could never
+// pass against the old reenqueueKnownWellKnownHit, which only ever looked
+// at method = well_known rows and so silently dropped every
+// robots_agentmap hit on resume.
+func TestHandleHostProbe_ResumeAfterCrashMidAgentmapFanoutStillEnqueuesAll(t *testing.T) {
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	host := "agentmap-fanout.example"
+
+	domain, err := st.UpsertDomain(host, store.DiscoverySourceSeed)
+	if err != nil {
+		t.Fatalf("UpsertDomain: %v", err)
+	}
+
+	agentmapURL1 := "https://" + host + "/catalogs/a.json"
+	agentmapURL2 := "https://" + host + "/catalogs/b.json"
+	for _, u := range []string{agentmapURL1, agentmapURL2} {
+		if err := st.RecordProbe(&store.Probe{
+			DomainID: domain.ID,
+			Method:   probe.MethodRobotsAgentmap,
+			URL:      u,
+			Outcome:  probe.OutcomeHit,
+			ProbedAt: time.Now(),
+		}); err != nil {
+			t.Fatalf("simulate pre-crash RecordProbe: %v", err)
+		}
+	}
+
+	// No catalog_fetch enqueued yet, matching the crash scenario.
+	var preCount int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ?", store.KindCatalogFetch).Count(&preCount)
+	if preCount != 0 {
+		t.Fatalf("expected no catalog_fetch before resume, got %d", preCount)
+	}
+
+	if err := eng.handleHostProbe(context.Background(), store.FrontierItem{Host: host}); err != nil {
+		t.Fatalf("handleHostProbe (resume): %v", err)
+	}
+
+	for _, u := range []string{agentmapURL1, agentmapURL2} {
+		var count int64
+		st.DB.Model(&store.FrontierItem{}).Where("kind = ? AND url = ?", store.KindCatalogFetch, u).Count(&count)
+		if count != 1 {
+			t.Errorf("expected the crash-interrupted agentmap catalog_fetch for %s to be enqueued exactly once on resume, got %d", u, count)
+		}
+	}
+}
+
+// -- BUG 3: duplicate identifiers must not clobber each other's checks -----
+
+// TestSplitChecks_DuplicateIdentifiersEachGetOwnChecks is BUG 3's
+// regression test: when two entries share an identifier, splitChecks must
+// attribute each entry's own checks to its own slice index, not clobber
+// earlier duplicates' checks onto the last one (the prior last-write-wins
+// map[identifier]index behavior silently dropped every duplicate but the
+// last entirely).
+func TestSplitChecks_DuplicateIdentifiersEachGetOwnChecks(t *testing.T) {
+	const dup = "urn:air:example.com:agents:dup"
+	entries := []ard.Entry{
+		{Identifier: dup, DisplayName: "First"},
+		{Identifier: dup, DisplayName: "Second"},
+	}
+	checks := []ard.Check{
+		{CheckID: "entry.check", Subject: dup, Message: "for first"},
+		{CheckID: "entry.check", Subject: dup, Message: "for second"},
+	}
+
+	_, entryChecks := splitChecks(checks, entries)
+
+	if len(entryChecks[0]) != 1 {
+		t.Fatalf("expected entry 0 to get exactly 1 check, got %d: %+v", len(entryChecks[0]), entryChecks[0])
+	}
+	if len(entryChecks[1]) != 1 {
+		t.Fatalf("expected entry 1 to get exactly 1 check, got %d: %+v", len(entryChecks[1]), entryChecks[1])
+	}
+	if entryChecks[0][0].Message != "for first" {
+		t.Errorf("entry 0's check = %q, want %q", entryChecks[0][0].Message, "for first")
+	}
+	if entryChecks[1][0].Message != "for second" {
+		t.Errorf("entry 1's check = %q, want %q", entryChecks[1][0].Message, "for second")
+	}
+}
+
+// TestSplitChecks_DuplicateIdentifiersInterleavedChecksAreApproximate pins
+// down splitChecks's documented limitation (see its doc comment): when
+// duplicate entries produce DIFFERING checks that arrive interleaved in
+// ard.Verify's flat list — e.g. two semantic checks (one per occurrence)
+// followed by two schema checks (one per occurrence), rather than each
+// occurrence's checks arriving already grouped together — checkBucket's
+// contiguous-chunk split does not realign them: it only guarantees the
+// total *count* per occurrence is preserved (2 checks each here), not that
+// each individual check lands on the occurrence it actually describes. This
+// is the interleaved case the task explicitly flagged as out of reach
+// without an entry-index field on ard.Check (out of scope: internal/ard is
+// not owned by this fix). The assertions below pin the CURRENT, imperfect,
+// distribution exactly so a future change to checkBucket cannot silently
+// regress it further without this test failing — this is a documented
+// approximation, not a claim of correctness.
+func TestSplitChecks_DuplicateIdentifiersInterleavedChecksAreApproximate(t *testing.T) {
+	const dup = "urn:air:example.com:agents:dup"
+	entries := []ard.Entry{
+		{Identifier: dup, DisplayName: "First"},
+		{Identifier: dup, DisplayName: "Second"},
+	}
+	// Interleaved by check kind, not by occurrence: both semantic checks
+	// (one per occurrence) before both schema checks (one per occurrence),
+	// mirroring how ard.Verify's semanticChecks/validateSchema stages each
+	// contribute their own per-occurrence checks in their own pass order.
+	checks := []ard.Check{
+		{CheckID: "entry.semantic", Subject: dup, Message: "semantic-occ0"},
+		{CheckID: "entry.semantic", Subject: dup, Message: "semantic-occ1"},
+		{CheckID: "entry.schema", Subject: dup, Message: "schema-occ0"},
+		{CheckID: "entry.schema", Subject: dup, Message: "schema-occ1"},
+	}
+
+	_, entryChecks := splitChecks(checks, entries)
+
+	if len(entryChecks[0]) != 2 || len(entryChecks[1]) != 2 {
+		t.Fatalf("expected the total to still split 2/2 across occurrences, got %d/%d", len(entryChecks[0]), len(entryChecks[1]))
+	}
+	// Both of entry 0's checks are in fact the two "occ0" checks' contiguous
+	// chunk-mates ("semantic-occ0" is correctly attributed; "semantic-occ1"
+	// is NOT — it describes occurrence 1, not 0). Pinning the exact (if
+	// imperfect) messages documents the trade-off rather than hiding it.
+	if got := []string{entryChecks[0][0].Message, entryChecks[0][1].Message}; got[0] != "semantic-occ0" || got[1] != "semantic-occ1" {
+		t.Errorf("entry 0 checks = %v, want [semantic-occ0 semantic-occ1] (documented approximation)", got)
+	}
+	if got := []string{entryChecks[1][0].Message, entryChecks[1][1].Message}; got[0] != "schema-occ0" || got[1] != "schema-occ1" {
+		t.Errorf("entry 1 checks = %v, want [schema-occ0 schema-occ1] (documented approximation)", got)
+	}
+}
+
+// TestSplitChecks_NonDuplicateIdentifiersUnaffected is a regression guard:
+// the common (non-duplicate) case must keep working exactly as before —
+// each entry's checks route to its own index by identifier lookup.
+func TestSplitChecks_NonDuplicateIdentifiersUnaffected(t *testing.T) {
+	entries := []ard.Entry{
+		{Identifier: "urn:air:example.com:agents:a", DisplayName: "A"},
+		{Identifier: "urn:air:example.com:agents:b", DisplayName: "B"},
+	}
+	checks := []ard.Check{
+		{CheckID: "catalog.spec_version", Subject: ard.SubjectCatalog, Message: "catalog-level"},
+		{CheckID: "entry.check", Subject: "urn:air:example.com:agents:a", Message: "for a"},
+		{CheckID: "entry.check", Subject: "urn:air:example.com:agents:b", Message: "for b"},
+	}
+
+	catalogChecks, entryChecks := splitChecks(checks, entries)
+
+	if len(catalogChecks) != 1 {
+		t.Fatalf("expected 1 catalog-level check, got %d", len(catalogChecks))
+	}
+	if len(entryChecks[0]) != 1 || entryChecks[0][0].Message != "for a" {
+		t.Errorf("entry 0 checks = %+v, want [for a]", entryChecks[0])
+	}
+	if len(entryChecks[1]) != 1 || entryChecks[1][0].Message != "for b" {
+		t.Errorf("entry 1 checks = %+v, want [for b]", entryChecks[1])
+	}
+}
+
+// -- LOW: catalog_fetch permanent failure must still emit a ProbeEvent ----
+
+// TestHandleCatalogFetch_PermanentFailureEmitsProbeEvent verifies the
+// documented "one ProbeEvent per host" contract holds even when a probe hit
+// leads to a catalog_fetch that then permanently fails (e.g. a 404): the
+// crawl must not silently produce zero rows for that host.
+func TestHandleCatalogFetch_PermanentFailureEmitsProbeEvent(t *testing.T) {
+	mux := http.NewServeMux()
+	// No handler registered for /missing.json: 404.
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	var events []ProbeEvent
+	var mu sync.Mutex
+	cfg := testCrawlerConfig()
+	st := newTestStore(t)
+	fr := frontier.New(st.DB)
+	fc := fetch.New(cfg.Crawler)
+	eng := New(cfg, st, fr, fc, discardLogger(), Options{OnProbe: func(ev ProbeEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, ev)
+	}})
+
+	host := strings.TrimPrefix(srv.URL, "http://")
+	item := store.FrontierItem{URL: srv.URL + "/missing.json", Host: host, Depth: 0, ProbeMethod: probe.MethodWellKnown}
+
+	if err := eng.handleCatalogFetch(context.Background(), item); err == nil {
+		t.Fatal("expected the 404 to propagate as an error")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) != 1 {
+		t.Fatalf("expected exactly 1 ProbeEvent for the permanently-failed catalog_fetch, got %d: %+v", len(events), events)
+	}
+	if events[0].Host != host {
+		t.Errorf("event host = %q, want %q", events[0].Host, host)
+	}
+	if events[0].Outcome != probe.OutcomeError {
+		t.Errorf("event outcome = %q, want %q", events[0].Outcome, probe.OutcomeError)
 	}
 }

@@ -182,6 +182,85 @@ func TestCTSeederDomains_PaginationWithServerTruncation(t *testing.T) {
 	}
 }
 
+func TestCTSeederDomains_WidensWindowWhenSanitizationUndercounts(t *testing.T) {
+	// The newest 5 entries (indices 15-19) all carry the same domain name,
+	// so a naive "read n raw entries" pass would sanitize/dedup down to a
+	// single domain. Entries 0-14 each have a unique domain. Requesting 5
+	// domains should widen the window backward until 5 unique domains are
+	// found, not stop after the first window of 5 entries.
+	const total = 20
+	entries := make([]ct.LeafEntry, total)
+	for i := 0; i < 15; i++ {
+		host := fmt.Sprintf("host%d.example.com", i)
+		entries[i] = makeLeafEntry(t, host, []string{host})
+	}
+	for i := 15; i < total; i++ {
+		entries[i] = makeLeafEntry(t, "dup.example.com", []string{"dup.example.com"})
+	}
+	fixture := newCTLogFixture(entries, 0)
+	srv := fixture.server()
+	defer srv.Close()
+
+	seeder := &CTSeeder{Logs: []string{srv.URL}}
+	names, err := seeder.Domains(context.Background(), 5)
+	if err != nil {
+		t.Fatalf("Domains: %v", err)
+	}
+	if len(names) != 5 {
+		t.Fatalf("got %d names, want 5: %v", len(names), names)
+	}
+	seen := make(map[string]bool)
+	for _, n := range names {
+		seen[n] = true
+	}
+	if !seen["dup.example.com"] {
+		t.Errorf("expected dup.example.com among %v", names)
+	}
+	dupCount := 0
+	for _, n := range names {
+		if n == "dup.example.com" {
+			dupCount++
+		}
+	}
+	if dupCount != 1 {
+		t.Errorf("dup.example.com should be deduped to one entry, appeared %d times in %v", dupCount, names)
+	}
+}
+
+func TestCTSeederDomains_PerLogBudgetUsesSanitizedCount(t *testing.T) {
+	// The first log's entries all sanitize/dedup to a single domain; the
+	// per-log remaining budget for the second log must be computed from
+	// the sanitized count collected so far (1), not the raw entry count
+	// consumed from the first log, or the second log will be shortchanged
+	// and the overall result will fall short of n.
+	dupEntries := []ct.LeafEntry{
+		makeLeafEntry(t, "dup.example.com", []string{"dup.example.com"}),
+		makeLeafEntry(t, "dup.example.com", []string{"dup.example.com"}),
+		makeLeafEntry(t, "dup.example.com", []string{"dup.example.com"}),
+	}
+	dupFixture := newCTLogFixture(dupEntries, 0)
+	dupSrv := dupFixture.server()
+	defer dupSrv.Close()
+
+	uniqueEntries := make([]ct.LeafEntry, 10)
+	for i := range uniqueEntries {
+		host := fmt.Sprintf("unique%d.example.com", i)
+		uniqueEntries[i] = makeLeafEntry(t, host, []string{host})
+	}
+	uniqueFixture := newCTLogFixture(uniqueEntries, 0)
+	uniqueSrv := uniqueFixture.server()
+	defer uniqueSrv.Close()
+
+	seeder := &CTSeeder{Logs: []string{dupSrv.URL, uniqueSrv.URL}}
+	names, err := seeder.Domains(context.Background(), 4)
+	if err != nil {
+		t.Fatalf("Domains: %v", err)
+	}
+	if len(names) != 4 {
+		t.Fatalf("got %d names, want 4: %v", len(names), names)
+	}
+}
+
 func TestCTSeederDomains_FewerEntriesThanRequested(t *testing.T) {
 	entries := []ct.LeafEntry{
 		makeLeafEntry(t, "only.example.com", []string{"only.example.com"}),

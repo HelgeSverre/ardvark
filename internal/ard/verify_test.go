@@ -1,7 +1,10 @@
 package ard
 
 import (
+	"encoding/json"
 	"os"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -730,6 +733,309 @@ func TestVerify_MediaType_UnknownStillWarns(t *testing.T) {
 	if !ok || c.Passed {
 		t.Errorf("expected failed entry.media_type warning for unknown type, got ok=%v check=%+v", ok, c)
 	}
+}
+
+// --- strict/lenient verification mode tests ---
+
+// A legacy "urn:ai:" identifier is a deliberate lenient-mode acceptance:
+// Verify must validate it against the schema, while VerifyStrict — the raw
+// vendored schema, which only accepts the "air" NID — must reject it.
+func TestVerify_LenientAcceptsLegacyAiNID_StrictRejects(t *testing.T) {
+	raw := `{
+		"specVersion": "1.0",
+		"entries": [{
+			"identifier": "urn:ai:example.com:tool:x",
+			"displayName": "X",
+			"type": "application/mcp-server-card+json",
+			"url": "https://example.com/x.json",
+			"representativeQueries": ["one", "two"]
+		}]
+	}`
+
+	lenient := Verify([]byte(raw), "example.com")
+	if _, ok := checkByID(lenient.Checks, "schema.validation", ""); ok {
+		t.Fatalf("lenient Verify: expected no schema.validation failures for urn:ai:, got %+v", lenient.Checks)
+	}
+	if lenient.Verdict != VerdictValid {
+		t.Fatalf("lenient Verdict = %q, want %q; checks: %+v", lenient.Verdict, VerdictValid, lenient.Checks)
+	}
+
+	strict := VerifyStrict([]byte(raw), "example.com")
+	if strict.Verdict != VerdictInvalid {
+		t.Fatalf("strict Verdict = %q, want %q; checks: %+v", strict.Verdict, VerdictInvalid, strict.Checks)
+	}
+	if _, ok := checkByID(strict.Checks, "schema.validation", ""); !ok {
+		t.Fatalf("strict VerifyStrict: expected a schema.validation failure for urn:ai:, got %+v", strict.Checks)
+	}
+}
+
+// An uppercase "URN:AIR:" prefix must validate leniently (the schema pattern
+// is case-sensitive; lenient mode lowercases the prefix before validating)
+// but fail strict validation against the raw schema.
+func TestVerify_LenientAcceptsUppercasePrefix_StrictRejects(t *testing.T) {
+	raw := `{
+		"specVersion": "1.0",
+		"entries": [{
+			"identifier": "URN:AIR:example.com:tool:x",
+			"displayName": "X",
+			"type": "application/mcp-server-card+json",
+			"url": "https://example.com/x.json",
+			"representativeQueries": ["one", "two"]
+		}]
+	}`
+
+	lenient := Verify([]byte(raw), "example.com")
+	if _, ok := checkByID(lenient.Checks, "schema.validation", ""); ok {
+		t.Fatalf("lenient Verify: expected no schema.validation failures for URN:AIR:, got %+v", lenient.Checks)
+	}
+
+	strict := VerifyStrict([]byte(raw), "example.com")
+	if strict.Verdict != VerdictInvalid {
+		t.Fatalf("strict Verdict = %q, want %q; checks: %+v", strict.Verdict, VerdictInvalid, strict.Checks)
+	}
+}
+
+// A "url" entry with an explicit "data": null is a deliberate lenient-mode
+// acceptance (data: null is treated as absent, matching
+// checkValueOrReference); strict mode sees both "url" and "data" present and
+// rejects the entry against the raw schema's value-or-reference oneOf/not.
+func TestVerify_LenientAcceptsExplicitNullData_StrictRejects(t *testing.T) {
+	raw := `{
+		"specVersion": "1.0",
+		"entries": [{
+			"identifier": "urn:air:example.com:tool:x",
+			"displayName": "X",
+			"type": "application/mcp-server-card+json",
+			"url": "https://example.com/x.json",
+			"data": null,
+			"representativeQueries": ["one", "two"]
+		}]
+	}`
+
+	lenient := Verify([]byte(raw), "example.com")
+	if _, ok := checkByID(lenient.Checks, "schema.validation", ""); ok {
+		t.Fatalf("lenient Verify: expected no schema.validation failures for url + data:null, got %+v", lenient.Checks)
+	}
+	if lenient.Verdict != VerdictValid {
+		t.Fatalf("lenient Verdict = %q, want %q; checks: %+v", lenient.Verdict, VerdictValid, lenient.Checks)
+	}
+
+	strict := VerifyStrict([]byte(raw), "example.com")
+	if strict.Verdict != VerdictInvalid {
+		t.Fatalf("strict Verdict = %q, want %q; checks: %+v", strict.Verdict, VerdictInvalid, strict.Checks)
+	}
+}
+
+// A malformed "uri" (host.documentationUrl) and a malformed "date-time"
+// (entry.updatedAt) are format-assertion failures: lenient mode downgrades
+// them to warnings (valid_with_warnings), strict mode reports them as
+// errors (invalid).
+func TestVerify_MalformedFormats_LenientWarnsStrictInvalid(t *testing.T) {
+	raw := `{
+		"specVersion": "1.0",
+		"host": {"displayName": "H", "documentationUrl": "not a uri"},
+		"entries": [{
+			"identifier": "urn:air:example.com:tool:x",
+			"displayName": "X",
+			"type": "application/mcp-server-card+json",
+			"url": "https://example.com/x.json",
+			"updatedAt": "not-a-date-time",
+			"representativeQueries": ["one", "two"]
+		}]
+	}`
+
+	lenient := Verify([]byte(raw), "example.com")
+	if lenient.Verdict != VerdictValidWithWarnings {
+		t.Fatalf("lenient Verdict = %q, want %q; checks: %+v", lenient.Verdict, VerdictValidWithWarnings, lenient.Checks)
+	}
+	var sawWarning bool
+	for _, c := range lenient.Checks {
+		if c.CheckID == "schema.validation" && !c.Passed {
+			if c.Severity != SeverityWarning {
+				t.Fatalf("lenient schema.validation check = %+v, want warning severity for a format failure", c)
+			}
+			sawWarning = true
+		}
+	}
+	if !sawWarning {
+		t.Fatalf("lenient Verify: expected at least one downgraded schema.validation warning, got %+v", lenient.Checks)
+	}
+
+	strict := VerifyStrict([]byte(raw), "example.com")
+	if strict.Verdict != VerdictInvalid {
+		t.Fatalf("strict Verdict = %q, want %q; checks: %+v", strict.Verdict, VerdictInvalid, strict.Checks)
+	}
+	for _, c := range strict.Checks {
+		if c.CheckID == "schema.validation" && !c.Passed && c.Severity != SeverityError {
+			t.Fatalf("strict schema.validation check = %+v, want error severity", c)
+		}
+	}
+}
+
+// representativeQueries with a single item is below the schema's minItems:2:
+// lenient mode downgrades this to a warning (valid_with_warnings, via the
+// semantic queries.count check, without also emitting a duplicate
+// schema-level row), while strict mode reports it as a schema error.
+func TestVerify_QueriesCountBelowMinimum_LenientWarnsStrictInvalid(t *testing.T) {
+	raw := `{
+		"specVersion": "1.0",
+		"entries": [{
+			"identifier": "urn:air:example.com:tool:x",
+			"displayName": "X",
+			"type": "application/mcp-server-card+json",
+			"url": "https://example.com/x.json",
+			"representativeQueries": ["only one"]
+		}]
+	}`
+
+	lenient := Verify([]byte(raw), "example.com")
+	if lenient.Verdict != VerdictValidWithWarnings {
+		t.Fatalf("lenient Verdict = %q, want %q; checks: %+v", lenient.Verdict, VerdictValidWithWarnings, lenient.Checks)
+	}
+	for _, c := range lenient.Checks {
+		if c.CheckID == "schema.validation" && strings.Contains(c.Message, "representativeQueries") {
+			t.Fatalf("lenient Verify: representativeQueries minItems failure should be dropped (queries.count already covers it), got %+v", c)
+		}
+	}
+	if c, ok := checkByID(lenient.Checks, "queries.count", "urn:air:example.com:tool:x"); !ok || c.Passed {
+		t.Fatalf("lenient Verify: expected a failed queries.count warning, got %+v", c)
+	}
+
+	strict := VerifyStrict([]byte(raw), "example.com")
+	if strict.Verdict != VerdictInvalid {
+		t.Fatalf("strict Verdict = %q, want %q; checks: %+v", strict.Verdict, VerdictInvalid, strict.Checks)
+	}
+}
+
+// A fully spec-clean catalog must verify valid under both modes.
+func TestVerify_FullyValidCatalog_ValidInBothModes(t *testing.T) {
+	raw, err := os.ReadFile("testdata/enterprise-catalog.json")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+
+	lenient := Verify(raw, "acme.example")
+	if lenient.Verdict != VerdictValid {
+		t.Fatalf("lenient Verdict = %q, want %q; checks: %+v", lenient.Verdict, VerdictValid, lenient.Checks)
+	}
+
+	strict := VerifyStrict(raw, "acme.example")
+	if strict.Verdict != VerdictValid {
+		t.Fatalf("strict Verdict = %q, want %q; checks: %+v", strict.Verdict, VerdictValid, strict.Checks)
+	}
+}
+
+// --- schema drift test ---
+
+// jsonFieldNames reflects the json struct tags of t's exported fields,
+// returning each field's tag name (the part before any ",omitempty" etc.),
+// or its Go field name when untagged.
+func jsonFieldNames(t reflect.Type) []string {
+	var names []string
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		tag := f.Tag.Get("json")
+		name := f.Name
+		if tag != "" {
+			if comma := strings.Index(tag, ","); comma >= 0 {
+				tag = tag[:comma]
+			}
+			if tag == "-" {
+				continue
+			}
+			if tag != "" {
+				name = tag
+			}
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// schemaPropertyNames returns the sorted key set of obj["properties"], for
+// obj a JSON Schema object node (unmarshaled into map[string]any).
+func schemaPropertyNames(t *testing.T, obj map[string]any) []string {
+	t.Helper()
+	props, ok := obj["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("node has no \"properties\" object: %+v", obj)
+	}
+	names := make([]string, 0, len(props))
+	for name := range props {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func assertPropertyNamesMatch(t *testing.T, label string, schemaProps []string, goType reflect.Type) {
+	t.Helper()
+	want := jsonFieldNames(goType)
+	if !reflect.DeepEqual(schemaProps, want) {
+		t.Fatalf("%s: vendored schema properties %v do not match %s's json struct tags %v — the schema was "+
+			"re-vendored with a shape change; update the corresponding Go type", label, schemaProps, goType.Name(), want)
+	}
+}
+
+// TestSchema_MatchesGoTypes walks the embedded vendored schema's root and
+// $defs property sets and asserts they exactly match the json struct tags
+// reflected off the corresponding ard Go types. A re-vendored schema whose
+// shape has drifted from the Go types turns this test red instead of
+// silently producing a mismatch at runtime.
+func TestSchema_MatchesGoTypes(t *testing.T) {
+	var schema map[string]any
+	if err := json.Unmarshal(catalogSchemaJSON, &schema); err != nil {
+		t.Fatalf("unmarshal embedded schema: %v", err)
+	}
+
+	defs, ok := schema["$defs"].(map[string]any)
+	if !ok {
+		t.Fatalf("schema has no $defs object: %+v", schema)
+	}
+	def := func(name string) map[string]any {
+		d, ok := defs[name].(map[string]any)
+		if !ok {
+			t.Fatalf("$defs has no %q object", name)
+		}
+		return d
+	}
+	nodeProp := func(obj map[string]any, name string) map[string]any {
+		props, ok := obj["properties"].(map[string]any)
+		if !ok {
+			t.Fatalf("node has no \"properties\" object: %+v", obj)
+		}
+		p, ok := props[name].(map[string]any)
+		if !ok {
+			t.Fatalf("properties has no %q object", name)
+		}
+		return p
+	}
+	itemsOf := func(arr map[string]any) map[string]any {
+		items, ok := arr["items"].(map[string]any)
+		if !ok {
+			t.Fatalf("array node has no \"items\" object: %+v", arr)
+		}
+		return items
+	}
+
+	assertPropertyNamesMatch(t, "root (Catalog)", schemaPropertyNames(t, schema), reflect.TypeOf(Catalog{}))
+	assertPropertyNamesMatch(t, "root.host (HostInfo)", schemaPropertyNames(t, nodeProp(schema, "host")), reflect.TypeOf(HostInfo{}))
+
+	catalogEntry := def("catalogEntry")
+	assertPropertyNamesMatch(t, "$defs.catalogEntry (Entry)", schemaPropertyNames(t, catalogEntry), reflect.TypeOf(Entry{}))
+
+	trustManifest := def("trustManifest")
+	assertPropertyNamesMatch(t, "$defs.trustManifest (TrustManifest)", schemaPropertyNames(t, trustManifest), reflect.TypeOf(TrustManifest{}))
+
+	trustSchema := def("trustSchema")
+	assertPropertyNamesMatch(t, "$defs.trustSchema (TrustSchema)", schemaPropertyNames(t, trustSchema), reflect.TypeOf(TrustSchema{}))
+
+	attestationItems := itemsOf(nodeProp(trustManifest, "attestations"))
+	assertPropertyNamesMatch(t, "$defs.trustManifest.attestations items (Attestation)", schemaPropertyNames(t, attestationItems), reflect.TypeOf(Attestation{}))
+
+	provenanceItems := itemsOf(nodeProp(trustManifest, "provenance"))
+	assertPropertyNamesMatch(t, "$defs.trustManifest.provenance items (ProvenanceLink)", schemaPropertyNames(t, provenanceItems), reflect.TypeOf(ProvenanceLink{}))
 }
 
 // queries.count must not fire for container/pointer entries (nested catalogs

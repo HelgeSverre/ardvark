@@ -64,14 +64,36 @@ func newVerifyReport(source string, report ard.Report) VerifyReport {
 }
 
 // VerifyTarget verifies a single catalog document, fetched via HTTP when
-// target looks like a URL, or read from the local filesystem otherwise, and
-// returns its full check report.
+// target looks like a URL, or read from the local filesystem otherwise,
+// using ardvark's default lenient verification, and returns its full check
+// report. Signature unchanged for existing callers (e.g. the MCP server);
+// see VerifyTargetStrict for the --strict variant.
 func VerifyTarget(ctx context.Context, target string) (VerifyReport, error) {
+	return verifyTarget(ctx, target, false)
+}
+
+// VerifyTargetStrict is VerifyTarget, but validates against the exact
+// published spec schema (ard.VerifyStrict) rather than ardvark's lenient
+// default.
+func VerifyTargetStrict(ctx context.Context, target string) (VerifyReport, error) {
+	return verifyTarget(ctx, target, true)
+}
+
+func verifyTarget(ctx context.Context, target string, strict bool) (VerifyReport, error) {
 	raw, servingDomain, err := fetchVerifyTarget(ctx, target)
 	if err != nil {
 		return VerifyReport{}, err
 	}
-	return newVerifyReport(target, ard.Verify(raw, servingDomain)), nil
+	return newVerifyReport(target, runVerify(raw, servingDomain, strict)), nil
+}
+
+// runVerify dispatches to ard.Verify or ard.VerifyStrict depending on
+// strict.
+func runVerify(raw []byte, servingDomain string, strict bool) ard.Report {
+	if strict {
+		return ard.VerifyStrict(raw, servingDomain)
+	}
+	return ard.Verify(raw, servingDomain)
 }
 
 // fetchVerifyTarget loads the raw catalog bytes for target, either via HTTP
@@ -112,10 +134,11 @@ func fetchVerifyTarget(ctx context.Context, target string) (raw []byte, servingD
 
 // VerifyStored re-runs verification against every catalog currently stored
 // in the database, updating each catalog's verification_status and replacing
-// its verification_checks rows with the fresh results. onReport, if non-nil,
-// is invoked with each catalog's report as it is produced (the CLI's live
-// per-catalog output).
-func VerifyStored(st *store.Store, onReport func(VerifyReport)) (VerifyStoredResult, error) {
+// its verification_checks rows with the fresh results. strict selects
+// ard.VerifyStrict instead of the default ard.Verify, as with VerifyTarget.
+// onReport, if non-nil, is invoked with each catalog's report as it is
+// produced (the CLI's live per-catalog output).
+func VerifyStored(st *store.Store, strict bool, onReport func(VerifyReport)) (VerifyStoredResult, error) {
 	var catalogs []store.Catalog
 	if err := st.DB.Preload("Entries").Find(&catalogs).Error; err != nil {
 		return VerifyStoredResult{}, fmt.Errorf("verify --stored: loading catalogs: %w", err)
@@ -131,7 +154,7 @@ func VerifyStored(st *store.Store, onReport func(VerifyReport)) (VerifyStoredRes
 			return VerifyStoredResult{}, fmt.Errorf("verify --stored: loading domain %d: %w", cat.DomainID, err)
 		}
 
-		report := ard.Verify([]byte(cat.RawJSON), domain.Host)
+		report := runVerify([]byte(cat.RawJSON), domain.Host, strict)
 		vr := newVerifyReport(fmt.Sprintf("%s (%s)", cat.SourceURL, domain.Host), report)
 		if onReport != nil {
 			onReport(vr)
