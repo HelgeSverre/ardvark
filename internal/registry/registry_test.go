@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/helgesverre/ardvark/internal/ard"
+	"github.com/helgesverre/ardvark/internal/fetch"
 )
 
 func entry(id string) ard.Entry {
@@ -68,10 +69,12 @@ func TestSearch_NonOKStatus(t *testing.T) {
 	tests := []struct {
 		name       string
 		statusCode int
+		transient  bool
 	}{
-		{"not found", http.StatusNotFound},
-		{"server error", http.StatusInternalServerError},
-		{"not implemented", http.StatusNotImplemented},
+		{"not found", http.StatusNotFound, false},
+		{"too many requests", http.StatusTooManyRequests, true},
+		{"server error", http.StatusInternalServerError, true},
+		{"not implemented", http.StatusNotImplemented, false},
 	}
 
 	for _, tt := range tests {
@@ -99,6 +102,9 @@ func TestSearch_NonOKStatus(t *testing.T) {
 			}
 			if tt.statusCode != http.StatusNotImplemented && IsNotImplemented(err) {
 				t.Error("IsNotImplemented(err) = true, want false")
+			}
+			if got := fetch.Transient(err); got != tt.transient {
+				t.Errorf("fetch.Transient(err) = %v, want %v", got, tt.transient)
 			}
 		})
 	}
@@ -129,7 +135,10 @@ func TestHarvestAll_Pagination(t *testing.T) {
 	var requests []SearchRequest
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req SearchRequest
-		json.NewDecoder(r.Body).Decode(&req)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decoding request: %v", err)
+			return
+		}
 		requests = append(requests, req)
 
 		resp, ok := pages[req.PageToken]
@@ -171,7 +180,10 @@ func TestHarvestAll_PageLimit(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		var req SearchRequest
-		json.NewDecoder(r.Body).Decode(&req)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decoding request: %v", err)
+			return
+		}
 		resp := SearchResponse{
 			Results:   []Result{{Entry: entry("x")}},
 			PageToken: "next-" + req.PageToken, // always has a next page
@@ -294,5 +306,132 @@ func TestHarvestAll_ErrorStopsHarvest(t *testing.T) {
 	}
 	if len(result.Results) != 1 {
 		t.Errorf("len(Results) = %d, want 1 (partial results preserved)", len(result.Results))
+	}
+}
+
+// -- federation ------------------------------------------------------------
+
+// HarvestAll accumulates resp.Referrals and the crawler follows them, so a
+// harvest that wants referrals must actually ask for them: a spec-compliant
+// registry returns none under federation "none".
+func TestHarvestAll_RequestsReferralsWhenAsked(t *testing.T) {
+	var got []SearchRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req SearchRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decoding request: %v", err)
+			return
+		}
+		got = append(got, req)
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(SearchResponse{
+			Results:   []Result{{Entry: entry("a")}},
+			Referrals: []ard.Entry{entry("ref")},
+		}); err != nil {
+			t.Errorf("encoding response: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, nil)
+	result, err := c.HarvestAll(context.Background(), HarvestOptions{Federation: FederationReferrals})
+	if err != nil {
+		t.Fatalf("HarvestAll: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("made %d requests, want 1", len(got))
+	}
+	if got[0].Federation != FederationReferrals {
+		t.Errorf("federation = %q, want %q", got[0].Federation, FederationReferrals)
+	}
+	if len(result.Referrals) != 1 {
+		t.Errorf("len(Referrals) = %d, want 1", len(result.Referrals))
+	}
+}
+
+// A harvest that does not want referrals must keep saying so explicitly,
+// rather than letting a registry federate the query by default.
+func TestHarvestAll_DefaultsToNoFederation(t *testing.T) {
+	var got []SearchRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req SearchRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decoding request: %v", err)
+			return
+		}
+		got = append(got, req)
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(SearchResponse{Results: []Result{{Entry: entry("a")}}}); err != nil {
+			t.Errorf("encoding response: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, nil)
+	if _, err := c.HarvestAll(context.Background(), HarvestOptions{}); err != nil {
+		t.Fatalf("HarvestAll: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("made %d requests, want 1", len(got))
+	}
+	if got[0].Federation != FederationNone {
+		t.Errorf("federation = %q, want %q", got[0].Federation, FederationNone)
+	}
+}
+
+// Federation is optional in the spec: a registry may answer 501 for it. That
+// must cost us the referrals only, never the results — the pre-federation
+// behavior harvested those fine.
+func TestHarvestAll_FallsBackToNoFederationOn501(t *testing.T) {
+	var got []SearchRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req SearchRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decoding request: %v", err)
+			return
+		}
+		got = append(got, req)
+		if req.Federation == FederationReferrals {
+			w.WriteHeader(http.StatusNotImplemented)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(SearchResponse{Results: []Result{{Entry: entry("a")}}}); err != nil {
+			t.Errorf("encoding response: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, nil)
+	result, err := c.HarvestAll(context.Background(), HarvestOptions{Federation: FederationReferrals})
+	if err != nil {
+		t.Fatalf("HarvestAll: %v", err)
+	}
+	if len(result.Results) != 1 {
+		t.Errorf("len(Results) = %d, want 1 despite the federation 501", len(result.Results))
+	}
+	if len(got) != 2 {
+		t.Fatalf("made %d requests, want 2 (referrals then the none retry)", len(got))
+	}
+	if got[0].Federation != FederationReferrals || got[1].Federation != FederationNone {
+		t.Errorf("federation sequence = [%q %q], want [%q %q]", got[0].Federation, got[1].Federation, FederationReferrals, FederationNone)
+	}
+}
+
+// A registry that does not implement /search at all must still surface as
+// not-implemented rather than being masked by the federation retry.
+func TestHarvestAll_UnsupportedSearchStillReportsNotImplemented(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotImplemented)
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, nil)
+	_, err := c.HarvestAll(context.Background(), HarvestOptions{Federation: FederationReferrals})
+	if err == nil {
+		t.Fatal("HarvestAll error = nil, want a not-implemented error")
+	}
+	if !IsNotImplemented(err) {
+		t.Errorf("IsNotImplemented(err) = false, want true (err = %v)", err)
 	}
 }

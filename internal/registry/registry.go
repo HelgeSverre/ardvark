@@ -23,9 +23,16 @@ import (
 // way), in which case the base URL is used as-is.
 const DefaultSearchPath = "/search"
 
-// federationNone is the SearchRequest.Federation value meaning "do not
-// federate this query to other registries".
-const federationNone = "none"
+// SearchRequest.Federation values.
+const (
+	// FederationNone asks the registry not to federate the query.
+	FederationNone = "none"
+	// FederationReferrals asks the registry to answer from its own index but
+	// to include referrals to other registries it knows about. Federation is
+	// optional in the spec: a registry may answer 501 Not Implemented, which
+	// HarvestAll handles by retrying without it.
+	FederationReferrals = "referrals"
+)
 
 // maxResponseBytes bounds how much of a /search response body is read,
 // guarding against a misbehaving or malicious registry streaming an
@@ -68,12 +75,38 @@ type SearchRequest struct {
 	PageToken  string `json:"pageToken,omitempty"`
 }
 
-// Result is a single catalog-entry-shaped search hit, with the registry's
-// relevance score and source registry attribution.
+// Result is a single search hit: a projection of a catalog entry, plus the
+// registry's relevance score and source attribution.
+//
+// A projection is not a complete ARD entry — a registry may legitimately omit
+// terms such as representativeQueries — so a Result must never be validated
+// as though it were one. Score is relevance, not trust or safety.
 type Result struct {
 	ard.Entry
 	Score  float64 `json:"score,omitempty"`
 	Source string  `json:"source,omitempty"`
+}
+
+// UnmarshalJSON decodes the projection's entry terms (retaining unknown and
+// namespaced ones in Entry.Raw) alongside the registry's own score/source.
+//
+// This is required, not incidental: embedding ard.Entry promotes its
+// UnmarshalJSON to Result, and without this override that inherited method
+// would decode only the entry fields and silently leave score and source at
+// their zero values.
+func (r *Result) UnmarshalJSON(data []byte) error {
+	if err := r.Entry.UnmarshalJSON(data); err != nil {
+		return err
+	}
+	var meta struct {
+		Score  float64 `json:"score"`
+		Source string  `json:"source"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return err
+	}
+	r.Score, r.Source = meta.Score, meta.Source
+	return nil
 }
 
 // SearchResponse is the body of a POST /search response.
@@ -96,6 +129,14 @@ func (e *StatusError) Error() string {
 	return fmt.Sprintf("registry: search: unexpected status %s", e.Status)
 }
 
+// Transient classifies retryable registry responses for the crawler's shared
+// retry policy. A 501 is a permanent "feature unsupported" response handled
+// separately by IsNotImplemented.
+func (e *StatusError) Transient() bool {
+	return e.StatusCode == http.StatusTooManyRequests ||
+		(e.StatusCode >= 500 && e.StatusCode <= 599 && e.StatusCode != http.StatusNotImplemented)
+}
+
 // IsNotImplemented reports whether err is a StatusError for HTTP 501 (Not
 // Implemented) — the status a registry returns when it does not support a
 // requested feature, e.g. federation.
@@ -110,7 +151,7 @@ func IsNotImplemented(err error) bool {
 // Search issues a single POST /search request and decodes the response.
 func (c *Client) Search(ctx context.Context, req SearchRequest) (*SearchResponse, error) {
 	if req.Federation == "" {
-		req.Federation = federationNone
+		req.Federation = FederationNone
 	}
 
 	body, err := json.Marshal(req)
@@ -171,9 +212,16 @@ type HarvestOptions struct {
 	// PageSize is the requested page size per /search call. Zero leaves
 	// it unset, letting the registry choose its default.
 	PageSize int
-	// QueryText is the query text used for harvesting. Empty/broad text
-	// is expected to surface the registry's full catalog.
+	// QueryText is the query text used for harvesting. Search is
+	// relevance-ranked, so broad text surfaces as much as the registry
+	// chooses to return — it is not a guarantee of a complete index export.
 	QueryText string
+	// Federation selects the federation mode requested per page. Empty
+	// means FederationNone. Set FederationReferrals only when the caller
+	// actually intends to follow HarvestResult.Referrals — asking a
+	// registry to federate and then discarding the answer is wasted work
+	// on both sides.
+	Federation string
 }
 
 // HarvestResult accumulates everything collected across a HarvestAll run.
@@ -183,11 +231,25 @@ type HarvestResult struct {
 	Pages     int
 }
 
-// HarvestAll paginates a registry's /search endpoint with a broad query,
-// accumulating results and referrals until the registry stops returning a
-// pageToken or opts.PageLimit pages have been fetched.
+// HarvestAll paginates a registry's /search endpoint, accumulating results
+// and referrals until the registry stops returning a pageToken or
+// opts.PageLimit pages have been fetched.
+//
+// Search is relevance-ranked and requires query text, so this is a broad
+// sweep of what the registry chooses to surface — not a guaranteed complete
+// export of its index. Treat the result as a sample, not a dump.
+//
+// When opts.Federation requests referrals and the registry answers 501 Not
+// Implemented, the request is retried once without federation: federation is
+// optional in the spec, and losing every result over an unsupported optional
+// feature would be worse than losing only the referrals.
 func (c *Client) HarvestAll(ctx context.Context, opts HarvestOptions) (*HarvestResult, error) {
 	out := &HarvestResult{}
+
+	federation := opts.Federation
+	if federation == "" {
+		federation = FederationNone
+	}
 
 	pageToken := ""
 	for {
@@ -196,12 +258,20 @@ func (c *Client) HarvestAll(ctx context.Context, opts HarvestOptions) (*HarvestR
 		}
 
 		req := SearchRequest{
-			Query:     Query{Text: opts.QueryText},
-			PageSize:  opts.PageSize,
-			PageToken: pageToken,
+			Query:      Query{Text: opts.QueryText},
+			Federation: federation,
+			PageSize:   opts.PageSize,
+			PageToken:  pageToken,
 		}
 
 		resp, err := c.Search(ctx, req)
+		if err != nil && IsNotImplemented(err) && federation != FederationNone {
+			// Distinguish "federation unsupported" from "/search
+			// unsupported": only the retry can tell us which 501 this was.
+			federation = FederationNone
+			req.Federation = federation
+			resp, err = c.Search(ctx, req)
+		}
 		if err != nil {
 			return out, fmt.Errorf("registry: harvest: page %d: %w", out.Pages+1, err)
 		}
