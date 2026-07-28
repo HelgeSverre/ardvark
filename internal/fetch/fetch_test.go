@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +14,22 @@ import (
 
 	"github.com/helgesverre/ardvark/internal/config"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func testResponse(req *http.Request, status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Request:    req,
+	}
+}
 
 func testConfig() config.CrawlerConfig {
 	return config.CrawlerConfig{
@@ -317,6 +334,77 @@ func TestRobots_TooManyRequestsNotCachedAsAllowAll(t *testing.T) {
 	}
 	if allowed {
 		t.Error("expected /private/secret to be disallowed once robots.txt is honored")
+	}
+}
+
+func TestRawRobots_TooManyRequestsDoesNotDowngradeToHTTP(t *testing.T) {
+	var schemes []string
+
+	c := New(testConfig())
+	c.httpClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		schemes = append(schemes, req.URL.Scheme)
+		if req.URL.Scheme == "https" {
+			return testResponse(req, http.StatusTooManyRequests, ""), nil
+		}
+		return testResponse(req, http.StatusNotFound, ""), nil
+	})
+
+	_, err := c.RawRobots(context.Background(), "example.test")
+	if err == nil {
+		t.Fatal("RawRobots error = nil, want transient HTTPS 429")
+	}
+	if !Transient(err) {
+		t.Fatalf("RawRobots error = %v, want transient", err)
+	}
+	if len(schemes) != 1 || schemes[0] != "https" {
+		t.Fatalf("requested schemes = %v, want [https] with no HTTP downgrade", schemes)
+	}
+}
+
+func TestRobotsCache_IsScopedToOriginScheme(t *testing.T) {
+	c := New(testConfig())
+	c.httpClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/robots.txt" {
+			return testResponse(req, http.StatusOK, "page"), nil
+		}
+		if req.URL.Scheme == "https" {
+			return testResponse(req, http.StatusOK, "User-agent: *\nDisallow: /private\n"), nil
+		}
+		return testResponse(req, http.StatusOK, "User-agent: *\nAllow: /\n"), nil
+	})
+
+	allowed, err := c.Allowed(context.Background(), "https://example.test/private")
+	if err != nil {
+		t.Fatalf("Allowed(https): %v", err)
+	}
+	if allowed {
+		t.Fatal("Allowed(https) = true, want false")
+	}
+
+	allowed, err = c.Allowed(context.Background(), "http://example.test/private")
+	if err != nil {
+		t.Fatalf("Allowed(http): %v", err)
+	}
+	if !allowed {
+		t.Fatal("Allowed(http) = false, want true from the HTTP origin's own robots.txt")
+	}
+}
+
+func TestGet_RobotsTooManyRequestsIsRetryable(t *testing.T) {
+	c := New(testConfig())
+	c.httpClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/robots.txt" {
+			return testResponse(req, http.StatusTooManyRequests, ""), nil
+		}
+		return testResponse(req, http.StatusOK, "page"), nil
+	})
+
+	_, err := c.Get(context.Background(), "https://example.test/page")
+	if err == nil {
+		t.Fatal("Get error = nil, want robots.txt 429 to block this attempt")
+	}
+	if !Transient(err) {
+		t.Fatalf("Get error = %v, want transient robots.txt failure", err)
 	}
 }
 

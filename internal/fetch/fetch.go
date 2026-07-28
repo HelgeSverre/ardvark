@@ -84,12 +84,21 @@ func (e *Error) Error() string {
 
 func (e *Error) Unwrap() error { return e.Err }
 
+// Transient reports whether this error is safe to retry with backoff.
+// Keeping the classification on the error lets other HTTP-facing packages
+// participate in the crawler's retry policy without importing fetch.
+func (e *Error) Transient() bool { return e.transient }
+
 // Transient reports whether err represents a transient failure (safe to
 // retry with backoff) as opposed to a permanent one.
+//
+// Any error in the chain that classifies itself via a Transient() bool
+// method is authoritative — including *Error, and including errors from
+// packages that must not import fetch (see registry.StatusError).
 func Transient(err error) bool {
-	var fe *Error
-	if errors.As(err, &fe) {
-		return fe.transient
+	var classified interface{ Transient() bool }
+	if errors.As(err, &classified) {
+		return classified.Transient()
 	}
 	// Fall back to inspecting well-known transient network conditions for
 	// errors not wrapped by this package.
@@ -252,13 +261,10 @@ func (c *Client) Get(ctx context.Context, rawURL string) (*Fetched, error) {
 	if c.cfg.RespectRobotsTxt {
 		allowed, err := c.Allowed(ctx, rawURL)
 		if err != nil {
-			// A robots.txt fetch problem should not block well-known probes
-			// or page fetches outright; treat as allowed but surface via
-			// caller logs is out of scope here — the design says well-known
-			// probes are always attempted regardless of robots outcome, and
-			// for page fetches we fail open on robots-fetch errors so a
-			// broken robots.txt doesn't wedge the crawl.
-			allowed = true
+			// Well-known probes bypass this gate via GetWellKnown. Ordinary
+			// pages must wait for a retryable robots failure rather than
+			// crawling with an indeterminate policy.
+			return nil, err
 		}
 		if !allowed {
 			return nil, &Error{Op: "get", URL: rawURL, Err: ErrRobotsDisallowed, transient: false}
@@ -388,20 +394,16 @@ func (c *Client) Allowed(ctx context.Context, rawURL string) (bool, error) {
 // connection-level failure (as opposed to an HTTP error status). It returns
 // an empty string if the host has no robots.txt.
 func (c *Client) RawRobots(ctx context.Context, host string) (string, error) {
-	c.robotsMu.Lock()
-	if raw, ok := c.rawRobots[host]; ok {
-		c.robotsMu.Unlock()
-		return raw, nil
-	}
-	c.robotsMu.Unlock()
-
 	if _, err := c.robotsFor(ctx, "", host); err != nil {
 		return "", err
 	}
 
 	c.robotsMu.Lock()
 	defer c.robotsMu.Unlock()
-	return c.rawRobots[host], nil
+	if raw, ok := c.rawRobots[robotsOriginKey("https", host)]; ok {
+		return raw, nil
+	}
+	return c.rawRobots[robotsOriginKey("http", host)], nil
 }
 
 // robotsFor fetches and caches robots.txt for the given host, returning the
@@ -409,53 +411,70 @@ func (c *Client) RawRobots(ctx context.Context, host string) (string, error) {
 // empty, https is tried first with a fallback to http on connection-level
 // failure (not on HTTP error statuses, which are meaningful responses).
 func (c *Client) robotsFor(ctx context.Context, scheme, host string) (*robotstxt.RobotsData, error) {
+	if scheme != "" {
+		return c.robotsForOrigin(ctx, scheme, host)
+	}
+
+	data, err := c.robotsForOrigin(ctx, "https", host)
+	if err == nil || !isConnectionLevelError(err) {
+		return data, err
+	}
+	return c.robotsForOrigin(ctx, "http", host)
+}
+
+// robotsForOrigin fetches and caches robots.txt for exactly one scheme+host
+// origin. Caching is per-origin because the two origins are separate
+// documents: an http robots.txt must never speak for its https sibling.
+func (c *Client) robotsForOrigin(ctx context.Context, scheme, host string) (*robotstxt.RobotsData, error) {
+	cacheKey := robotsOriginKey(scheme, host)
 	c.robotsMu.Lock()
-	if data, ok := c.robotsCache[host]; ok {
+	if data, ok := c.robotsCache[cacheKey]; ok {
 		c.robotsMu.Unlock()
 		return data, nil
 	}
 	c.robotsMu.Unlock()
 
-	schemes := []string{scheme}
-	if scheme == "" {
-		schemes = []string{"https", "http"}
+	robotsURL := fmt.Sprintf("%s://%s/robots.txt", scheme, host)
+
+	fetched, err := c.doGet(ctx, robotsURL)
+	if err != nil {
+		var fe *Error
+		if errors.As(err, &fe) && fe.Status >= 400 && fe.Status < 500 && fe.Status != http.StatusTooManyRequests {
+			// No robots.txt: everything allowed, empty raw body.
+			c.robotsMu.Lock()
+			c.robotsCache[cacheKey] = nil
+			c.rawRobots[cacheKey] = ""
+			c.robotsMu.Unlock()
+			return nil, nil
+		}
+		// A 429 or 5xx is the origin's own answer, not evidence that
+		// robots.txt is absent: don't cache an allow-all verdict, and
+		// propagate the (transient) error so callers retry instead of
+		// crawling with robots ignored.
+		return nil, err
 	}
 
-	var lastErr error
-	for _, s := range schemes {
-		robotsURL := fmt.Sprintf("%s://%s/robots.txt", s, host)
-
-		fetched, err := c.doGet(ctx, robotsURL)
-		if err != nil {
-			var fe *Error
-			if errors.As(err, &fe) && fe.Status >= 400 && fe.Status < 500 && fe.Status != http.StatusTooManyRequests {
-				// No robots.txt: everything allowed, empty raw body.
-				c.robotsMu.Lock()
-				c.robotsCache[host] = nil
-				c.rawRobots[host] = ""
-				c.robotsMu.Unlock()
-				return nil, nil
-			}
-			// A 429 on robots.txt is a transient rate-limit signal, not
-			// evidence robots.txt is absent: don't cache an allow-all
-			// verdict, and propagate the (transient) error so callers
-			// retry instead of crawling with robots ignored forever.
-			lastErr = err
-			continue
-		}
-
-		data, err := robotstxt.FromBytes(fetched.Body)
-		if err != nil {
-			return nil, &Error{Op: "robots", URL: robotsURL, Err: err, transient: false}
-		}
-
-		c.robotsMu.Lock()
-		c.robotsCache[host] = data
-		c.rawRobots[host] = string(fetched.Body)
-		c.robotsMu.Unlock()
-
-		return data, nil
+	data, err := robotstxt.FromBytes(fetched.Body)
+	if err != nil {
+		return nil, &Error{Op: "robots", URL: robotsURL, Err: err, transient: false}
 	}
 
-	return nil, lastErr
+	c.robotsMu.Lock()
+	c.robotsCache[cacheKey] = data
+	c.rawRobots[cacheKey] = string(fetched.Body)
+	c.robotsMu.Unlock()
+
+	return data, nil
+}
+
+func robotsOriginKey(scheme, host string) string {
+	return strings.ToLower(scheme) + "://" + strings.ToLower(host)
+}
+
+// isConnectionLevelError distinguishes "HTTPS could not establish a
+// connection" (where RawRobots may try HTTP) from an HTTP response such as
+// 429 or 5xx, whose status is authoritative and must be returned.
+func isConnectionLevelError(err error) bool {
+	var fe *Error
+	return errors.As(err, &fe) && fe.Status == 0
 }

@@ -79,6 +79,23 @@ func TestProbeWellKnown_Error(t *testing.T) {
 	}
 }
 
+func TestProbeWellKnown_TooManyRequestsIsError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/ai-catalog.json", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	result := probeWellKnownForTest(newTestClient(), srv.URL)
+	if result.Outcome != OutcomeError {
+		t.Fatalf("Outcome = %q, want %q for retryable 429", result.Outcome, OutcomeError)
+	}
+	if result.RetryError == nil || !fetch.Transient(result.RetryError) {
+		t.Fatalf("RetryError = %v, want transient fetch error", result.RetryError)
+	}
+}
+
 func TestParseAgentmapDirectives(t *testing.T) {
 	tests := []struct {
 		name string
@@ -191,20 +208,10 @@ func TestProbeRobotsAgentmap_NoRobotsTxt(t *testing.T) {
 // test servers, mirroring probeWellKnown/probeRobotsAgentmap exactly except
 // for the scheme, since httptest.Server serves plain HTTP. --
 
+// probeWellKnownForTest exercises the real alias-walking implementation
+// against an http (not https) test server.
 func probeWellKnownForTest(client *fetch.Client, baseURL string) Result {
-	wellKnownURL := baseURL + wellKnownPath
-	fetched, err := client.GetWellKnown(context.Background(), wellKnownURL)
-	if err != nil {
-		return classifyFetchErr(MethodWellKnown, wellKnownURL, err)
-	}
-	return Result{
-		Method:      MethodWellKnown,
-		URL:         fetched.URL,
-		HTTPStatus:  fetched.Status,
-		ContentType: fetched.ContentType,
-		Outcome:     OutcomeHit,
-		CatalogURLs: []string{fetched.URL},
-	}
+	return probeWellKnownBase(context.Background(), client, baseURL)
 }
 
 func probeRobotsAgentmapForTest(client *fetch.Client, host string) Result {
@@ -257,5 +264,115 @@ func TestProbe_ReturnsBothMethods(t *testing.T) {
 	}
 	if results[1].Method != MethodRobotsAgentmap {
 		t.Fatalf("expected second result method %s, got %s", MethodRobotsAgentmap, results[1].Method)
+	}
+}
+
+// -- well-known aliases ----------------------------------------------------
+
+// jsonCatalogHandler serves a minimal ARD document.
+func jsonCatalogHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/ai-catalog+json")
+	_, _ = w.Write([]byte(`{"specVersion":"1.0"}`))
+}
+
+// A publisher that has moved to the preferred name must be discovered, and
+// the legacy alias must not be fetched once the preferred one has answered.
+func TestProbeWellKnown_PrefersArdJSONAndStopsThere(t *testing.T) {
+	var paths []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.URL.Path == "/.well-known/ard.json" {
+			jsonCatalogHandler(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	result := probeWellKnownForTest(newTestClient(), srv.URL)
+
+	if result.Outcome != OutcomeHit {
+		t.Fatalf("Outcome = %q, want %q (detail=%s)", result.Outcome, OutcomeHit, result.ErrorDetail)
+	}
+	if !strings.HasSuffix(result.URL, "/.well-known/ard.json") {
+		t.Errorf("URL = %q, want the preferred ard.json alias", result.URL)
+	}
+	if len(paths) != 1 {
+		t.Errorf("fetched %v, want only the preferred alias", paths)
+	}
+}
+
+// The existing adopter base publishes only the legacy name; it must keep
+// being discovered after the preferred alias 404s.
+func TestProbeWellKnown_FallsBackToLegacyAlias(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/ai-catalog.json", jsonCatalogHandler)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	result := probeWellKnownForTest(newTestClient(), srv.URL)
+
+	if result.Outcome != OutcomeHit {
+		t.Fatalf("Outcome = %q, want %q", result.Outcome, OutcomeHit)
+	}
+	if !strings.HasSuffix(result.URL, "/.well-known/ai-catalog.json") {
+		t.Errorf("URL = %q, want the legacy alias", result.URL)
+	}
+}
+
+// A transient failure on one alias must not hide a real hit on the other.
+func TestProbeWellKnown_TransientOnPreferredStillFindsLegacy(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/ard.json", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	mux.HandleFunc("/.well-known/ai-catalog.json", jsonCatalogHandler)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	result := probeWellKnownForTest(newTestClient(), srv.URL)
+
+	if result.Outcome != OutcomeHit {
+		t.Fatalf("Outcome = %q, want %q despite the 429 on the preferred alias", result.Outcome, OutcomeHit)
+	}
+	if !strings.HasSuffix(result.URL, "/.well-known/ai-catalog.json") {
+		t.Errorf("URL = %q, want the legacy alias", result.URL)
+	}
+}
+
+// An indeterminate alias must outrank a definitive miss on the other: we do
+// not know this host lacks ARD, so it must stay retryable rather than being
+// recorded as a durable not-found.
+func TestProbeWellKnown_TransientOnEitherAliasIsNotAMiss(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/ai-catalog.json", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	result := probeWellKnownForTest(newTestClient(), srv.URL)
+
+	if result.Outcome != OutcomeError {
+		t.Fatalf("Outcome = %q, want %q so the host is retried", result.Outcome, OutcomeError)
+	}
+	if result.RetryError == nil || !fetch.Transient(result.RetryError) {
+		t.Errorf("RetryError = %v, want a transient error", result.RetryError)
+	}
+}
+
+// A host publishing neither alias is a genuine miss.
+func TestProbeWellKnown_NeitherAliasIsAMiss(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	result := probeWellKnownForTest(newTestClient(), srv.URL)
+
+	if result.Outcome != OutcomeMiss {
+		t.Fatalf("Outcome = %q, want %q", result.Outcome, OutcomeMiss)
 	}
 }

@@ -1,9 +1,11 @@
 // Package probe discovers ARD (Agentic Resource Discovery) documents on a
-// host via the two web discovery mechanisms in scope for v1: the
-// well-known path /.well-known/ai-catalog.json, and Agentmap: directives in
-// robots.txt. (DNS Service Binding discovery and <link rel="ai-catalog">
-// scanning of harvested pages are handled elsewhere — the latter by
-// internal/harvest during page_fetch.)
+// host via two web discovery mechanisms: the well-known paths (see
+// wellKnownPaths), and Agentmap: directives in robots.txt.
+//
+// The other web mechanisms are handled elsewhere: <link rel="ard"> tags and
+// inline <script type="application/ld+json"> markup are both extracted by
+// internal/harvest during page_fetch. DNS Service Binding discovery is not
+// implemented.
 package probe
 
 import (
@@ -30,8 +32,22 @@ const (
 	OutcomeError = "error"
 )
 
-// wellKnownPath is the standardized ARD discovery path.
-const wellKnownPath = "/.well-known/ai-catalog.json"
+// wellKnownPaths are the standardized ARD discovery paths, in preference
+// order. They are aliases for the same resource, so the first hit wins and
+// no further path is fetched.
+//
+// /.well-known/ard.json is the preferred name; /.well-known/ai-catalog.json
+// is the original one and remains supported, since it is where essentially
+// every catalog published so far still lives. Dropping it would un-discover
+// the existing adopter base.
+//
+// Cost: a host publishing neither costs two well-known requests instead of
+// one. That is the unavoidable price of covering both names — a host that
+// publishes the preferred path still costs exactly one.
+var wellKnownPaths = []string{
+	"/.well-known/ard.json",
+	"/.well-known/ai-catalog.json",
+}
 
 // agentmapPrefix is the (case-insensitive) robots.txt directive key that
 // points at ARD catalog document(s). This is a non-standard directive, so
@@ -59,6 +75,9 @@ type Result struct {
 	// CatalogURLs holds the ARD catalog document URL(s) discovered by this
 	// probe. Empty unless Outcome is OutcomeHit.
 	CatalogURLs []string
+	// RetryError retains the underlying retryable fetch error for the crawler.
+	// It is not persisted; ErrorDetail is the durable human-readable form.
+	RetryError error
 }
 
 // Probe attempts both discovery mechanisms for host (a bare hostname, e.g.
@@ -71,14 +90,48 @@ func Probe(ctx context.Context, client *fetch.Client, host string) []Result {
 	}
 }
 
-// probeWellKnown fetches https://<host>/.well-known/ai-catalog.json,
-// bypassing the robots.txt gate (well-known probes are always attempted)
-// while still going through the client's rate limiting and politeness
-// caps. Probing is https-only by policy (unlike fetch, which parameterizes
-// scheme) since well-known discovery targets are assumed to serve over TLS.
+// probeWellKnown fetches host's well-known ARD document, trying each alias
+// in wellKnownPaths order. Probing is https-only by policy (unlike fetch,
+// which parameterizes scheme) since well-known discovery targets are assumed
+// to serve over TLS.
 func probeWellKnown(ctx context.Context, client *fetch.Client, host string) Result {
-	wellKnownURL := "https://" + host + wellKnownPath
+	return probeWellKnownBase(ctx, client, "https://"+host)
+}
 
+// probeWellKnownBase is probeWellKnown against an explicit scheme+host base,
+// returning the first alias that hits.
+//
+// When nothing hits, an indeterminate result outranks a miss: a 429 or 5xx on
+// one alias means we do not actually know whether the host publishes ARD, so
+// reporting a miss there would let a transient failure be recorded as a
+// durable "not found" and suppress rediscovery.
+func probeWellKnownBase(ctx context.Context, client *fetch.Client, base string) Result {
+	var firstMiss, firstErr *Result
+	for _, path := range wellKnownPaths {
+		result := probeWellKnownURL(ctx, client, base+path)
+		switch result.Outcome {
+		case OutcomeHit:
+			return result
+		case OutcomeError:
+			if firstErr == nil {
+				firstErr = &result
+			}
+		default:
+			if firstMiss == nil {
+				firstMiss = &result
+			}
+		}
+	}
+	if firstErr != nil {
+		return *firstErr
+	}
+	return *firstMiss
+}
+
+// probeWellKnownURL fetches one well-known URL, bypassing the robots.txt gate
+// (well-known probes are always attempted) while still going through the
+// client's rate limiting and politeness caps.
+func probeWellKnownURL(ctx context.Context, client *fetch.Client, wellKnownURL string) Result {
 	fetched, err := client.GetWellKnown(ctx, wellKnownURL)
 	if err != nil {
 		return classifyFetchErr(MethodWellKnown, wellKnownURL, err)
@@ -192,7 +245,7 @@ func parseAgentmapDirectives(raw, baseURL string) []string {
 func classifyFetchErr(method, rawURL string, err error) Result {
 	var fe *fetch.Error
 	if errors.As(err, &fe) {
-		if fe.Status >= 400 && fe.Status < 500 {
+		if fe.Status >= 400 && fe.Status < 500 && fe.Status != http.StatusTooManyRequests {
 			return Result{
 				Method:     method,
 				URL:        rawURL,
@@ -206,6 +259,7 @@ func classifyFetchErr(method, rawURL string, err error) Result {
 			HTTPStatus:  fe.Status,
 			Outcome:     OutcomeError,
 			ErrorDetail: fe.Error(),
+			RetryError:  retryError(err),
 		}
 	}
 	return Result{
@@ -213,7 +267,15 @@ func classifyFetchErr(method, rawURL string, err error) Result {
 		URL:         rawURL,
 		Outcome:     OutcomeError,
 		ErrorDetail: err.Error(),
+		RetryError:  retryError(err),
 	}
+}
+
+func retryError(err error) error {
+	if fetch.Transient(err) {
+		return err
+	}
+	return nil
 }
 
 // resolveAgainst resolves ref against baseURL, returning the absolute
