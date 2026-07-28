@@ -77,6 +77,36 @@ sync-schema:
     echo "Re-vendored from upstream main. If anything changed above, update"
     echo "the pinned commit hash in $dir/PROVENANCE.md."
 
+# === Website ===
+
+# Deploy website/ to Vercel production from a clean export of HEAD
+[group('website')]
+deploy-website:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Publish exactly what is committed, and nothing else.
+    #
+    # Deploying the working directory makes publication a denylist: every
+    # stray file is live unless something remembered to exclude it. That is
+    # the wrong default here, because `ardvark` writes ./ardvark.db by
+    # default — so a crawl run from website/ leaves a database sitting next
+    # to the static files. Exporting HEAD inverts it to an allowlist:
+    # untracked files cannot reach the CDN at all, whatever they are.
+    if ! git diff --quiet HEAD -- website; then
+        echo "website/ has uncommitted changes; commit them first so the deploy matches HEAD." >&2
+        git status --short -- website >&2
+        exit 1
+    fi
+    staging="$(mktemp -d)"
+    trap 'rm -rf "$staging"' EXIT
+    git archive HEAD website | tar -x -C "$staging"
+    # .vercel/ holds the project linkage and is deliberately untracked, so
+    # it has to be carried over rather than exported.
+    cp -R website/.vercel "$staging/website/.vercel"
+    echo "Deploying $(git rev-parse --short HEAD) from a clean export:"
+    find "$staging/website" -type f -not -path "*/.vercel/*" | sed "s|$staging/website/|  |" | sort
+    cd "$staging/website" && npx vercel --prod --yes
+
 # === Release ===
 
 # Validate the goreleaser config
