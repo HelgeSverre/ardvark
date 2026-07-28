@@ -1,0 +1,16 @@
+# Nothing here is part of the published site.
+#
+# Without this file the deploy would depend on Vercel's default ignore
+# behaviour, and a stray crawl database in this directory would be served at
+# https://ardvark.no/ardvark.db. Local crawl output lands here easily (the
+# CLI defaults to ./ardvark.db), so exclude it explicitly.
+*.db
+*.db-journal
+*.jsonl
+
+# OG image generator source. The generated og.png sits at the site root and
+# is published; the Playwright script that produces it is not.
+og/
+
+node_modules/
+.DS_Store
