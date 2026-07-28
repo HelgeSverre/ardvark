@@ -14,6 +14,10 @@ dist/
 # unrunnable from a fresh clone.
 /ardvark.json
 
+# Per-machine Claude Code settings. The shared commands in .claude/commands/
+# are committed; local tool permissions are not.
+.claude/settings.local.json
+
 # Go
 coverage.out
 
