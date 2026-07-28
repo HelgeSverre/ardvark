@@ -137,6 +137,23 @@ func TestSeedOne(t *testing.T) {
 		}
 	})
 
+	t.Run("url preserves explicit port for host probe", func(t *testing.T) {
+		st := newTestStore(t)
+		eng := newTestEngine(t, st)
+
+		if _, err := SeedOne(eng, "https://example.com:8443/some/page"); err != nil {
+			t.Fatalf("SeedOne: %v", err)
+		}
+
+		var item store.FrontierItem
+		if err := st.DB.Where("kind = ?", store.KindHostProbe).First(&item).Error; err != nil {
+			t.Fatalf("loading host_probe: %v", err)
+		}
+		if item.Host != "example.com:8443" {
+			t.Errorf("host_probe host = %q, want %q", item.Host, "example.com:8443")
+		}
+	})
+
 	t.Run("bare domain seeds only host_probe", func(t *testing.T) {
 		st := newTestStore(t)
 		eng := newTestEngine(t, st)

@@ -1,6 +1,8 @@
 // Package harvest parses HTML documents to extract outbound links, the set
-// of hosts referenced by those links, and ai-catalog discovery hints found
-// in <link rel="ai-catalog" href="..."> tags.
+// of hosts referenced by those links, ARD discovery hints found in
+// <link rel="ard"> / <link rel="ai-catalog"> tags, and the raw contents of
+// any <script type="application/ld+json"> blocks (which may carry an ARD
+// catalog inline; interpreting them is the caller's job).
 package harvest
 
 import (
@@ -25,7 +27,23 @@ type Result struct {
 	// AICatalogHints holds absolute URLs from <link rel="ai-catalog"
 	// href="..."> tags, resolved the same way as anchor links.
 	AICatalogHints []string
+	// JSONLD holds the raw contents of the page's
+	// <script type="application/ld+json"> blocks, in document order and
+	// bounded by maxJSONLDBlocks/maxJSONLDBlockBytes. Contents are NOT
+	// parsed or validated here: most JSON-LD on the web is Schema.org
+	// markup that has nothing to do with ARD, so deciding what a block
+	// means is the caller's job.
+	JSONLD [][]byte
 }
+
+// Bounds on inline JSON-LD extraction. A page's JSON-LD is fetched as part
+// of the page body, which the crawler already size-caps, but these keep one
+// pathological page from turning into unbounded downstream parsing and
+// fan-out work.
+const (
+	maxJSONLDBlocks     = 32
+	maxJSONLDBlockBytes = 1 << 20 // 1 MiB per block
+)
 
 // ExtractLinks parses body as HTML relative to baseURL and extracts anchor
 // links, the set of unique hosts among them, and ai-catalog link hints.
@@ -57,11 +75,18 @@ func ExtractLinks(baseURL string, body io.Reader) (Result, error) {
 	linkSet := map[string]string{} // normalized key -> original resolved URL
 	hostSet := map[string]struct{}{}
 	catalogSet := map[string]string{}
+	var jsonLD [][]byte
 
 	var walk func(*html.Node)
 	walk = func(n *html.Node) {
 		if n.Type == html.ElementNode {
 			switch n.Data {
+			case "script":
+				if typ, ok := attr(n, "type"); ok && isJSONLDType(typ) {
+					if block, ok := scriptText(n); ok && len(jsonLD) < maxJSONLDBlocks {
+						jsonLD = append(jsonLD, block)
+					}
+				}
 			case "a", "area":
 				if href, ok := attr(n, "href"); ok {
 					if resolved, ok := resolveHTTPURL(effectiveBase, href); ok {
@@ -93,15 +118,54 @@ func ExtractLinks(baseURL string, body io.Reader) (Result, error) {
 		Links:          sortedValues(linkSet),
 		Hosts:          sortedKeys(hostSet),
 		AICatalogHints: sortedValues(catalogSet),
+		JSONLD:         jsonLD,
 	}, nil
 }
 
+// isJSONLDType reports whether a <script> type attribute names JSON-LD.
+// Comparison ignores case and any media-type parameters (e.g. charset).
+func isJSONLDType(typ string) bool {
+	base, _, _ := strings.Cut(typ, ";")
+	return strings.EqualFold(strings.TrimSpace(base), "application/ld+json")
+}
+
+// scriptText returns a script element's text content, or ok=false when it is
+// empty, or larger than maxJSONLDBlockBytes. Oversized blocks are dropped
+// rather than truncated: a partial JSON document would only fail to parse
+// later, with a confusing error.
+func scriptText(n *html.Node) ([]byte, bool) {
+	var sb strings.Builder
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if c.Type != html.TextNode {
+			continue
+		}
+		if sb.Len()+len(c.Data) > maxJSONLDBlockBytes {
+			return nil, false
+		}
+		sb.WriteString(c.Data)
+	}
+	text := strings.TrimSpace(sb.String())
+	if text == "" {
+		return nil, false
+	}
+	return []byte(text), true
+}
+
+// ardRelTokens are the link relation tokens that name an ARD document.
+// "ard" is preferred; "ai-catalog" is the original token and remains
+// supported, since that is what published pages currently use.
+var ardRelTokens = []string{"ard", "ai-catalog"}
+
 // isAICatalogRel reports whether rel (a possibly space-separated list of
-// link relation tokens) contains the "ai-catalog" token.
+// link relation tokens, per HTML's rel attribute) contains a token naming an
+// ARD document. Matching is per whole token and case-insensitive, so
+// rel="guard" and rel="ard-extra" do not match.
 func isAICatalogRel(rel string) bool {
 	for _, tok := range strings.Fields(rel) {
-		if strings.EqualFold(tok, "ai-catalog") {
-			return true
+		for _, want := range ardRelTokens {
+			if strings.EqualFold(tok, want) {
+				return true
+			}
 		}
 	}
 	return false

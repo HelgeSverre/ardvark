@@ -210,7 +210,22 @@ type Item = store.FrontierItem
 func (f *Frontier) Enqueue(item *store.FrontierItem) (bool, error) {
 	// No budget: -1 disables the per-(host, kind) row cap that
 	// EnqueueBudgeted applies (see enqueue).
-	return f.enqueue(item, -1)
+	return f.enqueue(item, -1, true, true)
+}
+
+// Ensure inserts item when its dedup key has never been seen, but unlike
+// Enqueue it never reactivates a done or failed row. It is used for
+// relationship-specific follow-up fan-out: crash recovery needs to fill any
+// missing child rows without redoing children that already completed.
+func (f *Frontier) Ensure(item *store.FrontierItem) (bool, error) {
+	return f.enqueue(item, -1, false, false)
+}
+
+// Resume ensures an item exists and reactivates it only when its previous
+// attempt failed. Completed work remains done. This is used when rebuilding
+// promised top-level work from durable probe hits.
+func (f *Frontier) Resume(item *store.FrontierItem) (bool, error) {
+	return f.enqueue(item, -1, false, true)
 }
 
 // EnqueueBudgeted behaves exactly like Enqueue except it refuses to create a
@@ -232,20 +247,22 @@ func (f *Frontier) Enqueue(item *store.FrontierItem) (bool, error) {
 // maxRowsForHostKind < 0 disables the budget entirely (equivalent to
 // Enqueue). A budget of 0 permits re-activations but no new rows.
 func (f *Frontier) EnqueueBudgeted(item *store.FrontierItem, maxRowsForHostKind int) (bool, error) {
-	return f.enqueue(item, maxRowsForHostKind)
+	return f.enqueue(item, maxRowsForHostKind, true, true)
 }
 
-// enqueue is the shared implementation of Enqueue and EnqueueBudgeted.
+// enqueue is the shared implementation of Enqueue, Ensure, and
+// EnqueueBudgeted.
 // maxRowsForHostKind < 0 means "no budget"; >= 0 caps the number of distinct
 // frontier_items rows for (item.Host, item.Kind), gating fresh inserts only
 // (see EnqueueBudgeted).
-func (f *Frontier) enqueue(item *store.FrontierItem, maxRowsForHostKind int) (bool, error) {
+func (f *Frontier) enqueue(item *store.FrontierItem, maxRowsForHostKind int, reactivateDone, reactivateFailed bool) (bool, error) {
 	if item.DedupKey == "" {
 		return false, fmt.Errorf("frontier: enqueue requires a non-empty DedupKey")
 	}
 	if item.Status == "" {
 		item.Status = store.FrontierStatusPending
 	}
+	item.DedupVersion = store.FrontierDedupVersion
 	// HostShard is derived, never caller-supplied: computing it here (the
 	// one place every item passes through before being written) guarantees
 	// every row's shard reflects the host that will actually be fetched,
@@ -324,6 +341,12 @@ func (f *Frontier) enqueue(item *store.FrontierItem, maxRowsForHostKind int) (bo
 	if existing.Status != store.FrontierStatusDone && existing.Status != store.FrontierStatusFailed {
 		return false, nil
 	}
+	if existing.Status == store.FrontierStatusDone && !reactivateDone {
+		return false, nil
+	}
+	if existing.Status == store.FrontierStatusFailed && !reactivateFailed {
+		return false, nil
+	}
 
 	// The status check above and this UPDATE are not atomic: another
 	// worker could dequeue/complete/fail the same row in between (e.g.
@@ -334,7 +357,7 @@ func (f *Frontier) enqueue(item *store.FrontierItem, maxRowsForHostKind int) (bo
 	// changed the row's status out from under us, so this call lost the
 	// race and must not report success.
 	res := f.db.Model(&store.FrontierItem{}).
-		Where("id = ? AND status IN ?", existing.ID, []string{store.FrontierStatusDone, store.FrontierStatusFailed}).
+		Where("id = ? AND status = ?", existing.ID, existing.Status).
 		Updates(leaseReleaseUpdates(store.FrontierStatusPending, map[string]any{
 			"attempts":   0,
 			"last_error": "",

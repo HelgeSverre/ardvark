@@ -436,6 +436,95 @@ func TestEnqueueResetAdoptsNewProvenance(t *testing.T) {
 	}
 }
 
+func TestEnsureDoesNotReactivateCompletedItem(t *testing.T) {
+	f := newTestFrontier(t)
+	parent := uint(1)
+	item := &store.FrontierItem{
+		Kind:            store.KindCatalogFetch,
+		URL:             "https://example.com/catalog.json",
+		Host:            "example.com",
+		DedupKey:        "ensure-completed",
+		ParentCatalogID: &parent,
+	}
+	if added, err := f.Enqueue(item); err != nil || !added {
+		t.Fatalf("Enqueue: added=%v err=%v", added, err)
+	}
+	if err := f.db.Model(&store.FrontierItem{}).Where("id = ?", item.ID).
+		Update("status", store.FrontierStatusDone).Error; err != nil {
+		t.Fatalf("mark done: %v", err)
+	}
+
+	newParent := uint(2)
+	added, err := f.Ensure(&store.FrontierItem{
+		Kind:            item.Kind,
+		URL:             item.URL,
+		Host:            item.Host,
+		DedupKey:        item.DedupKey,
+		ParentCatalogID: &newParent,
+	})
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if added {
+		t.Fatal("Ensure added/reactivated a completed item")
+	}
+
+	var got store.FrontierItem
+	if err := f.db.First(&got, item.ID).Error; err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got.Status != store.FrontierStatusDone {
+		t.Errorf("status = %q, want done", got.Status)
+	}
+	if got.ParentCatalogID == nil || *got.ParentCatalogID != parent {
+		t.Errorf("parent_catalog_id = %v, want original %d", got.ParentCatalogID, parent)
+	}
+}
+
+func TestResumeReactivatesFailedButNotDone(t *testing.T) {
+	for _, status := range []string{store.FrontierStatusFailed, store.FrontierStatusDone} {
+		t.Run(status, func(t *testing.T) {
+			f := newTestFrontier(t)
+			item := &store.FrontierItem{
+				Kind:     store.KindCatalogFetch,
+				URL:      "https://example.com/catalog.json",
+				Host:     "example.com",
+				DedupKey: "resume-" + status,
+			}
+			if added, err := f.Enqueue(item); err != nil || !added {
+				t.Fatalf("Enqueue: added=%v err=%v", added, err)
+			}
+			if err := f.db.Model(&store.FrontierItem{}).Where("id = ?", item.ID).
+				Update("status", status).Error; err != nil {
+				t.Fatalf("setting status: %v", err)
+			}
+
+			added, err := f.Resume(&store.FrontierItem{
+				Kind: item.Kind, URL: item.URL, Host: item.Host, DedupKey: item.DedupKey,
+			})
+			if err != nil {
+				t.Fatalf("Resume: %v", err)
+			}
+			wantAdded := status == store.FrontierStatusFailed
+			if added != wantAdded {
+				t.Errorf("Resume added = %v, want %v", added, wantAdded)
+			}
+
+			var got store.FrontierItem
+			if err := f.db.First(&got, item.ID).Error; err != nil {
+				t.Fatalf("reload: %v", err)
+			}
+			wantStatus := status
+			if status == store.FrontierStatusFailed {
+				wantStatus = store.FrontierStatusPending
+			}
+			if got.Status != wantStatus {
+				t.Errorf("status = %q, want %q", got.Status, wantStatus)
+			}
+		})
+	}
+}
+
 // ReclaimInFlight returns items stranded in_flight by a killed process back to
 // pending so a resumed crawl picks them up.
 func TestReclaimInFlight(t *testing.T) {

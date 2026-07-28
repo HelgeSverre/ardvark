@@ -32,6 +32,7 @@ import (
 	"github.com/helgesverre/ardvark/internal/config"
 	"github.com/helgesverre/ardvark/internal/fetch"
 	"github.com/helgesverre/ardvark/internal/frontier"
+	"github.com/helgesverre/ardvark/internal/probe"
 	"github.com/helgesverre/ardvark/internal/store"
 )
 
@@ -93,12 +94,13 @@ type Options struct {
 // Engine drains the frontier with a bounded worker pool, dispatching each
 // item to its kind-specific handler.
 type Engine struct {
-	cfg      config.Config
-	store    *store.Store
-	frontier *frontier.Frontier
-	fetch    *fetch.Client
-	logger   *slog.Logger
-	opts     Options
+	cfg       config.Config
+	store     *store.Store
+	frontier  *frontier.Frontier
+	fetch     *fetch.Client
+	logger    *slog.Logger
+	opts      Options
+	probeHost func(context.Context, *fetch.Client, string) []probe.Result
 
 	httpClientOnce sync.Once
 	httpClient     *http.Client
@@ -108,12 +110,13 @@ type Engine struct {
 // (or slog.Default() in tests).
 func New(cfg config.Config, st *store.Store, fr *frontier.Frontier, fetchClient *fetch.Client, logger *slog.Logger, opts Options) *Engine {
 	return &Engine{
-		cfg:      cfg,
-		store:    st,
-		frontier: fr,
-		fetch:    fetchClient,
-		logger:   logger,
-		opts:     opts,
+		cfg:       cfg,
+		store:     st,
+		frontier:  fr,
+		fetch:     fetchClient,
+		logger:    logger,
+		opts:      opts,
+		probeHost: probe.Probe,
 	}
 }
 
@@ -150,14 +153,35 @@ type provenance struct {
 }
 
 // enqueue builds (via buildItem) and enqueues a frontier item for kind. An
-// enqueue failure is warn-logged here — the crawl always continues without
-// the item — and also returned for the callers that must react to it (seed
-// enqueues). Page-fetch fan-out uses enqueuePageFetch instead, which applies
-// the maxPagesPerDomain budget.
+// enqueue failure is logged and returned so the parent item can retry instead
+// of completing with missing follow-up work. Page-fetch fan-out uses
+// enqueuePageFetch instead, which applies the maxPagesPerDomain budget.
 func (e *Engine) enqueue(kind, url, host string, depth int, prov provenance) (bool, error) {
 	added, err := e.frontier.Enqueue(e.buildItem(kind, url, host, depth, prov))
 	if err != nil {
 		e.logger.Warn("crawler: failed to enqueue item", "kind", kind, "url", url, "host", host, "error", err)
+		return false, err
+	}
+	return added, nil
+}
+
+// ensure inserts relationship-specific follow-up work if it has never been
+// queued, without reactivating a completed row during crash-recovery fan-out.
+func (e *Engine) ensure(kind, url, host string, depth int, prov provenance) (bool, error) {
+	added, err := e.frontier.Ensure(e.buildItem(kind, url, host, depth, prov))
+	if err != nil {
+		e.logger.Warn("crawler: failed to ensure item", "kind", kind, "url", url, "host", host, "error", err)
+		return false, err
+	}
+	return added, nil
+}
+
+// resume inserts promised work if missing and retries a prior failed row, while
+// leaving completed work untouched.
+func (e *Engine) resume(kind, url, host string, depth int, prov provenance) (bool, error) {
+	added, err := e.frontier.Resume(e.buildItem(kind, url, host, depth, prov))
+	if err != nil {
+		e.logger.Warn("crawler: failed to resume item", "kind", kind, "url", url, "host", host, "error", err)
 		return false, err
 	}
 	return added, nil
@@ -183,14 +207,30 @@ func (e *Engine) enqueuePageFetch(url, host string, depth int) (bool, error) {
 	return added, nil
 }
 
-// buildItem constructs a frontier item for kind, deriving the dedup key from
-// the item's natural key (host for host_probe, URL otherwise) in one place so
-// keys cannot drift across call sites, and stamping prov onto the row so a
-// handler can read it back after the item is dequeued.
+// buildItem constructs a frontier item for kind, deriving a relationship-aware
+// dedup key and stamping prov onto the row so a handler can read it back after
+// the item is dequeued.
 func (e *Engine) buildItem(kind, url, host string, depth int, prov provenance) *store.FrontierItem {
 	natural := url
 	if kind == store.KindHostProbe {
 		natural = host
+	}
+	switch kind {
+	case store.KindCatalogFetch:
+		if prov.ParentCatalogID != nil {
+			natural += fmt.Sprintf("\x00parent_catalog:%d", *prov.ParentCatalogID)
+		}
+	case store.KindArtifactFetch:
+		if prov.ArtifactEntryID != nil {
+			natural += fmt.Sprintf("\x00artifact_entry:%d", *prov.ArtifactEntryID)
+		}
+	case store.KindRegistryHarvest:
+		switch {
+		case prov.RegistryRowID != nil:
+			natural += fmt.Sprintf("\x00registry_row:%d", *prov.RegistryRowID)
+		case prov.RegistryEntryID != nil:
+			natural += fmt.Sprintf("\x00registry_entry:%d", *prov.RegistryEntryID)
+		}
 	}
 	return &store.FrontierItem{
 		RunID:             e.opts.RunID,
@@ -557,34 +597,30 @@ func (e *Engine) maxReferralDepth() int {
 	return e.cfg.Registry.MaxReferralDepth
 }
 
-// dedupKey builds a frontier dedup key from a kind and a natural key (URL or
-// host) by hashing "kind:natural" with SHA-256 and hex-encoding it, always
-// yielding exactly 64 lowercase hex characters regardless of input length.
+// dedupKey builds a frontier dedup key from a kind and a natural key (host,
+// URL, or URL plus relationship provenance) by hashing "kind:natural" with
+// SHA-256 and hex-encoding it, always yielding exactly 64 lowercase hex
+// characters regardless of input length.
 //
 // The fixed width is load-bearing, not cosmetic. The natural key derives from
 // FrontierItem.URL (size:2048), but the dedup key is stored in a much narrower
 // uniqueIndex column (store.FrontierItem.DedupKey, size:64). Using the raw
 // "kind:natural" string there would overflow on any long URL — common via
 // anchor fan-out — with driver-dependent, data-losing consequences:
-// Postgres/MySQL-strict reject the insert (the item is dropped, since enqueue
-// only warn-logs), while MySQL non-strict silently truncates to the column
-// width, so two distinct long URLs sharing a prefix collide and one is lost.
+// Postgres/MySQL-strict reject the insert, while MySQL non-strict silently
+// truncates to the column width, so two distinct long URLs sharing a prefix
+// collide and one is lost.
 // Hashing bounds the key to 64 hex chars — well under MySQL's utf8mb4 768-char
 // unique-index key limit — while keeping collisions cryptographically
 // negligible, so distinct URLs of any length always get distinct keys.
 //
 // This is the single source of truth for key derivation: every enqueue routes
 // through Engine.enqueue -> buildItem -> dedupKey, and frontier.Enqueue treats
-// DedupKey as an opaque required value. Changing the derivation therefore
-// re-keys the whole frontier: upgrading from <=0.4.0 (which stored raw
-// "kind:natural" keys) means pre-existing frontier_items rows no longer match
-// the hashed lookups of new enqueues. That is benign for a crawler — worst
-// case a still-pending or already-done URL is re-discovered and re-enqueued
-// once (status guards prevent duplicating live work); no corruption results.
-// Rather than rewrite the old keys in place (impossible under the narrowed
-// varchar(64) column — see store.migrateFrontierDedupKey), store.Open discards
-// the stale <=0.4.0 frontier table on the first 0.4.1 open so those rows are
-// simply re-discovered.
+// DedupKey as an opaque required value. Changing the natural-key semantics
+// therefore re-keys the whole frontier. Enqueue stamps FrontierDedupVersion,
+// and store.Open discards rows from older semantics rather than allowing an
+// old URL-only row to collapse a relationship-aware enqueue. The separate
+// store.migrateFrontierDedupKey handles the <=0.4.0 raw-key column shape.
 func dedupKey(kind, natural string) string {
 	sum := sha256.Sum256([]byte(kind + ":" + natural))
 	return hex.EncodeToString(sum[:])

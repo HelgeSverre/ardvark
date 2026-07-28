@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -14,11 +15,14 @@ import (
 	"testing"
 	"time"
 
+	"gorm.io/gorm"
+
 	"github.com/helgesverre/ardvark/internal/ard"
 	"github.com/helgesverre/ardvark/internal/config"
 	"github.com/helgesverre/ardvark/internal/fetch"
 	"github.com/helgesverre/ardvark/internal/frontier"
 	"github.com/helgesverre/ardvark/internal/probe"
+	"github.com/helgesverre/ardvark/internal/registry"
 	"github.com/helgesverre/ardvark/internal/store"
 )
 
@@ -209,6 +213,36 @@ func TestHandlePageFetch_LinkTagHintEnqueuesCatalogFetch(t *testing.T) {
 	}
 }
 
+func TestHandlePageFetch_PropagatesFollowupEnqueueFailure(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<a href="https://other-host.example/thing">external</a>`))
+	})
+	mux.HandleFunc("/robots.txt", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	wantErr := errors.New("frontier insert failed")
+	if err := st.DB.Callback().Create().Before("gorm:create").
+		Register("test:fail_frontier_insert", func(db *gorm.DB) {
+			if db.Statement != nil && db.Statement.Table == "frontier_items" {
+				db.AddError(wantErr)
+			}
+		}); err != nil {
+		t.Fatalf("register callback: %v", err)
+	}
+
+	host := strings.TrimPrefix(srv.URL, "http://")
+	err := eng.handlePageFetch(context.Background(), store.FrontierItem{URL: srv.URL + "/", Host: host})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("handlePageFetch error = %v, want %v", err, wantErr)
+	}
+}
+
 func TestHandlePageFetch_RespectsMaxDepth(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -345,6 +379,90 @@ func TestHandleHostProbe_ForceBypassesFreshness(t *testing.T) {
 	}
 }
 
+func TestHandleHostProbe_TransientFailureRemainsRetryableAndUnprobed(t *testing.T) {
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	eng.probeHost = func(context.Context, *fetch.Client, string) []probe.Result {
+		return []probe.Result{{
+			Method:      probe.MethodWellKnown,
+			URL:         "https://example.com/.well-known/ai-catalog.json",
+			Outcome:     probe.OutcomeError,
+			ErrorDetail: "deadline exceeded",
+			RetryError:  context.DeadlineExceeded,
+		}}
+	}
+
+	err := eng.handleHostProbe(context.Background(), store.FrontierItem{Host: "example.com"})
+	if err == nil {
+		t.Fatal("handleHostProbe error = nil, want retryable error")
+	}
+	if !fetch.Transient(err) {
+		t.Fatalf("handleHostProbe error = %v, want transient", err)
+	}
+
+	domain, err := st.DomainByHost("example.com")
+	if err != nil {
+		t.Fatalf("DomainByHost: %v", err)
+	}
+	if domain.ARDStatus != store.ARDStatusUnprobed {
+		t.Errorf("ARDStatus = %q, want %q while a probe mechanism is indeterminate", domain.ARDStatus, store.ARDStatusUnprobed)
+	}
+	if domain.LastProbedAt != nil {
+		t.Errorf("LastProbedAt = %v, want nil while the probe remains retryable", domain.LastProbedAt)
+	}
+
+	var probes int64
+	if err := st.DB.Model(&store.Probe{}).Where("domain_id = ?", domain.ID).Count(&probes).Error; err != nil {
+		t.Fatalf("counting probes: %v", err)
+	}
+	if probes != 1 {
+		t.Errorf("recorded probes = %d, want 1", probes)
+	}
+}
+
+func TestHandleHostProbe_RetryDoesNotReactivateCompletedCatalogFetch(t *testing.T) {
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	const catalogURL = "https://example.com/.well-known/ai-catalog.json"
+	eng.probeHost = func(context.Context, *fetch.Client, string) []probe.Result {
+		return []probe.Result{
+			{
+				Method:      probe.MethodWellKnown,
+				URL:         catalogURL,
+				Outcome:     probe.OutcomeHit,
+				CatalogURLs: []string{catalogURL},
+			},
+			{
+				Method:      probe.MethodRobotsAgentmap,
+				URL:         "https://example.com/robots.txt",
+				Outcome:     probe.OutcomeError,
+				ErrorDetail: "rate limited",
+				RetryError:  context.DeadlineExceeded,
+			},
+		}
+	}
+
+	if err := eng.handleHostProbe(context.Background(), store.FrontierItem{Host: "example.com"}); err == nil {
+		t.Fatal("first handleHostProbe error = nil, want retryable error")
+	}
+
+	var child store.FrontierItem
+	if err := st.DB.Where("kind = ? AND url = ?", store.KindCatalogFetch, catalogURL).First(&child).Error; err != nil {
+		t.Fatalf("loading catalog_fetch: %v", err)
+	}
+	if err := st.DB.Model(&child).Update("status", store.FrontierStatusDone).Error; err != nil {
+		t.Fatalf("marking catalog_fetch done: %v", err)
+	}
+
+	if err := eng.handleHostProbe(context.Background(), store.FrontierItem{Host: "example.com", Attempts: 1}); err == nil {
+		t.Fatal("retry handleHostProbe error = nil, want retryable error")
+	}
+	if err := st.DB.First(&child, child.ID).Error; err != nil {
+		t.Fatalf("reloading catalog_fetch: %v", err)
+	}
+	if child.Status != store.FrontierStatusDone {
+		t.Errorf("catalog_fetch status = %q, want done", child.Status)
+	}
+}
+
 // -- catalog_fetch ------------------------------------------------------
 
 func TestHandleCatalogFetch_SavesCatalogAndEnqueuesFollowOns(t *testing.T) {
@@ -435,6 +553,49 @@ func TestHandleCatalogFetch_SavesCatalogAndEnqueuesFollowOns(t *testing.T) {
 	}
 }
 
+func TestHandleCatalogFetch_UsesFinalServingHost(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/ai-catalog+json")
+		w.Write([]byte(`{"specVersion":"1.0","host":{"displayName":"Foreign"},"entries":[]}`))
+	}))
+	defer target.Close()
+
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/catalog.json", http.StatusFound)
+	}))
+	defer redirect.Close()
+
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	item := store.FrontierItem{
+		URL:  redirect.URL + "/catalog.json",
+		Host: "parent.example",
+	}
+	if err := eng.handleCatalogFetch(context.Background(), item); err != nil {
+		t.Fatalf("handleCatalogFetch: %v", err)
+	}
+
+	targetHost := strings.TrimPrefix(target.URL, "http://")
+	var domain store.Domain
+	if err := st.DB.Where("host = ?", targetHost).First(&domain).Error; err != nil {
+		t.Fatalf("serving-host domain was not stored: %v", err)
+	}
+	var catalog store.Catalog
+	if err := st.DB.Where("domain_id = ?", domain.ID).First(&catalog).Error; err != nil {
+		t.Fatalf("serving-host catalog was not stored: %v", err)
+	}
+	if catalog.SourceURL != target.URL+"/catalog.json" {
+		t.Errorf("SourceURL = %q, want final URL %q", catalog.SourceURL, target.URL+"/catalog.json")
+	}
+
+	var parentRows int64
+	if err := st.DB.Model(&store.Domain{}).Where("host = ?", "parent.example").Count(&parentRows).Error; err != nil {
+		t.Fatalf("counting parent domains: %v", err)
+	}
+	if parentRows != 0 {
+		t.Errorf("parent.example domain rows = %d, want 0", parentRows)
+	}
+}
+
 func TestHandleCatalogFetch_UnchangedContentSkipsResave(t *testing.T) {
 	mux := http.NewServeMux()
 	srv := httptest.NewServer(mux)
@@ -474,6 +635,87 @@ func TestHandleCatalogFetch_UnchangedContentSkipsResave(t *testing.T) {
 	st.DB.Model(&store.Catalog{}).Where("source_url = ?", item.URL).Count(&catalogCount)
 	if catalogCount != 2 {
 		t.Errorf("expected 2 catalog rows after --force re-fetch, got %d", catalogCount)
+	}
+}
+
+func TestHandleCatalogFetch_UnchangedDoesNotReactivateCompletedFollowups(t *testing.T) {
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	body := strings.ReplaceAll(rootCatalogJSON(hostPlaceholder), hostPlaceholder, srv.URL)
+	mux.HandleFunc("/catalog.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/ai-catalog+json")
+		w.Write([]byte(body))
+	})
+
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	host := strings.TrimPrefix(srv.URL, "http://")
+	item := store.FrontierItem{URL: srv.URL + "/catalog.json", Host: host}
+	if err := eng.handleCatalogFetch(context.Background(), item); err != nil {
+		t.Fatalf("first handleCatalogFetch: %v", err)
+	}
+
+	followupKinds := []string{store.KindArtifactFetch, store.KindCatalogFetch, store.KindRegistryHarvest}
+	if err := st.DB.Model(&store.FrontierItem{}).
+		Where("kind IN ?", followupKinds).
+		Update("status", store.FrontierStatusDone).Error; err != nil {
+		t.Fatalf("marking followups done: %v", err)
+	}
+
+	var registryRowsBefore int64
+	if err := st.DB.Model(&store.Registry{}).Count(&registryRowsBefore).Error; err != nil {
+		t.Fatalf("counting registries: %v", err)
+	}
+	if err := eng.handleCatalogFetch(context.Background(), item); err != nil {
+		t.Fatalf("unchanged handleCatalogFetch: %v", err)
+	}
+
+	var reactivated int64
+	if err := st.DB.Model(&store.FrontierItem{}).
+		Where("kind IN ? AND status = ?", followupKinds, store.FrontierStatusPending).
+		Count(&reactivated).Error; err != nil {
+		t.Fatalf("counting reactivated followups: %v", err)
+	}
+	if reactivated != 0 {
+		t.Errorf("reactivated completed followups = %d, want 0", reactivated)
+	}
+
+	var registryRowsAfter int64
+	if err := st.DB.Model(&store.Registry{}).Count(&registryRowsAfter).Error; err != nil {
+		t.Fatalf("counting registries after unchanged fetch: %v", err)
+	}
+	if registryRowsAfter != registryRowsBefore {
+		t.Errorf("registry rows = %d after unchanged fetch, want %d", registryRowsAfter, registryRowsBefore)
+	}
+}
+
+func TestProcessCatalog_SameURLFromDifferentParentsPreservesBothRelationships(t *testing.T) {
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	raw := []byte(`{"specVersion":"1.0","host":{"displayName":"Shared"},"entries":[]}`)
+	sum := sha256.Sum256(raw)
+	hash := fmt.Sprintf("%x", sum[:])
+	parentA := uint(101)
+	parentB := uint(202)
+	const sourceURL = "https://shared.example/catalog.json"
+
+	if err := eng.processCatalog(context.Background(), raw, hash, "shared.example", sourceURL, &parentA, "", 1, nil); err != nil {
+		t.Fatalf("processCatalog(parent A): %v", err)
+	}
+	if err := eng.processCatalog(context.Background(), raw, hash, "shared.example", sourceURL, &parentB, "", 1, nil); err != nil {
+		t.Fatalf("processCatalog(parent B): %v", err)
+	}
+
+	var catalogs []store.Catalog
+	if err := st.DB.Where("source_url = ?", sourceURL).Order("id ASC").Find(&catalogs).Error; err != nil {
+		t.Fatalf("loading catalogs: %v", err)
+	}
+	if len(catalogs) != 2 {
+		t.Fatalf("catalog rows = %d, want 2", len(catalogs))
+	}
+	if catalogs[0].ParentCatalogID == nil || catalogs[1].ParentCatalogID == nil ||
+		*catalogs[0].ParentCatalogID == *catalogs[1].ParentCatalogID {
+		t.Errorf("parent relationships = %v, %v; want distinct parents", catalogs[0].ParentCatalogID, catalogs[1].ParentCatalogID)
 	}
 }
 
@@ -686,6 +928,55 @@ func TestProcess_FailsPermanentlyOnUnknownKind(t *testing.T) {
 }
 
 // -- provenance persistence ------------------------------------------------
+
+func TestEnqueue_SameURLWithDifferentProvenanceKeepsBothRelationships(t *testing.T) {
+	tests := []struct {
+		name string
+		kind string
+		a    provenance
+		b    provenance
+	}{
+		{
+			name: "nested catalogs",
+			kind: store.KindCatalogFetch,
+			a:    provenance{ParentCatalogID: uintPtr(1)},
+			b:    provenance{ParentCatalogID: uintPtr(2)},
+		},
+		{
+			name: "artifacts",
+			kind: store.KindArtifactFetch,
+			a:    provenance{ArtifactEntryID: uintPtr(1)},
+			b:    provenance{ArtifactEntryID: uintPtr(2)},
+		},
+		{
+			name: "registries",
+			kind: store.KindRegistryHarvest,
+			a:    provenance{RegistryRowID: uintPtr(1)},
+			b:    provenance{RegistryRowID: uintPtr(2)},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			eng, st := newTestEngine(t, testCrawlerConfig())
+			const sharedURL = "https://shared.example/resource.json"
+			if added, err := eng.enqueue(tt.kind, sharedURL, "parent.example", 0, tt.a); err != nil || !added {
+				t.Fatalf("first enqueue: added=%v err=%v", added, err)
+			}
+			if added, err := eng.enqueue(tt.kind, sharedURL, "parent.example", 0, tt.b); err != nil || !added {
+				t.Fatalf("second enqueue: added=%v err=%v", added, err)
+			}
+
+			var count int64
+			if err := st.DB.Model(&store.FrontierItem{}).Where("kind = ? AND url = ?", tt.kind, sharedURL).Count(&count).Error; err != nil {
+				t.Fatalf("counting frontier items: %v", err)
+			}
+			if count != 2 {
+				t.Errorf("frontier rows = %d, want 2", count)
+			}
+		})
+	}
+}
 
 // TestProcess_PersistsProvenanceAcrossRetry ensures a transient failure
 // (retries remaining) leaves the frontier row's provenance columns intact:
@@ -1577,7 +1868,9 @@ func TestFollowCatalogPointer_EnqueuesCatalogFetch(t *testing.T) {
 	eng, st := newTestEngine(t, testCrawlerConfig())
 	parent := uint(42)
 	en := ard.Entry{Identifier: "urn:air:example.com:catalogs:c", Type: "application/ai-catalog", URL: "https://x.example/c.json"}
-	eng.followCatalogPointer(context.Background(), en, "x.example", "https://x.example/root.json", 3, &parent)
+	if err := eng.followCatalogPointer(context.Background(), en, "x.example", "https://x.example/root.json", 3, &parent); err != nil {
+		t.Fatalf("followCatalogPointer: %v", err)
+	}
 
 	var it store.FrontierItem
 	if err := st.DB.Where("kind = ? AND url = ?", store.KindCatalogFetch, "https://x.example/c.json").First(&it).Error; err != nil {
@@ -1594,7 +1887,9 @@ func TestFollowCatalogPointer_EnqueuesCatalogFetch(t *testing.T) {
 func TestFollowCatalogPointer_EmbeddedRecurses(t *testing.T) {
 	eng, st := newTestEngine(t, testCrawlerConfig())
 	en := ard.Entry{Identifier: "urn:air:example.com:catalogs:emb", Type: "application/ai-catalog", Data: json.RawMessage(`{"specVersion":"1.0","host":{"displayName":"E"},"entries":[]}`)}
-	eng.followCatalogPointer(context.Background(), en, "x.example", "https://x.example/root.json", 1, nil)
+	if err := eng.followCatalogPointer(context.Background(), en, "x.example", "https://x.example/root.json", 1, nil); err != nil {
+		t.Fatalf("followCatalogPointer: %v", err)
+	}
 
 	var fetch int64
 	st.DB.Model(&store.FrontierItem{}).Where("kind = ?", store.KindCatalogFetch).Count(&fetch)
@@ -1611,7 +1906,9 @@ func TestFollowCatalogPointer_EmbeddedRecurses(t *testing.T) {
 func TestFollowRegistryPointer_SavesRowAndEnqueues(t *testing.T) {
 	eng, st := newTestEngine(t, testCrawlerConfig())
 	regRow := &store.Registry{BaseURL: "https://x.example/reg", HarvestStatus: store.HarvestStatusPending}
-	eng.followRegistryPointer("https://x.example/reg", "x.example", 2, regRow, provenance{})
+	if err := eng.followRegistryPointer("https://x.example/reg", "x.example", 2, regRow, provenance{}); err != nil {
+		t.Fatalf("followRegistryPointer: %v", err)
+	}
 
 	if regRow.ID == 0 {
 		t.Fatal("expected registries row saved with a nonzero ID")
@@ -1826,6 +2123,43 @@ func TestHandleHostProbe_ResumeAfterCrashBeforeCatalogEnqueueStillEnqueues(t *te
 	}
 }
 
+func TestHandleHostProbe_ResumeReactivatesFailedCatalogFetch(t *testing.T) {
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	const host = "failed-catalog.example"
+	catalogURL := "https://" + host + "/.well-known/ai-catalog.json"
+
+	domain, err := st.UpsertDomain(host, store.DiscoverySourceSeed)
+	if err != nil {
+		t.Fatalf("UpsertDomain: %v", err)
+	}
+	if err := st.RecordProbe(&store.Probe{
+		DomainID: domain.ID, Method: probe.MethodWellKnown, URL: catalogURL,
+		Outcome: probe.OutcomeHit, ProbedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("RecordProbe: %v", err)
+	}
+	if _, err := eng.enqueue(store.KindCatalogFetch, catalogURL, host, 0, provenance{ProbeMethod: probe.MethodWellKnown}); err != nil {
+		t.Fatalf("enqueue catalog: %v", err)
+	}
+	if err := st.DB.Model(&store.FrontierItem{}).
+		Where("kind = ? AND url = ?", store.KindCatalogFetch, catalogURL).
+		Update("status", store.FrontierStatusFailed).Error; err != nil {
+		t.Fatalf("mark catalog failed: %v", err)
+	}
+
+	if err := eng.handleHostProbe(context.Background(), store.FrontierItem{Host: host}); err != nil {
+		t.Fatalf("handleHostProbe: %v", err)
+	}
+
+	var item store.FrontierItem
+	if err := st.DB.Where("kind = ? AND url = ?", store.KindCatalogFetch, catalogURL).First(&item).Error; err != nil {
+		t.Fatalf("loading catalog fetch: %v", err)
+	}
+	if item.Status != store.FrontierStatusPending {
+		t.Errorf("catalog fetch status = %q, want pending", item.Status)
+	}
+}
+
 // TestHandleHostProbe_ResumeAfterCrashMidAgentmapFanoutStillEnqueuesAll is
 // BUG 2's harder regression test, targeting the specific gap a reviewer
 // flagged in the first fix attempt: unlike well_known (which can only ever
@@ -1898,8 +2232,8 @@ func TestSplitChecks_DuplicateIdentifiersEachGetOwnChecks(t *testing.T) {
 		{Identifier: dup, DisplayName: "Second"},
 	}
 	checks := []ard.Check{
-		{CheckID: "entry.check", Subject: dup, Message: "for first"},
-		{CheckID: "entry.check", Subject: dup, Message: "for second"},
+		{CheckID: "entry.check", Subject: dup, EntryIndex: 0, Message: "for first"},
+		{CheckID: "entry.check", Subject: dup, EntryIndex: 1, Message: "for second"},
 	}
 
 	_, entryChecks := splitChecks(checks, entries)
@@ -1918,52 +2252,39 @@ func TestSplitChecks_DuplicateIdentifiersEachGetOwnChecks(t *testing.T) {
 	}
 }
 
-// TestSplitChecks_DuplicateIdentifiersInterleavedChecksAreApproximate pins
-// down splitChecks's documented limitation (see its doc comment): when
-// duplicate entries produce DIFFERING checks that arrive interleaved in
-// ard.Verify's flat list — e.g. two semantic checks (one per occurrence)
-// followed by two schema checks (one per occurrence), rather than each
-// occurrence's checks arriving already grouped together — checkBucket's
-// contiguous-chunk split does not realign them: it only guarantees the
-// total *count* per occurrence is preserved (2 checks each here), not that
-// each individual check lands on the occurrence it actually describes. This
-// is the interleaved case the task explicitly flagged as out of reach
-// without an entry-index field on ard.Check (out of scope: internal/ard is
-// not owned by this fix). The assertions below pin the CURRENT, imperfect,
-// distribution exactly so a future change to checkBucket cannot silently
-// regress it further without this test failing — this is a documented
-// approximation, not a claim of correctness.
-func TestSplitChecks_DuplicateIdentifiersInterleavedChecksAreApproximate(t *testing.T) {
+// TestSplitChecks_DuplicateIdentifiersInterleavedChecksAreExact covers the
+// case that used to be unreachable: duplicate entries producing DIFFERING
+// checks that arrive interleaved in ard.Verify's flat list — both semantic
+// checks (one per occurrence) before both schema checks (one per occurrence),
+// mirroring how semanticChecks and validateSchema each contribute their own
+// per-occurrence checks in their own pass order.
+//
+// Attribution is now driven by ard.Check.EntryIndex rather than by splitting
+// a shared identifier's checks into contiguous chunks, so each check lands on
+// the occurrence it actually describes regardless of arrival order.
+func TestSplitChecks_DuplicateIdentifiersInterleavedChecksAreExact(t *testing.T) {
 	const dup = "urn:air:example.com:agents:dup"
 	entries := []ard.Entry{
 		{Identifier: dup, DisplayName: "First"},
 		{Identifier: dup, DisplayName: "Second"},
 	}
-	// Interleaved by check kind, not by occurrence: both semantic checks
-	// (one per occurrence) before both schema checks (one per occurrence),
-	// mirroring how ard.Verify's semanticChecks/validateSchema stages each
-	// contribute their own per-occurrence checks in their own pass order.
 	checks := []ard.Check{
-		{CheckID: "entry.semantic", Subject: dup, Message: "semantic-occ0"},
-		{CheckID: "entry.semantic", Subject: dup, Message: "semantic-occ1"},
-		{CheckID: "entry.schema", Subject: dup, Message: "schema-occ0"},
-		{CheckID: "entry.schema", Subject: dup, Message: "schema-occ1"},
+		{CheckID: "entry.semantic", Subject: dup, EntryIndex: 0, Message: "semantic-occ0"},
+		{CheckID: "entry.semantic", Subject: dup, EntryIndex: 1, Message: "semantic-occ1"},
+		{CheckID: "entry.schema", Subject: dup, EntryIndex: 0, Message: "schema-occ0"},
+		{CheckID: "entry.schema", Subject: dup, EntryIndex: 1, Message: "schema-occ1"},
 	}
 
 	_, entryChecks := splitChecks(checks, entries)
 
 	if len(entryChecks[0]) != 2 || len(entryChecks[1]) != 2 {
-		t.Fatalf("expected the total to still split 2/2 across occurrences, got %d/%d", len(entryChecks[0]), len(entryChecks[1]))
+		t.Fatalf("expected a 2/2 split across occurrences, got %d/%d", len(entryChecks[0]), len(entryChecks[1]))
 	}
-	// Both of entry 0's checks are in fact the two "occ0" checks' contiguous
-	// chunk-mates ("semantic-occ0" is correctly attributed; "semantic-occ1"
-	// is NOT — it describes occurrence 1, not 0). Pinning the exact (if
-	// imperfect) messages documents the trade-off rather than hiding it.
-	if got := []string{entryChecks[0][0].Message, entryChecks[0][1].Message}; got[0] != "semantic-occ0" || got[1] != "semantic-occ1" {
-		t.Errorf("entry 0 checks = %v, want [semantic-occ0 semantic-occ1] (documented approximation)", got)
+	if got := []string{entryChecks[0][0].Message, entryChecks[0][1].Message}; got[0] != "semantic-occ0" || got[1] != "schema-occ0" {
+		t.Errorf("entry 0 checks = %v, want [semantic-occ0 schema-occ0]", got)
 	}
-	if got := []string{entryChecks[1][0].Message, entryChecks[1][1].Message}; got[0] != "schema-occ0" || got[1] != "schema-occ1" {
-		t.Errorf("entry 1 checks = %v, want [schema-occ0 schema-occ1] (documented approximation)", got)
+	if got := []string{entryChecks[1][0].Message, entryChecks[1][1].Message}; got[0] != "semantic-occ1" || got[1] != "schema-occ1" {
+		t.Errorf("entry 1 checks = %v, want [semantic-occ1 schema-occ1]", got)
 	}
 }
 
@@ -2035,5 +2356,397 @@ func TestHandleCatalogFetch_PermanentFailureEmitsProbeEvent(t *testing.T) {
 	}
 	if events[0].Outcome != probe.OutcomeError {
 		t.Errorf("event outcome = %q, want %q", events[0].Outcome, probe.OutcomeError)
+	}
+}
+
+// -- registry federation ---------------------------------------------------
+
+// newFederationRecordingRegistry returns a registry server that records the
+// federation mode of every /search request it receives and answers with one
+// referral.
+func newFederationRecordingRegistry(t *testing.T, got *[]string) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/registry/search", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Federation string `json:"federation"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decoding search request: %v", err)
+			return
+		}
+		*got = append(*got, req.Federation)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"results":   []any{},
+			"referrals": []map[string]any{{"identifier": "urn:air:peer.example:registries:r", "displayName": "Peer", "type": "application/ai-registry+json", "url": "https://peer.example/registry"}},
+			"pageToken": "",
+		})
+	})
+	return httptest.NewServer(mux)
+}
+
+// The crawler follows HarvestResult.Referrals, so it must request them.
+// Harvesting with federation "none" and then expecting referrals means a
+// spec-compliant registry silently yields none and referral crawling never
+// happens at all.
+func TestHandleRegistryHarvest_RequestsReferralsWithinDepthBudget(t *testing.T) {
+	var got []string
+	srv := newFederationRecordingRegistry(t, &got)
+	defer srv.Close()
+
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	reg := &store.Registry{BaseURL: srv.URL + "/registry", HarvestStatus: store.HarvestStatusPending}
+	if err := st.SaveRegistry(reg); err != nil {
+		t.Fatalf("SaveRegistry: %v", err)
+	}
+	item := store.FrontierItem{
+		Kind:          store.KindRegistryHarvest,
+		URL:           srv.URL + "/registry",
+		Host:          strings.TrimPrefix(srv.URL, "http://"),
+		Depth:         0,
+		RegistryRowID: &reg.ID,
+	}
+	if err := eng.handleRegistryHarvest(context.Background(), item); err != nil {
+		t.Fatalf("handleRegistryHarvest: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("registry received %d searches, want 1", len(got))
+	}
+	if got[0] != registry.FederationReferrals {
+		t.Errorf("federation = %q, want %q", got[0], registry.FederationReferrals)
+	}
+
+	var harvests int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ? AND url = ?", store.KindRegistryHarvest, "https://peer.example/registry").Count(&harvests)
+	if harvests != 1 {
+		t.Errorf("expected 1 registry_harvest enqueued from the referral, got %d", harvests)
+	}
+}
+
+// At the depth ceiling the crawler discards referrals, so asking a registry
+// to federate would be work neither side can use.
+func TestHandleRegistryHarvest_SkipsFederationAtDepthCeiling(t *testing.T) {
+	var got []string
+	srv := newFederationRecordingRegistry(t, &got)
+	defer srv.Close()
+
+	cfg := testCrawlerConfig()
+	cfg.Registry.MaxReferralDepth = 1
+	eng, st := newTestEngine(t, cfg)
+	reg := &store.Registry{BaseURL: srv.URL + "/registry", HarvestStatus: store.HarvestStatusPending}
+	if err := st.SaveRegistry(reg); err != nil {
+		t.Fatalf("SaveRegistry: %v", err)
+	}
+	item := store.FrontierItem{
+		Kind:          store.KindRegistryHarvest,
+		URL:           srv.URL + "/registry",
+		Host:          strings.TrimPrefix(srv.URL, "http://"),
+		Depth:         1, // one more hop would exceed MaxReferralDepth
+		RegistryRowID: &reg.ID,
+	}
+	if err := eng.handleRegistryHarvest(context.Background(), item); err != nil {
+		t.Fatalf("handleRegistryHarvest: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("registry received %d searches, want 1", len(got))
+	}
+	if got[0] != registry.FederationNone {
+		t.Errorf("federation = %q, want %q at the depth ceiling", got[0], registry.FederationNone)
+	}
+}
+
+// -- JSON-LD / extension term preservation ---------------------------------
+
+// The stored raw entry JSON is what exports and re-verification read, so a
+// crawl must persist the publisher's own bytes rather than a re-marshaling of
+// ardvark's struct — which models none of these terms and would drop them.
+func TestHandleCatalogFetch_PreservesJSONLDAndExtensionTerms(t *testing.T) {
+	const catalog = `{
+	  "specVersion": "1.0",
+	  "@context": "https://ards.dev/ns/v1",
+	  "host": {"displayName": "Example"},
+	  "entries": [{
+	    "@id": "https://example.com/agents/a",
+	    "identifier": "urn:air:example.com:agents:a",
+	    "displayName": "A",
+	    "type": "application/mcp-server-card",
+	    "url": "https://example.com/a",
+	    "representativeQueries": ["find a thing", "do a thing"],
+	    "acme:serviceTier": {"level": "gold", "regions": ["eu", "us"]}
+	  }]
+	}`
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/catalog.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(catalog))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	host := strings.TrimPrefix(srv.URL, "http://")
+	item := store.FrontierItem{URL: srv.URL + "/catalog.json", Host: host, Depth: 0}
+	if err := eng.handleCatalogFetch(context.Background(), item); err != nil {
+		t.Fatalf("handleCatalogFetch: %v", err)
+	}
+
+	var row store.CatalogEntry
+	if err := st.DB.Where("urn = ?", "urn:air:example.com:agents:a").First(&row).Error; err != nil {
+		t.Fatalf("loading stored entry: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal([]byte(row.RawJSON), &got); err != nil {
+		t.Fatalf("decoding stored raw_json %q: %v", row.RawJSON, err)
+	}
+	if got["@id"] != "https://example.com/agents/a" {
+		t.Errorf("stored raw_json lost @id: %s", row.RawJSON)
+	}
+	tier, ok := got["acme:serviceTier"].(map[string]any)
+	if !ok {
+		t.Fatalf("stored raw_json lost acme:serviceTier: %s", row.RawJSON)
+	}
+	if tier["level"] != "gold" {
+		t.Errorf("acme:serviceTier.level = %v, want gold", tier["level"])
+	}
+
+	// Known columns must still be populated from the same entry.
+	if row.DisplayName != "A" || row.MediaType != "application/mcp-server-card" {
+		t.Errorf("known columns not populated: DisplayName=%q MediaType=%q", row.DisplayName, row.MediaType)
+	}
+}
+
+// -- in-page JSON-LD ingestion ---------------------------------------------
+
+const inlineARDPage = `<html><head>
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"Organization","name":"Example Inc"}</script>
+<script type="application/ld+json">{"specVersion":"1.0","host":{"displayName":"Example"},"entries":[{"identifier":"urn:air:example.com:agents:inline","displayName":"Inline","type":"application/mcp-server-card","url":"https://example.com/inline","representativeQueries":["a thing","another thing"],"acme:tier":"gold"}]}</script>
+</head><body><a href="/other">other</a></body></html>`
+
+// A page whose only ARD publication is inline JSON-LD must still be indexed.
+func TestHandlePageFetch_IngestsInlineARDCatalog(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/page.html", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(inlineARDPage))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	host := strings.TrimPrefix(srv.URL, "http://")
+	item := store.FrontierItem{Kind: store.KindPageFetch, URL: srv.URL + "/page.html", Host: host, Depth: 0}
+	if err := eng.handlePageFetch(context.Background(), item); err != nil {
+		t.Fatalf("handlePageFetch: %v", err)
+	}
+
+	var entry store.CatalogEntry
+	if err := st.DB.Where("urn = ?", "urn:air:example.com:agents:inline").First(&entry).Error; err != nil {
+		t.Fatalf("inline entry was not stored: %v", err)
+	}
+	if !strings.Contains(string(entry.RawJSON), "acme:tier") {
+		t.Errorf("inline entry lost its extension terms: %s", entry.RawJSON)
+	}
+
+	// Provenance must point at the page, distinguishably from a hosted doc.
+	var cat store.Catalog
+	if err := st.DB.First(&cat, entry.CatalogID).Error; err != nil {
+		t.Fatalf("loading catalog: %v", err)
+	}
+	if !strings.HasPrefix(cat.SourceURL, srv.URL+"/page.html") {
+		t.Errorf("catalog SourceURL = %q, want it rooted at the page URL", cat.SourceURL)
+	}
+	if cat.SourceURL == srv.URL+"/page.html" {
+		t.Errorf("catalog SourceURL = %q, want a per-block fragment distinguishing it from the page itself", cat.SourceURL)
+	}
+}
+
+// Ordinary link harvesting must keep working on a page that also carries
+// inline JSON-LD.
+func TestHandlePageFetch_InlineJSONLDDoesNotBreakLinkHarvesting(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/page.html", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(inlineARDPage))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	host := strings.TrimPrefix(srv.URL, "http://")
+	item := store.FrontierItem{Kind: store.KindPageFetch, URL: srv.URL + "/page.html", Host: host, Depth: 0}
+	if err := eng.handlePageFetch(context.Background(), item); err != nil {
+		t.Fatalf("handlePageFetch: %v", err)
+	}
+
+	var pageFetches int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ? AND url = ?", store.KindPageFetch, srv.URL+"/other").Count(&pageFetches)
+	if pageFetches != 1 {
+		t.Errorf("expected the ordinary anchor to still be enqueued, got %d", pageFetches)
+	}
+}
+
+// Unrelated Schema.org markup must not create ARD rows.
+func TestHandlePageFetch_IgnoresNonARDJSONLD(t *testing.T) {
+	const page = `<html><head>
+	<script type="application/ld+json">{"@context":"https://schema.org","@type":"Organization","name":"Example Inc"}</script>
+	<script type="application/ld+json">{ broken json </script>
+	</head><body><a href="/other">o</a></body></html>`
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/page.html", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(page))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	host := strings.TrimPrefix(srv.URL, "http://")
+	item := store.FrontierItem{Kind: store.KindPageFetch, URL: srv.URL + "/page.html", Host: host, Depth: 0}
+	if err := eng.handlePageFetch(context.Background(), item); err != nil {
+		t.Fatalf("handlePageFetch: %v", err)
+	}
+
+	var catalogs int64
+	st.DB.Model(&store.Catalog{}).Count(&catalogs)
+	if catalogs != 0 {
+		t.Errorf("Schema.org markup produced %d catalog rows, want 0", catalogs)
+	}
+	var pageFetches int64
+	st.DB.Model(&store.FrontierItem{}).Where("kind = ? AND url = ?", store.KindPageFetch, srv.URL+"/other").Count(&pageFetches)
+	if pageFetches != 1 {
+		t.Errorf("malformed JSON-LD broke link harvesting: %d page_fetch rows", pageFetches)
+	}
+}
+
+// A page's crawl depth is a different budget from nested-catalog depth. An
+// inline catalog is a top-level document that happens to be embedded, so it
+// must be ingested no matter how deep the page it appeared on was found.
+func TestHandlePageFetch_IngestsInlineCatalogOnADeepPage(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/deep.html", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(inlineARDPage))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cfg := testCrawlerConfig()
+	eng, st := newTestEngine(t, cfg)
+	host := strings.TrimPrefix(srv.URL, "http://")
+	item := store.FrontierItem{
+		Kind:  store.KindPageFetch,
+		URL:   srv.URL + "/deep.html",
+		Host:  host,
+		Depth: cfg.ARD.MaxCatalogDepth + 2,
+	}
+	if err := eng.handlePageFetch(context.Background(), item); err != nil {
+		t.Fatalf("handlePageFetch: %v", err)
+	}
+
+	var entry store.CatalogEntry
+	if err := st.DB.Where("urn = ?", "urn:air:example.com:agents:inline").First(&entry).Error; err != nil {
+		t.Fatalf("inline entry on a deep page was not stored: %v", err)
+	}
+}
+
+// -- ard_status accuracy for cross-host advertising -------------------------
+
+// A host can advertise a catalog that another host serves — a robots.txt
+// Agentmap pointing at a sibling domain is the common real-world shape (a
+// marketing domain pointing at the product domain). The verification verdict
+// belongs to the SERVING host, so the advertising host is never the subject
+// of that write. It must still not be reported as though it were never
+// looked at: it was probed, and it does advertise ARD.
+func TestHandleHostProbe_CrossHostAdvertiserIsNotLeftUnprobed(t *testing.T) {
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	eng.probeHost = func(context.Context, *fetch.Client, string) []probe.Result {
+		return []probe.Result{{
+			Method:      probe.MethodRobotsAgentmap,
+			URL:         "https://advertiser.example/robots.txt",
+			Outcome:     probe.OutcomeHit,
+			CatalogURLs: []string{"https://serving.example/.well-known/ai-catalog.json"},
+		}}
+	}
+
+	if err := eng.handleHostProbe(context.Background(), store.FrontierItem{Host: "advertiser.example"}); err != nil {
+		t.Fatalf("handleHostProbe: %v", err)
+	}
+
+	domain, err := st.DomainByHost("advertiser.example")
+	if err != nil {
+		t.Fatalf("DomainByHost: %v", err)
+	}
+	if domain.ARDStatus == store.ARDStatusUnprobed {
+		t.Errorf("ARDStatus = %q, but the host was probed and advertises a catalog", domain.ARDStatus)
+	}
+	if domain.ARDStatus != store.ARDStatusAdvertised {
+		t.Errorf("ARDStatus = %q, want %q", domain.ARDStatus, store.ARDStatusAdvertised)
+	}
+}
+
+// The advertised status is strictly weaker information than a verification
+// verdict, so a re-probe must never demote a host that serves its own,
+// already-verified catalog.
+func TestHandleHostProbe_AdvertisedNeverDemotesAVerifiedVerdict(t *testing.T) {
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	domain, err := st.UpsertDomain("serving.example", store.DiscoverySourceSeed)
+	if err != nil {
+		t.Fatalf("UpsertDomain: %v", err)
+	}
+	if err := st.UpdateDomainARDStatus(domain.ID, store.ARDStatusFoundValid); err != nil {
+		t.Fatalf("UpdateDomainARDStatus: %v", err)
+	}
+
+	eng.probeHost = func(context.Context, *fetch.Client, string) []probe.Result {
+		return []probe.Result{{
+			Method:      probe.MethodWellKnown,
+			URL:         "https://serving.example/.well-known/ard.json",
+			Outcome:     probe.OutcomeHit,
+			CatalogURLs: []string{"https://serving.example/.well-known/ard.json"},
+		}}
+	}
+	eng.opts.Force = true // bypass the freshness skip so the probe actually runs
+
+	if err := eng.handleHostProbe(context.Background(), store.FrontierItem{Host: "serving.example"}); err != nil {
+		t.Fatalf("handleHostProbe: %v", err)
+	}
+
+	got, err := st.DomainByHost("serving.example")
+	if err != nil {
+		t.Fatalf("DomainByHost: %v", err)
+	}
+	if got.ARDStatus != store.ARDStatusFoundValid {
+		t.Errorf("ARDStatus = %q, want %q preserved (advertised must not demote a verdict)", got.ARDStatus, store.ARDStatusFoundValid)
+	}
+}
+
+// A probe that finds nothing must still record not_found, unaffected by the
+// advertised promotion.
+func TestHandleHostProbe_NoHitStillRecordsNotFound(t *testing.T) {
+	eng, st := newTestEngine(t, testCrawlerConfig())
+	eng.probeHost = func(context.Context, *fetch.Client, string) []probe.Result {
+		return []probe.Result{{
+			Method:  probe.MethodWellKnown,
+			URL:     "https://empty.example/.well-known/ard.json",
+			Outcome: probe.OutcomeMiss,
+		}}
+	}
+
+	if err := eng.handleHostProbe(context.Background(), store.FrontierItem{Host: "empty.example"}); err != nil {
+		t.Fatalf("handleHostProbe: %v", err)
+	}
+
+	domain, err := st.DomainByHost("empty.example")
+	if err != nil {
+		t.Fatalf("DomainByHost: %v", err)
+	}
+	if domain.ARDStatus != store.ARDStatusNotFound {
+		t.Errorf("ARDStatus = %q, want %q", domain.ARDStatus, store.ARDStatusNotFound)
 	}
 }

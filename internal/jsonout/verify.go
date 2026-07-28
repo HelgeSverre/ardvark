@@ -140,7 +140,9 @@ func fetchVerifyTarget(ctx context.Context, target string) (raw []byte, servingD
 // produced (the CLI's live per-catalog output).
 func VerifyStored(st *store.Store, strict bool, onReport func(VerifyReport)) (VerifyStoredResult, error) {
 	var catalogs []store.Catalog
-	if err := st.DB.Preload("Entries").Find(&catalogs).Error; err != nil {
+	if err := st.DB.Preload("Entries", func(db *gorm.DB) *gorm.DB {
+		return db.Order("id ASC")
+	}).Find(&catalogs).Error; err != nil {
 		return VerifyStoredResult{}, fmt.Errorf("verify --stored: loading catalogs: %w", err)
 	}
 
@@ -188,10 +190,10 @@ func reverifyCatalog(st *store.Store, cat store.Catalog, report ard.Report) erro
 			return err
 		}
 
-		entryIDByURN := make(map[string]uint, len(cat.Entries))
+		entries := make([]ard.Entry, len(cat.Entries))
 		var entryIDs []uint
-		for _, e := range cat.Entries {
-			entryIDByURN[e.URN] = e.ID
+		for i, e := range cat.Entries {
+			entries[i].Identifier = e.URN
 			entryIDs = append(entryIDs, e.ID)
 		}
 		if len(entryIDs) > 0 {
@@ -201,11 +203,12 @@ func reverifyCatalog(st *store.Store, cat store.Catalog, report ard.Report) erro
 			}
 		}
 
+		catalogChecks, entryChecks := ard.PartitionChecks(report.Checks, entries)
 		now := time.Now()
-		for _, c := range report.Checks {
+		saveCheck := func(c ard.Check, subjectType string, subjectID uint) error {
 			row := &store.VerificationCheck{
-				SubjectType: store.SubjectTypeCatalog,
-				SubjectID:   cat.ID,
+				SubjectType: subjectType,
+				SubjectID:   subjectID,
 				CheckID:     c.CheckID,
 				Severity:    c.Severity,
 				Passed:      c.Passed,
@@ -213,14 +216,21 @@ func reverifyCatalog(st *store.Store, cat store.Catalog, report ard.Report) erro
 				SpecRef:     c.SpecRef,
 				CheckedAt:   now,
 			}
-			if c.Subject != "" && c.Subject != ard.SubjectCatalog {
-				if entryID, ok := entryIDByURN[c.Subject]; ok {
-					row.SubjectType = store.SubjectTypeEntry
-					row.SubjectID = entryID
-				}
-			}
-			if err := tx.Create(row).Error; err != nil {
+			return tx.Create(row).Error
+		}
+		for _, check := range catalogChecks {
+			if err := saveCheck(check, store.SubjectTypeCatalog, cat.ID); err != nil {
 				return err
+			}
+		}
+		for idx, checks := range entryChecks {
+			if idx < 0 || idx >= len(cat.Entries) {
+				return fmt.Errorf("verification check entry index %d out of range", idx)
+			}
+			for _, check := range checks {
+				if err := saveCheck(check, store.SubjectTypeEntry, cat.Entries[idx].ID); err != nil {
+					return err
+				}
 			}
 		}
 		return nil

@@ -157,3 +157,109 @@ func TestExtractLinksInvalidBaseURL(t *testing.T) {
 		t.Fatal("expected error for invalid base URL, got nil")
 	}
 }
+
+// -- link relation aliases -------------------------------------------------
+
+// rel="ard" is the preferred link relation; rel="ai-catalog" remains a
+// supported alias. Both must be recognized inside a space-separated,
+// arbitrarily-cased token list.
+func TestExtract_RecognizesArdAndLegacyRelTokens(t *testing.T) {
+	tests := []struct {
+		name string
+		rel  string
+		want bool
+	}{
+		{"preferred token", "ard", true},
+		{"legacy token", "ai-catalog", true},
+		{"preferred uppercase", "ARD", true},
+		{"preferred in a token list", "alternate ard noopener", true},
+		{"legacy in a token list", "alternate ai-catalog", true},
+		{"unrelated token", "stylesheet", false},
+		{"substring must not match", "guard", false},
+		{"substring prefix must not match", "ard-extra", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			page := `<html><head><link rel="` + tt.rel + `" href="/catalog.json"></head><body></body></html>`
+			res, err := ExtractLinks("https://example.com/", strings.NewReader(page))
+			if err != nil {
+				t.Fatalf("Extract: %v", err)
+			}
+			got := len(res.AICatalogHints) > 0
+			if got != tt.want {
+				t.Errorf("rel=%q produced hints %v, want hint=%v", tt.rel, res.AICatalogHints, tt.want)
+			}
+		})
+	}
+}
+
+// -- inline JSON-LD --------------------------------------------------------
+
+func TestExtractLinks_CollectsJSONLDBlocks(t *testing.T) {
+	const page = `<html><head>
+	<script type="application/ld+json">{"@type":"Organization","name":"Example"}</script>
+	<script type="APPLICATION/LD+JSON">{"specVersion":"1.0","entries":[]}</script>
+	<script type="text/javascript">var notJSONLD = 1;</script>
+	</head><body><a href="/next">n</a></body></html>`
+
+	res, err := ExtractLinks("https://example.com/", strings.NewReader(page))
+	if err != nil {
+		t.Fatalf("ExtractLinks: %v", err)
+	}
+	if len(res.JSONLD) != 2 {
+		t.Fatalf("collected %d ld+json blocks, want 2: %q", len(res.JSONLD), res.JSONLD)
+	}
+	if !strings.Contains(string(res.JSONLD[1]), "specVersion") {
+		t.Errorf("second block = %q, want the specVersion document", res.JSONLD[1])
+	}
+	if len(res.Links) != 1 {
+		t.Errorf("Links = %v, want the ordinary anchor still harvested", res.Links)
+	}
+}
+
+// Malformed or oversized JSON-LD must never cost us the page's ordinary link
+// harvesting — that is the crawler's primary job on an HTML page.
+func TestExtractLinks_MalformedJSONLDDoesNotAbortHarvesting(t *testing.T) {
+	const page = `<html><head>
+	<script type="application/ld+json">{ this is not json </script>
+	</head><body><a href="/next">n</a><a href="https://other.example/x">o</a></body></html>`
+
+	res, err := ExtractLinks("https://example.com/", strings.NewReader(page))
+	if err != nil {
+		t.Fatalf("ExtractLinks: %v", err)
+	}
+	if len(res.Links) != 2 {
+		t.Errorf("Links = %v, want both anchors", res.Links)
+	}
+	if len(res.Hosts) != 2 {
+		t.Errorf("Hosts = %v, want both hosts", res.Hosts)
+	}
+}
+
+// A single page must not be able to bypass the crawler's body limits by
+// embedding unbounded or unlimited JSON-LD.
+func TestExtractLinks_BoundsJSONLDSizeAndCount(t *testing.T) {
+	var sb strings.Builder
+	sb.WriteString("<html><head>")
+	for i := 0; i < maxJSONLDBlocks+10; i++ {
+		sb.WriteString(`<script type="application/ld+json">{"n":1}</script>`)
+	}
+	sb.WriteString(`<script type="application/ld+json">{"big":"`)
+	sb.WriteString(strings.Repeat("x", maxJSONLDBlockBytes+1))
+	sb.WriteString(`"}</script>`)
+	sb.WriteString("</head><body></body></html>")
+
+	res, err := ExtractLinks("https://example.com/", strings.NewReader(sb.String()))
+	if err != nil {
+		t.Fatalf("ExtractLinks: %v", err)
+	}
+	if len(res.JSONLD) > maxJSONLDBlocks {
+		t.Errorf("collected %d blocks, want at most %d", len(res.JSONLD), maxJSONLDBlocks)
+	}
+	for i, b := range res.JSONLD {
+		if len(b) > maxJSONLDBlockBytes {
+			t.Errorf("block %d is %d bytes, want at most %d", i, len(b), maxJSONLDBlockBytes)
+		}
+	}
+}

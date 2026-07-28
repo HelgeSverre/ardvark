@@ -5,8 +5,10 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/helgesverre/ardvark/internal/ard"
+	"github.com/helgesverre/ardvark/internal/store"
 )
 
 // VerifyTarget must use ardvark's lenient default verification, accepting a
@@ -56,5 +58,52 @@ func TestVerifyTarget_MissingFile(t *testing.T) {
 	}
 	if _, err := VerifyTargetStrict(context.Background(), missing); err == nil {
 		t.Fatal("VerifyTargetStrict: want error for missing file, got nil")
+	}
+}
+
+func TestReverifyCatalog_DuplicateIdentifiersKeepPerEntryChecks(t *testing.T) {
+	st := newTestStore(t)
+	domain, err := st.UpsertDomain("example.com", store.DiscoverySourceSeed)
+	if err != nil {
+		t.Fatalf("UpsertDomain: %v", err)
+	}
+
+	const duplicateURN = "urn:air:example.com:agents:duplicate"
+	cat := &store.Catalog{
+		DomainID:           domain.ID,
+		SourceURL:          "https://example.com/.well-known/ai-catalog.json",
+		RawJSON:            `{"specVersion":"1.0","entries":[]}`,
+		ContentHash:        "duplicate-check-test",
+		FetchedAt:          time.Now(),
+		VerificationStatus: store.VerificationStatusInvalid,
+		Entries: []store.CatalogEntry{
+			{URN: duplicateURN, DisplayName: "First", Source: store.EntrySourceCatalog},
+			{URN: duplicateURN, DisplayName: "Second", Source: store.EntrySourceCatalog},
+		},
+	}
+	if err := st.SaveCatalog(cat, nil, nil); err != nil {
+		t.Fatalf("SaveCatalog: %v", err)
+	}
+
+	report := ard.Report{
+		Verdict: ard.VerdictInvalid,
+		Checks: []ard.Check{
+			{CheckID: "entry.check", Subject: duplicateURN, EntryIndex: 0, Message: "first occurrence"},
+			{CheckID: "entry.check", Subject: duplicateURN, EntryIndex: 1, Message: "second occurrence"},
+		},
+	}
+	if err := reverifyCatalog(st, *cat, report); err != nil {
+		t.Fatalf("reverifyCatalog: %v", err)
+	}
+
+	for i, entry := range cat.Entries {
+		var checks []store.VerificationCheck
+		if err := st.DB.Where("subject_type = ? AND subject_id = ?", store.SubjectTypeEntry, entry.ID).
+			Find(&checks).Error; err != nil {
+			t.Fatalf("loading checks for entry %d: %v", i, err)
+		}
+		if len(checks) != 1 {
+			t.Fatalf("entry %d checks = %d, want 1: %+v", i, len(checks), checks)
+		}
 	}
 }

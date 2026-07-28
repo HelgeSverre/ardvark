@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"strconv"
 	"strings"
@@ -64,7 +65,9 @@ func (e *Engine) handlePageFetch(ctx context.Context, item store.FrontierItem) e
 			e.logger.Warn("crawler: failed to upsert domain from anchor", "host", host, "error", err)
 			continue
 		}
-		e.enqueue(store.KindHostProbe, "", host, 0, provenance{})
+		if _, err := e.enqueue(store.KindHostProbe, "", host, 0, provenance{}); err != nil {
+			return err
+		}
 	}
 
 	for _, hintURL := range result.AICatalogHints {
@@ -86,7 +89,13 @@ func (e *Engine) handlePageFetch(ctx context.Context, item store.FrontierItem) e
 		}); err != nil {
 			e.logger.Warn("crawler: failed to record link_tag probe", "url", hintURL, "error", err)
 		}
-		e.enqueue(store.KindCatalogFetch, hintURL, hintHost, 0, provenance{ProbeMethod: store.ProbeMethodLinkTag})
+		if _, err := e.enqueue(store.KindCatalogFetch, hintURL, hintHost, 0, provenance{ProbeMethod: store.ProbeMethodLinkTag}); err != nil {
+			return err
+		}
+	}
+
+	if err := e.processInlineCatalogs(ctx, result.JSONLD, fetched.URL, item.Host); err != nil {
+		return err
 	}
 
 	if item.Depth < e.maxDepth() {
@@ -110,6 +119,40 @@ func (e *Engine) handlePageFetch(ctx context.Context, item store.FrontierItem) e
 	return nil
 }
 
+// processInlineCatalogs ingests ARD catalog documents embedded in a page's
+// <script type="application/ld+json"> blocks, which the spec treats as a
+// first-class publication mechanism alongside the well-known paths.
+//
+// Each candidate is persisted through the same processCatalog path as a
+// hosted document, so verification, storage, and follow-up fan-out behave
+// identically no matter how the catalog was published. Provenance is the page
+// URL plus a stable per-block/per-node fragment, which keeps two catalogs on
+// one page distinct and stable across re-crawls.
+//
+// This runs synchronously rather than through its own frontier item, and that
+// is safe here: the page body is the only source of these entries, and the
+// page_fetch item is not marked done until this returns. A crash part-way
+// re-fetches the page and redoes the work, so nothing is permanently lost —
+// unlike a probe hit, which is durably recorded before its follow-up work
+// exists and therefore needs a persistent item to recover.
+// An inline catalog enters at catalog depth 0: it is a top-level document
+// that happens to be embedded in a page, not a catalog nested inside another
+// catalog. The page's own crawl depth is a different budget (crawler.maxDepth
+// governs how far anchors are followed) and must not be spent here, or a
+// catalog published on a deep page would be silently ignored.
+func (e *Engine) processInlineCatalogs(ctx context.Context, blocks [][]byte, pageURL, host string) error {
+	for blockIdx, block := range blocks {
+		for nodeIdx, candidate := range ard.InlineCatalogs(block) {
+			sum := sha256.Sum256(candidate)
+			sourceURL := fmt.Sprintf("%s#ld+json=%d.%d", pageURL, blockIdx, nodeIdx)
+			if err := e.processCatalog(ctx, candidate, hex.EncodeToString(sum[:]), host, sourceURL, nil, store.ProbeMethodInPage, 0, nil); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // -- host_probe ---------------------------------------------------------
 
 // handleHostProbe probes item.Host for ARD documents via internal/probe,
@@ -117,7 +160,7 @@ func (e *Engine) handlePageFetch(ctx context.Context, item store.FrontierItem) e
 // for every discovered catalog URL. It skips hosts probed within the
 // freshness window unless Options.Force is set.
 func (e *Engine) handleHostProbe(ctx context.Context, item store.FrontierItem) error {
-	if !e.opts.Force {
+	if !e.opts.Force && item.Attempts == 0 {
 		recently, err := e.store.RecentlyProbed(item.Host, e.refreshWindow())
 		if err != nil {
 			// Fail open: the freshness check is an optimization, so a broken
@@ -126,7 +169,7 @@ func (e *Engine) handleHostProbe(ctx context.Context, item store.FrontierItem) e
 		} else if recently {
 			e.logger.Debug("crawler: skipping recently-probed host", "host", item.Host)
 
-			// BUG 2 fix: a recently-recorded hit doesn't prove THIS item's
+			// A recently-recorded hit doesn't prove THIS item's
 			// own catalog_fetch fan-out ever completed. A prior process may
 			// have crashed after store.RecordProbe durably persisted a hit
 			// (which is what RecentlyProbed keys on) but before the
@@ -135,12 +178,10 @@ func (e *Engine) handleHostProbe(ctx context.Context, item store.FrontierItem) e
 			// probe attempt, so a crash partway through that loop can lose
 			// some but not all of them), permanently losing that catalog on
 			// every future resume, since this branch used to return
-			// unconditionally. Re-deriving and re-enqueuing every durably
-			// recorded hit here is idempotent (see dedupKey's doc comment),
-			// so it can only ensure the follow-up exists, never duplicate
-			// it.
-			e.reenqueueKnownCatalogHits(item.Host)
-			return nil
+			// unconditionally. Re-deriving every durably recorded hit through
+			// Frontier.Resume fills missing work, retries failed work, and
+			// leaves completed catalog fetches untouched.
+			return e.reenqueueKnownCatalogHits(item.Host)
 		}
 	}
 
@@ -148,9 +189,11 @@ func (e *Engine) handleHostProbe(ctx context.Context, item store.FrontierItem) e
 	if err != nil {
 		return err
 	}
+	previousLastProbedAt := domain.LastProbedAt
 
-	results := probe.Probe(ctx, e.fetch, item.Host)
+	results := e.probeHost(ctx, e.fetch, item.Host)
 	hadHit := false
+	var retryErr error
 	for _, r := range results {
 		if r.Outcome != probe.OutcomeHit {
 			if err := e.store.RecordProbe(&store.Probe{
@@ -166,6 +209,9 @@ func (e *Engine) handleHostProbe(ctx context.Context, item store.FrontierItem) e
 				return err
 			}
 			e.emit(ProbeEvent{Host: item.Host, Method: r.Method, Outcome: r.Outcome, Detail: probeDetail(r)})
+			if retryErr == nil && r.RetryError != nil {
+				retryErr = r.RetryError
+			}
 			continue
 		}
 
@@ -189,23 +235,41 @@ func (e *Engine) handleHostProbe(ctx context.Context, item store.FrontierItem) e
 			}); err != nil {
 				return err
 			}
-			e.enqueue(store.KindCatalogFetch, catalogURL, item.Host, 0, provenance{ProbeMethod: r.Method})
+			if _, err := e.resume(store.KindCatalogFetch, catalogURL, item.Host, 0, provenance{ProbeMethod: r.Method}); err != nil {
+				return err
+			}
 		}
 	}
 
-	if !hadHit {
+	switch {
+	case hadHit:
+		// This host advertises ARD. The verification verdict is written
+		// against whichever host actually serves the catalog, which may be a
+		// different one, so record what we know about THIS host rather than
+		// leaving it looking as though it was never probed. Promotion never
+		// demotes a verdict this host has already earned.
+		if err := e.store.PromoteDomainAdvertised(domain.ID); err != nil {
+			e.logger.Warn("crawler: failed to mark domain advertised", "host", item.Host, "error", err)
+		}
+	case retryErr == nil:
 		if err := e.store.UpdateDomainARDStatus(domain.ID, store.ARDStatusNotFound); err != nil {
 			e.logger.Warn("crawler: failed to mark domain not_found", "host", item.Host, "error", err)
 		}
+	}
+	if retryErr != nil {
+		if err := e.store.RestoreDomainLastProbedAt(domain.ID, previousLastProbedAt); err != nil {
+			return err
+		}
+		return fmt.Errorf("crawler: probing host %s: %w", item.Host, retryErr)
 	}
 
 	e.logger.Info("crawler: host probed", "host", item.Host, "domain_id", domain.ID)
 	return nil
 }
 
-// reenqueueKnownCatalogHits re-derives and idempotently re-enqueues
-// catalog_fetch for every durably recorded probe hit on host, closing the
-// gap documented at handleHostProbe's freshness-skip branch (BUG 2).
+// reenqueueKnownCatalogHits ensures catalog_fetch exists for every durably
+// recorded probe hit on host, closing the gap documented at handleHostProbe's
+// freshness-skip branch without reactivating completed work.
 //
 // This works uniformly across both probe methods because handleHostProbe
 // records one Probe row per discovered catalog URL (not one per method
@@ -218,23 +282,24 @@ func (e *Engine) handleHostProbe(ctx context.Context, item store.FrontierItem) e
 // Anything discovered but not yet durably recorded before the crash is, by
 // construction, not recoverable here — it was never promised — and will be
 // rediscovered on the next non-skipped probe (window expiry or --force).
-func (e *Engine) reenqueueKnownCatalogHits(host string) {
+func (e *Engine) reenqueueKnownCatalogHits(host string) error {
 	domain, err := e.store.DomainByHost(host)
 	if err != nil {
-		e.logger.Warn("crawler: failed to look up domain for known-hit re-enqueue", "host", host, "error", err)
-		return
+		return fmt.Errorf("crawler: looking up known hits for %s: %w", host, err)
 	}
 	var hits []store.Probe
 	if err := e.store.DB.
 		Where("domain_id = ? AND outcome = ?", domain.ID, probe.OutcomeHit).
 		Order("id ASC").
 		Find(&hits).Error; err != nil {
-		e.logger.Warn("crawler: failed to look up known hits for re-enqueue", "host", host, "error", err)
-		return
+		return fmt.Errorf("crawler: loading known hits for %s: %w", host, err)
 	}
 	for _, hit := range hits {
-		e.enqueue(store.KindCatalogFetch, hit.URL, host, 0, provenance{ProbeMethod: hit.Method})
+		if _, err := e.resume(store.KindCatalogFetch, hit.URL, host, 0, provenance{ProbeMethod: hit.Method}); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // -- catalog_fetch --------------------------------------------------------
@@ -264,7 +329,11 @@ func (e *Engine) handleCatalogFetch(ctx context.Context, item store.FrontierItem
 
 	transportChecks := ard.TransportChecks(fetched.ContentType, fetched.Body, e.cfg.Crawler.MaxBodyBytes)
 
-	return e.processCatalog(ctx, fetched.Body, fetched.SHA256, item.Host, item.URL, item.ParentCatalogID, item.ProbeMethod, item.Depth, transportChecks)
+	servingHost, err := hostOf(fetched.URL)
+	if err != nil {
+		return fmt.Errorf("crawler: resolving fetched catalog host: %w", err)
+	}
+	return e.processCatalog(ctx, fetched.Body, fetched.SHA256, servingHost, fetched.URL, item.ParentCatalogID, item.ProbeMethod, item.Depth, transportChecks)
 }
 
 // fetchErrorDetail summarizes a catalog_fetch failure for ProbeEvent.Detail:
@@ -302,7 +371,11 @@ func (e *Engine) processCatalog(ctx context.Context, raw []byte, contentHash, ho
 	}
 
 	if !e.opts.Force {
-		if prior, err := e.store.LatestCatalogBySource(domain.ID, sourceURL); err == nil && prior.ContentHash == contentHash {
+		prior, err := e.store.LatestCatalogBySourceAndParent(domain.ID, sourceURL, parentCatalogID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return err
+		}
+		if err == nil && prior.ContentHash == contentHash {
 			e.logger.Debug("crawler: catalog unchanged since last fetch, skipping re-save", "url", sourceURL, "host", host)
 			e.emit(ProbeEvent{
 				Host:    host,
@@ -312,22 +385,18 @@ func (e *Engine) processCatalog(ctx context.Context, raw []byte, contentHash, ho
 				Detail:  "unchanged",
 			})
 
-			// BUG 1 fix: "unchanged" only means the SAVE is redundant, not
-			// that this item's follow-on work was ever enqueued. A prior
+			// "Unchanged" only means the save is redundant, not that this
+			// item's follow-on work was ever enqueued. A prior
 			// process may have crashed after store.SaveCatalog committed but
 			// before enqueueEntryFollowups ran (or before this branch even
 			// existed to run it), permanently losing that catalog's nested
 			// fetches/harvests/artifacts on every future resume, since this
-			// short-circuit used to return before fan-out. Re-running the
-			// fan-out here is always safe: every enqueue routes through
-			// frontier.Enqueue, which re-activates an existing dedup key
-			// instead of duplicating it (see dedupKey's doc comment), so a
-			// follow-up that already completed is at worst harmlessly
-			// re-activated and redone, never duplicated.
+			// short-circuit used to return before fan-out. Re-running fan-out
+			// is safe because relationship-specific work uses Frontier.Ensure:
+			// missing rows are inserted while completed rows remain completed.
 			if depth < e.maxCatalogDepth() {
 				if err := e.store.DB.Where("catalog_id = ?", prior.ID).Order("id ASC").Find(&prior.Entries).Error; err != nil {
-					e.logger.Warn("crawler: failed to load prior catalog entries for follow-up re-enqueue", "url", sourceURL, "error", err)
-					return nil
+					return fmt.Errorf("crawler: loading prior catalog entries for %s: %w", sourceURL, err)
 				}
 				if len(prior.Entries) != len(parsed.Entries) {
 					// Should not happen (identical content hash implies
@@ -336,7 +405,9 @@ func (e *Engine) processCatalog(ctx context.Context, raw []byte, contentHash, ho
 					e.logger.Warn("crawler: prior catalog entry count mismatch, skipping follow-up re-enqueue", "url", sourceURL, "prior_entries", len(prior.Entries), "parsed_entries", len(parsed.Entries))
 					return nil
 				}
-				e.enqueueEntryFollowups(ctx, prior, parsed.Entries, host, sourceURL, depth)
+				if err := e.enqueueEntryFollowups(ctx, prior, parsed.Entries, host, sourceURL, depth); err != nil {
+					return err
+				}
 			}
 			return nil
 		}
@@ -377,8 +448,7 @@ func (e *Engine) processCatalog(ctx context.Context, raw []byte, contentHash, ho
 		return nil
 	}
 
-	e.enqueueEntryFollowups(ctx, cat, parsed.Entries, host, sourceURL, depth)
-	return nil
+	return e.enqueueEntryFollowups(ctx, cat, parsed.Entries, host, sourceURL, depth)
 }
 
 // enqueueEntryFollowups fans out follow-on work for each entry of a just-
@@ -387,7 +457,7 @@ func (e *Engine) processCatalog(ctx context.Context, raw []byte, contentHash, ho
 // registry_harvest for registry entries, and artifact_fetch for everything
 // else. Kept separate from processCatalog so persistence and fan-out policy
 // don't intertwine.
-func (e *Engine) enqueueEntryFollowups(ctx context.Context, cat *store.Catalog, entries []ard.Entry, host, sourceURL string, depth int) {
+func (e *Engine) enqueueEntryFollowups(ctx context.Context, cat *store.Catalog, entries []ard.Entry, host, sourceURL string, depth int) error {
 	for i, en := range entries {
 		entryID := cat.Entries[i].ID
 		catID := cat.ID
@@ -395,34 +465,43 @@ func (e *Engine) enqueueEntryFollowups(ctx context.Context, cat *store.Catalog, 
 
 		switch {
 		case kind == mediatype.KindCatalog:
-			e.followCatalogPointer(ctx, en, host, sourceURL, depth+1, &catID)
+			if err := e.followCatalogPointer(ctx, en, host, sourceURL, depth+1, &catID); err != nil {
+				return err
+			}
 
 		case kind == mediatype.KindRegistry && en.URL != "" && e.cfg.Registry.Harvest:
-			e.followRegistryPointer(en.URL, host, 0,
+			if err := e.followRegistryPointer(en.URL, host, 0,
 				&store.Registry{EntryID: entryID, BaseURL: en.URL, HarvestStatus: store.HarvestStatusPending},
-				provenance{RegistryEntryID: &entryID, RegistryCatalogID: &catID})
+				provenance{RegistryEntryID: &entryID, RegistryCatalogID: &catID}); err != nil {
+				return err
+			}
 
 		case en.URL != "" && e.cfg.ARD.FetchArtifacts:
-			e.enqueue(store.KindArtifactFetch, en.URL, host, 0, provenance{ArtifactEntryID: &entryID})
+			if _, err := e.ensure(store.KindArtifactFetch, en.URL, host, 0, provenance{ArtifactEntryID: &entryID}); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }
 
 // followCatalogPointer follows an ai-catalog pointer entry: a url-referenced
 // nested catalog becomes a catalog_fetch at depth; an embedded-data catalog is
 // processed recursively at depth. A pointer with neither url nor data is a
 // no-op. Shared by the catalog fan-out and the registry-result fan-out.
-func (e *Engine) followCatalogPointer(ctx context.Context, en ard.Entry, host, sourceURL string, depth int, parentCatID *uint) {
+func (e *Engine) followCatalogPointer(ctx context.Context, en ard.Entry, host, sourceURL string, depth int, parentCatID *uint) error {
 	switch {
 	case en.URL != "":
-		e.enqueue(store.KindCatalogFetch, en.URL, host, depth, provenance{ParentCatalogID: parentCatID})
+		_, err := e.ensure(store.KindCatalogFetch, en.URL, host, depth, provenance{ParentCatalogID: parentCatID})
+		return err
 	case hasEmbeddedData(en.Data):
 		sum := sha256.Sum256(en.Data)
 		nestedSource := sourceURL + "#" + en.Identifier
 		if err := e.processCatalog(ctx, en.Data, hex.EncodeToString(sum[:]), host, nestedSource, parentCatID, "", depth, nil); err != nil {
-			e.logger.Warn("crawler: failed to process embedded nested catalog", "identifier", en.Identifier, "error", err)
+			return err
 		}
 	}
+	return nil
 }
 
 // followRegistryPointer persists a registries row and enqueues a
@@ -430,13 +509,13 @@ func (e *Engine) followCatalogPointer(ctx context.Context, en ard.Entry, host, s
 // provenance columns) and the frontier-item provenance; this sets
 // prov.RegistryRowID to the newly-saved row's ID. Shared by the catalog
 // fan-out and the registry-result fan-out.
-func (e *Engine) followRegistryPointer(url, host string, depth int, regRow *store.Registry, prov provenance) {
+func (e *Engine) followRegistryPointer(url, host string, depth int, regRow *store.Registry, prov provenance) error {
 	if err := e.store.SaveRegistry(regRow); err != nil {
-		e.logger.Warn("crawler: failed to save registry row", "url", url, "error", err)
-		return
+		return err
 	}
 	prov.RegistryRowID = &regRow.ID
-	e.enqueue(store.KindRegistryHarvest, url, host, depth, prov)
+	_, err := e.ensure(store.KindRegistryHarvest, url, host, depth, prov)
+	return err
 }
 
 // hasEmbeddedData reports whether raw carries a real JSON value: an absent
@@ -466,7 +545,14 @@ func buildEntryRow(en ard.Entry, source string, sourceRegistryID *uint) store.Ca
 		name = urn.Name
 	}
 
-	raw, _ := json.Marshal(en)
+	// The entry's own bytes are authoritative. Re-marshaling the Go struct
+	// would silently drop @context, @id, and any namespaced extension terms
+	// the struct does not model. Fall back to marshaling only for entries
+	// built in code rather than decoded from a document.
+	raw := en.Raw
+	if len(raw) == 0 {
+		raw, _ = json.Marshal(en)
+	}
 
 	return store.CatalogEntry{
 		URN:                   en.Identifier,
@@ -511,97 +597,31 @@ func jsonOrEmpty(v any) string {
 	return string(b)
 }
 
-// splitChecks partitions ard.Verify's flat check list into catalog-level
-// checks and per-entry checks (keyed by entry slice index), matching each
-// check's Subject against entry identifiers.
-//
-// BUG 3 / distribution invariant: a check's Subject is the entry's raw
-// identifier STRING (ard.Check has no entry-index field — see
-// ard.entrySubject/ard.schemaSubject, which resolve to identifier or
-// "catalog" and discard the index they had on hand), so when a catalog has
-// two or more entries sharing an identifier (itself an identifier.unique
-// violation, which the catalog will already be failing), Subject alone
-// cannot say which of the duplicate entries a given check belongs to. The
-// old code resolved Subject through a map[identifier]index built by
-// iterating entries in order, so the LAST entry with a given identifier
-// silently won every check for ALL of them — every earlier duplicate got
-// zero rows, not an approximation, none.
-//
-// This resolves it by evenly splitting all checks sharing identifier S
-// across S's occurrences, in contiguous chunks matching catalog order: the
-// first ceil(total/n) checks for S go to its first occurrence, the next
-// chunk to its second, and so on. This is EXACT when every duplicate entry
-// produces the same number of checks (the common case in practice: a
-// verbatim or near-verbatim copy-paste duplicate produces identical check
-// outcomes), and a documented best-effort approximation — not a guarantee —
-// when duplicates differ enough to produce different check counts each
-// (schema checks in particular arrive in JSON-Schema's own, not
-// necessarily catalog-order, sequence — see validateSchema). A fully exact
-// resolution needs an entry-index field on ard.Check, which is out of
-// scope here (internal/ard is not owned by this fix). Either way, this is
-// strictly better than the prior last-write-wins behavior, which is not an
-// approximation trade-off, just data loss.
+// splitChecks converts ard.PartitionChecks' shared catalog/entry partition
+// into persistence rows. Keeping the identifier-duplicate policy in ard
+// ensures initial verification and verify --stored cannot drift.
 func splitChecks(checks []ard.Check, entries []ard.Entry) ([]*store.VerificationCheck, map[int][]*store.VerificationCheck) {
-	idxsByIdentifier := make(map[string][]int, len(entries))
-	for i, en := range entries {
-		if en.Identifier != "" {
-			idxsByIdentifier[en.Identifier] = append(idxsByIdentifier[en.Identifier], i)
-		}
-	}
-
-	totalByIdentifier := make(map[string]int, len(idxsByIdentifier))
-	for _, c := range checks {
-		if c.Subject != "" && c.Subject != ard.SubjectCatalog {
-			if _, ok := idxsByIdentifier[c.Subject]; ok {
-				totalByIdentifier[c.Subject]++
-			}
-		}
-	}
-
-	seenByIdentifier := make(map[string]int, len(idxsByIdentifier))
-
-	var catalogChecks []*store.VerificationCheck
+	catalog, byEntry := ard.PartitionChecks(checks, entries)
+	catalogChecks := make([]*store.VerificationCheck, 0, len(catalog))
 	entryChecks := make(map[int][]*store.VerificationCheck)
 
-	for _, c := range checks {
-		row := &store.VerificationCheck{
-			CheckID:   c.CheckID,
-			Severity:  c.Severity,
-			Passed:    c.Passed,
-			Message:   c.Message,
-			SpecRef:   c.SpecRef,
-			CheckedAt: time.Now(),
+	toRow := func(c ard.Check) *store.VerificationCheck {
+		return &store.VerificationCheck{
+			CheckID: c.CheckID, Severity: c.Severity, Passed: c.Passed,
+			Message: c.Message, SpecRef: c.SpecRef, CheckedAt: time.Now(),
 		}
-		if c.Subject != "" && c.Subject != ard.SubjectCatalog {
-			if idxs, ok := idxsByIdentifier[c.Subject]; ok {
-				k := seenByIdentifier[c.Subject]
-				seenByIdentifier[c.Subject]++
-				idx := idxs[checkBucket(k, totalByIdentifier[c.Subject], len(idxs))]
-				entryChecks[idx] = append(entryChecks[idx], row)
-				continue
-			}
-		}
-		catalogChecks = append(catalogChecks, row)
 	}
-
+	for _, check := range catalog {
+		catalogChecks = append(catalogChecks, toRow(check))
+	}
+	for idx, entry := range byEntry {
+		rows := make([]*store.VerificationCheck, 0, len(entry))
+		for _, check := range entry {
+			rows = append(rows, toRow(check))
+		}
+		entryChecks[idx] = rows
+	}
 	return catalogChecks, entryChecks
-}
-
-// checkBucket maps the k-th (0-based) check for a shared identifier, out of
-// total such checks, to one of that identifier's n duplicate-entry
-// occurrences: k*n/total, clamped to n-1. This splits [0,total) into n
-// contiguous, near-equal-sized chunks in occurrence order. For the common
-// non-duplicate case (n == 1) it always returns 0, exactly matching the
-// prior single-index behavior.
-func checkBucket(k, total, n int) int {
-	if n <= 1 || total <= 0 {
-		return 0
-	}
-	idx := k * n / total
-	if idx >= n {
-		idx = n - 1
-	}
-	return idx
 }
 
 // -- artifact_fetch -------------------------------------------------------
@@ -654,6 +674,10 @@ func (e *Engine) handleArtifactFetch(ctx context.Context, item store.FrontierIte
 // endpoint (paginating within registry.pageLimit), stores returned entries
 // with source=registry provenance, and enqueues further registry_harvest
 // items for referrals, bounded by registry.maxReferralDepth.
+//
+// Search results are relevance-ranked projections, not complete ARD entries:
+// they may legitimately omit terms such as representativeQueries, so they are
+// persisted with registry provenance rather than verified as full entries.
 func (e *Engine) handleRegistryHarvest(ctx context.Context, item store.FrontierItem) error {
 	if item.Depth > e.maxReferralDepth() {
 		return nil
@@ -661,9 +685,18 @@ func (e *Engine) handleRegistryHarvest(ctx context.Context, item store.FrontierI
 
 	known := item.RegistryRowID != nil
 
+	// Only ask the registry to federate when a referral it returns could
+	// still be followed; at the depth ceiling the referrals below are
+	// discarded, so requesting them would be work neither side can use.
+	federation := registry.FederationNone
+	if item.Depth+1 <= e.maxReferralDepth() {
+		federation = registry.FederationReferrals
+	}
+
 	client := registry.New(item.URL, e.registryHTTPClient())
 	result, err := client.HarvestAll(ctx, registry.HarvestOptions{
-		PageLimit: e.cfg.Registry.PageLimit,
+		PageLimit:  e.cfg.Registry.PageLimit,
+		Federation: federation,
 	})
 	if err != nil {
 		if registry.IsNotImplemented(err) {
@@ -708,15 +741,19 @@ func (e *Engine) handleRegistryHarvest(ctx context.Context, item store.FrontierI
 		for i, res := range result.Results {
 			switch mediatype.Parse(res.Type).Kind() {
 			case mediatype.KindCatalog:
-				e.followCatalogPointer(ctx, res.Entry, item.Host, item.URL, 0, &catalogID)
+				if err := e.followCatalogPointer(ctx, res.Entry, item.Host, item.URL, 0, &catalogID); err != nil {
+					return err
+				}
 			case mediatype.KindRegistry:
 				if res.URL == "" || !e.cfg.Registry.Harvest {
 					continue
 				}
 				resultEntryID := rows[i].ID
-				e.followRegistryPointer(res.URL, item.Host, item.Depth+1,
+				if err := e.followRegistryPointer(res.URL, item.Host, item.Depth+1,
 					&store.Registry{EntryID: resultEntryID, BaseURL: res.URL, HarvestStatus: store.HarvestStatusPending, ReferralSourceID: uintPtr(regRowID)},
-					provenance{RegistryEntryID: &resultEntryID, RegistryCatalogID: &catalogID})
+					provenance{RegistryEntryID: &resultEntryID, RegistryCatalogID: &catalogID}); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -736,14 +773,15 @@ func (e *Engine) handleRegistryHarvest(ctx context.Context, item store.FrontierI
 			ReferralSourceID: uintPtr(regRowID),
 		}
 		if err := e.store.SaveRegistry(refRow); err != nil {
-			e.logger.Warn("crawler: failed to save referral registry row", "url", ref.URL, "error", err)
-			continue
+			return err
 		}
-		e.enqueue(store.KindRegistryHarvest, ref.URL, item.Host, nextDepth, provenance{
+		if _, err := e.ensure(store.KindRegistryHarvest, ref.URL, item.Host, nextDepth, provenance{
 			RegistryEntryID:   &entryID,
 			RegistryCatalogID: &catalogID,
 			RegistryRowID:     &refRow.ID,
-		})
+		}); err != nil {
+			return err
+		}
 	}
 
 	return nil

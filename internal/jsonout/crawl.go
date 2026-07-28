@@ -48,7 +48,9 @@ func Crawl(ctx context.Context, cfg config.Config, st *store.Store, seeds []stri
 	if err != nil {
 		return CrawlResult{}, err
 	}
-	defer closeLogger()
+	// Nothing actionable remains at shutdown: the logger being closed is the
+	// only place a close failure could have been reported.
+	defer func() { _ = closeLogger() }()
 
 	configSnapshot, err := json.Marshal(cfg)
 	if err != nil {
@@ -126,8 +128,8 @@ func SeedOne(eng *crawler.Engine, seed string) (bool, error) {
 	if err != nil {
 		return added, err
 	}
-	if u, perr := url.Parse(seed); perr == nil && u.Hostname() != "" {
-		if _, herr := eng.EnqueueSeedHost(u.Hostname(), store.DiscoverySourceSeed); herr != nil {
+	if u, perr := url.Parse(seed); perr == nil && u.Host != "" {
+		if _, herr := eng.EnqueueSeedHost(u.Host, store.DiscoverySourceSeed); herr != nil {
 			return added, herr
 		}
 	}
