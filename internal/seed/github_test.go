@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 )
@@ -94,7 +93,6 @@ func TestGitHubSeederDomains_NoTokenErrors(t *testing.T) {
 	// Ensure a clean environment regardless of what's set on the host
 	// running the test.
 	t.Setenv("GITHUB_TOKEN", "")
-	os.Unsetenv("GITHUB_TOKEN")
 
 	seeder := &GitHubSeeder{Endpoint: "http://example.invalid"}
 	_, err := seeder.Domains(context.Background(), 1)

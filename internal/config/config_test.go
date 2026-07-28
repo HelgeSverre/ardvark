@@ -58,6 +58,13 @@ func TestDefaults_LeaseSeconds(t *testing.T) {
 	}
 }
 
+func TestDefaults_UserAgentDoesNotEmbedStaleRelease(t *testing.T) {
+	const want = "ardvark (+https://github.com/helgesverre/ardvark)"
+	if got := Defaults().Crawler.UserAgent; got != want {
+		t.Errorf("Defaults().Crawler.UserAgent = %q, want %q", got, want)
+	}
+}
+
 // Relative storage.dsn (sqlite) and log.file in a config file must resolve
 // against the config file's directory, not the process's working directory.
 // Absolute paths, sqlite special forms, and server DSNs pass through.

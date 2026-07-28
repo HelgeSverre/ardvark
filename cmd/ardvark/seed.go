@@ -132,7 +132,7 @@ var seedCommonCrawlCmd = &cobra.Command{
 
 func init() {
 	seedCTCmd.Flags().IntVar(&seedCTCount, "count", 0, "entries to harvest (default: config seed.ct.entryCount)")
-	seedCTCmd.Flags().StringVar(&seedCTLog, "log", "", "operator token (oak, argon, all) or explicit log URL (default: config seed.ct.logs)")
+	seedCTCmd.Flags().StringVar(&seedCTLog, "log", "", "operator token (oak, argon, nimbus, all) or explicit log URL (default: config seed.ct.logs)")
 
 	seedCrtshCmd.Flags().IntVar(&seedCrtshCount, "count", 0, "domains to enqueue (default: config seed.crtsh.count)")
 	seedCrtshCmd.Flags().StringVar(&seedCrtshMatch, "match", "", "narrow to certificate identities mentioning this keyword (default: a curated agent/mcp/ai keyword set)")

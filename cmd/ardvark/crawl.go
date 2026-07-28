@@ -128,10 +128,10 @@ func printCrawlSummary(p *ui.Printer, res jsonout.CrawlResult) {
 // probeRow maps a live crawler.ProbeEvent onto the status, result, and
 // extra columns of a ui.Printer row, matching the canonical demo output:
 //
-//	hit   acme.com            well-known       catalog valid          14 entries
+//	hit   acme.com            well_known       catalog valid          14 entries
 //	hit   tools.example.dev   robots_agentmap  valid_with_warnings    queries.count
-//	miss  blog.someone.net    well-known       404
-//	hit   broken.startup.ai   well-known       invalid                urn.format ×3
+//	miss  blog.someone.net    well_known       404
+//	hit   broken.startup.ai   well_known       invalid                urn.format ×3
 func probeRow(ev crawler.ProbeEvent) (status ui.Status, result, extra string) {
 	switch ev.Outcome {
 	case probe.OutcomeHit:
@@ -163,7 +163,8 @@ func collectSeeds(args []string, listFile string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("crawl: opening --list file %s: %w", listFile, err)
 	}
-	defer f.Close()
+	// Read-only handle: the close error cannot affect the lines already read.
+	defer func() { _ = f.Close() }()
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {

@@ -138,8 +138,8 @@ func statusLabel(s Status) (string, Style) {
 // Row prints one aligned crawl/probe result row, matching the canonical
 // format:
 //
-//	hit   acme.com            well-known       catalog valid        14 entries
-//	miss  blog.someone.net    well-known       404
+//	hit   acme.com            well_known       catalog valid        14 entries
+//	miss  blog.someone.net    well_known       404
 //
 // extra is optional muted detail at the end of the line.
 func (p *Printer) Row(status Status, host, method, result, extra string) {

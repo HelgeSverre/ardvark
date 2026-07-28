@@ -1,0 +1,51 @@
+version: "2"
+
+linters:
+  settings:
+    errcheck:
+      # Type-resolved exclusions. These match on the receiver's type rather
+      # than on source text, so they keep working when a call site is
+      # reformatted or its variable renamed — unlike a `source:` regex, which
+      # silently stops matching and reintroduces noise nobody notices.
+      #
+      # Every entry is a read-side or ancillary close whose error cannot
+      # change an already-computed result.
+      #
+      # (*os.File).Close is deliberately NOT listed: on a write path a failing
+      # Close is often the first evidence the data never reached disk, so
+      # those stay checked (see jsonout.Export and smoketest/gencerts.writePEM,
+      # which both report it). Read-path file handles opt out explicitly at
+      # the call site with `_ =`.
+      exclude-functions:
+        - (io.Closer).Close
+        - (io.ReadCloser).Close
+        - (*database/sql.Rows).Close
+        - (*compress/gzip.Reader).Close
+        - (*github.com/helgesverre/ardvark/internal/store.Store).Close
+
+  exclusions:
+    rules:
+      # Staticcheck's QF analyzers are optional source rewrites, not defects.
+      - linters:
+          - staticcheck
+        text: "^QF"
+      # Keep the explicit io.Writer type where the variable later receives
+      # different concrete writer implementations.
+      - linters:
+          - staticcheck
+        text: "^ST1023:"
+      # Test HTTP handlers and fixtures are scaffolding: a client disconnect
+      # mid-response, or a cleanup failure after the assertion already ran,
+      # cannot change what the test is asserting.
+      - path: "_test\\.go$"
+        linters:
+          - errcheck
+      # Human-readable output is best-effort by design; Printer's API has no
+      # error return. Machine-readable JSON output still propagates failures.
+      - path: "^internal/ui/ui\\.go$"
+        linters:
+          - errcheck
+      # The smoke fixture cannot recover when its test client disconnects.
+      - path: "^tools/smoketest/fixture/main\\.go$"
+        linters:
+          - errcheck

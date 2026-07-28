@@ -32,7 +32,9 @@ func RunSeeder(ctx context.Context, cfg config.Config, st *store.Store, s seed.S
 	if err != nil {
 		return SeedResult{}, err
 	}
-	defer closeLogger()
+	// Nothing actionable remains at shutdown: the logger being closed is the
+	// only place a close failure could have been reported.
+	defer func() { _ = closeLogger() }()
 
 	names, err := s.Domains(ctx, n)
 	if err != nil {

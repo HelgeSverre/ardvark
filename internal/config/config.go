@@ -237,7 +237,7 @@ func Defaults() Config {
 			PerHostRequestsPerSecond: 1,
 			RequestTimeoutSeconds:    15,
 			MaxBodyBytes:             DefaultMaxBodyBytes,
-			UserAgent:                "ardvark/0.1 (+https://github.com/helgesverre/ardvark)",
+			UserAgent:                "ardvark (+https://github.com/helgesverre/ardvark)",
 			RespectRobotsTxt:         true,
 			RefreshAfterHours:        168,
 			LeaseSeconds:             600,

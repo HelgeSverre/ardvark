@@ -96,7 +96,9 @@ func printJSON(cmd *cobra.Command, v any) error {
 	if err != nil {
 		return fmt.Errorf("encoding JSON output: %w", err)
 	}
-	fmt.Fprintln(cmd.OutOrStdout(), string(out))
+	if _, err := fmt.Fprintln(cmd.OutOrStdout(), string(out)); err != nil {
+		return fmt.Errorf("writing JSON output: %w", err)
+	}
 	return nil
 }
 

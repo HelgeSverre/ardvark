@@ -65,7 +65,10 @@ const exportWriteBufferSize = 256 * 1024
 // stdout. Rows stream from the database cursor straight to the writer, so
 // memory use is constant regardless of dataset size and output starts
 // immediately.
-func Export(st *store.Store, format, outPath string, stdout io.Writer) (ExportResult, error) {
+// A close error is reported only when nothing else already failed: on a
+// write path, a failing Close can be the first sign the data never reached
+// disk, so it must not be silently dropped.
+func Export(st *store.Store, format, outPath string, stdout io.Writer) (res ExportResult, err error) {
 	if format != "jsonl" && format != "csv" {
 		return ExportResult{}, fmt.Errorf("export: --format must be \"jsonl\" or \"csv\", got %q", format)
 	}
@@ -76,7 +79,11 @@ func Export(st *store.Store, format, outPath string, stdout io.Writer) (ExportRe
 		if cerr != nil {
 			return ExportResult{}, fmt.Errorf("export: creating %s: %w", outPath, cerr)
 		}
-		defer f.Close()
+		defer func() {
+			if cerr := f.Close(); cerr != nil && err == nil {
+				res, err = ExportResult{}, fmt.Errorf("export: closing %s: %w", outPath, cerr)
+			}
+		}()
 		w = f
 	}
 	bw := bufio.NewWriterSize(w, exportWriteBufferSize)

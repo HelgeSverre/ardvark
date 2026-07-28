@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -87,9 +88,16 @@ func (f *ctLogFixture) server() *httptest.Server {
 	})
 	mux.HandleFunc("/ct/v1/get-entries", func(w http.ResponseWriter, r *http.Request) {
 		f.requests = append(f.requests, r.URL.String())
-		var start, end int64
-		fmt.Sscanf(r.URL.Query().Get("start"), "%d", &start)
-		fmt.Sscanf(r.URL.Query().Get("end"), "%d", &end)
+		start, err := strconv.ParseInt(r.URL.Query().Get("start"), 10, 64)
+		if err != nil {
+			http.Error(w, "invalid start", http.StatusBadRequest)
+			return
+		}
+		end, err := strconv.ParseInt(r.URL.Query().Get("end"), 10, 64)
+		if err != nil {
+			http.Error(w, "invalid end", http.StatusBadRequest)
+			return
+		}
 
 		if start < 0 || start >= int64(len(f.entries)) || end < start {
 			_ = json.NewEncoder(w).Encode(ctGetEntriesResponse{})
