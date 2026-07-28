@@ -23,9 +23,12 @@ proceed past a red gate to "fix it after".
 2. **The website is deployed by hand.** No workflow deploys it. Tagging a
    release does nothing to ardvark.no. It is the step most likely to be
    forgotten.
-3. **Local crawl output can be published.** The CLI defaults to `./ardvark.db`,
-   so running it from `website/` drops a database next to the static files.
-   `website/.vercelignore` excludes it — confirm the live 404 anyway.
+3. **Only committed files may be published.** The CLI defaults to
+   `./ardvark.db`, so running it from `website/` drops a database next to the
+   static files. `just deploy-website` deploys a clean export of `HEAD` rather
+   than the working directory, so untracked files cannot reach the CDN at all;
+   `website/.vercelignore` is a second layer. Deploying by hand from `website/`
+   throws that guarantee away — don't.
 4. **The smoke test is not in CI.** It needs Docker. CI never runs it, so
    changes to `internal/store`, `internal/crawler`, or `internal/frontier` are
    unverified against MySQL/Postgres until you run it locally.
@@ -161,22 +164,30 @@ the previous version while the job was green, the token gate skipped it.
 Static site on Vercel, linked via `website/.vercel/project.json`. Not in CI.
 
 ```sh
-cd website && npx vercel whoami          # expect: helgesverre
-npx vercel --prod --yes
+cd website && npx vercel whoami   # expect: helgesverre
+cd .. && just deploy-website
 ```
+
+The recipe exports `HEAD` to a staging directory and deploys that, so only
+committed files can be published and the deploy always matches a reviewable
+commit. It refuses to run while `website/` has uncommitted changes — commit
+them rather than working around it, or the live site silently diverges from
+the tag you just cut. It prints the exact file list it is publishing; skim it.
 
 ## Phase 9 — Verify the live site
 
 ```sh
 curl -sS -o /dev/null -w 'ard.json        %{http_code} %{content_type}\n' https://ardvark.no/.well-known/ard.json
 curl -sS -o /dev/null -w 'ai-catalog.json %{http_code} %{content_type}\n' https://ardvark.no/.well-known/ai-catalog.json
-curl -sS -o /dev/null -w 'ardvark.db      %{http_code} (MUST be 404)\n'   https://ardvark.no/ardvark.db
+curl -sS -o /dev/null -w 'ardvark.db      %{http_code} (regression guard, expect 404)\n' https://ardvark.no/ardvark.db
 curl -sS https://ardvark.no/robots.txt
 curl -sS https://ardvark.no/ | grep -o '<link rel="ar[^>]*>'
 ```
 
-Expect: both well-known paths `200 application/json`, `ardvark.db` **404**,
-both `Agentmap:` lines present, `rel="ard"` in the page head.
+Expect: both well-known paths `200 application/json`, both `Agentmap:` lines
+present, `rel="ard"` in the page head. The `ardvark.db` 404 is a regression
+guard on the clean-export deploy, not the thing keeping it private — if it
+ever returns 200, someone deployed the working directory by hand.
 
 ## Phase 10 — Dogfood
 
