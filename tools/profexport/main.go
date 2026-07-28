@@ -34,8 +34,17 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		defer f.Close()
-		pprof.StartCPUProfile(f)
+		// Closes after StopCPUProfile (LIFO). A close failure means the
+		// profile on disk is truncated, which would silently invalidate the
+		// measurement, so say so.
+		defer func() {
+			if err := f.Close(); err != nil {
+				log.Printf("closing cpu profile %s: %v", *cpuprofile, err)
+			}
+		}()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Fatal(err)
+		}
 		defer pprof.StopCPUProfile()
 	}
 
@@ -45,7 +54,11 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		defer f.Close()
+		defer func() {
+			if err := f.Close(); err != nil {
+				log.Printf("closing export output %s: %v", *out, err)
+			}
+		}()
 		w = f
 	}
 

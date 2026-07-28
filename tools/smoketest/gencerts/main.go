@@ -111,6 +111,9 @@ func writePEM(path, typ string, der []byte) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	return pem.Encode(f, &pem.Block{Type: typ, Bytes: der})
+	if err := pem.Encode(f, &pem.Block{Type: typ, Bytes: der}); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }

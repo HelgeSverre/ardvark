@@ -1,0 +1,35 @@
+{
+  "storage": {
+    "driver": "__DB_DRIVER__",
+    "dsn": "__DB_DSN__"
+  },
+  "log": {
+    "file": "__LOGFILE__",
+    "level": "info"
+  },
+  "crawler": {
+    "concurrency": 4,
+    "maxDepth": 2,
+    "maxPagesPerDomain": 4,
+    "perHostRequestsPerSecond": 50,
+    "requestTimeoutSeconds": 15,
+    "maxBodyBytes": 5242880,
+    "userAgent": "ardvark-smoketest (+https://github.com/helgesverre/ardvark)",
+    "respectRobotsTxt": true,
+    "refreshAfterHours": 168,
+    "leaseSeconds": 15,
+    "worker": {
+      "index": __WORKER_INDEX__,
+      "count": __WORKER_COUNT__
+    }
+  },
+  "ard": {
+    "maxCatalogDepth": 3,
+    "fetchArtifacts": true
+  },
+  "registry": {
+    "harvest": true,
+    "maxReferralDepth": 2,
+    "pageLimit": 20
+  }
+}

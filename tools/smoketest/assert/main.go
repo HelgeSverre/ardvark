@@ -341,7 +341,8 @@ func forEachItemComplete(logsDir string, w int, fn func(logEvent)) {
 	if err != nil {
 		return
 	}
-	defer f.Close()
+	// Read-only handle: the close error cannot affect what was already scanned.
+	defer func() { _ = f.Close() }()
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1024*1024), 4*1024*1024)
 	for sc.Scan() {

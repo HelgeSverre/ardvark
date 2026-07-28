@@ -8,8 +8,11 @@ dist/
 *.db-journal
 *.jsonl
 
-# Local config
-ardvark.json
+# Local config. Anchored to the repo root: an unanchored "ardvark.json"
+# matches at any depth and silently swallowed the smoke test's config
+# template (tools/smoketest/config/ardvark.json), leaving the harness
+# unrunnable from a fresh clone.
+/ardvark.json
 
 # Go
 coverage.out
