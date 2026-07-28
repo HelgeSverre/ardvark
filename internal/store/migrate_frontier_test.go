@@ -2,6 +2,8 @@ package store
 
 import (
 	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 
 	"gorm.io/driver/mysql"
@@ -169,5 +171,103 @@ func TestMigrateFrontierDedupKey_SqliteNoOp(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("sqlite reconcile must be a no-op; expected 1 row preserved, got %d", count)
+	}
+}
+
+func TestOpen_DiscardsRowsFromOlderDedupSemantics(t *testing.T) {
+	dsn := filepath.Join(t.TempDir(), "dedup-version.db")
+	st, err := Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	if err := st.DB.Create(&FrontierItem{
+		Kind:     KindArtifactFetch,
+		URL:      "https://example.com/shared.json",
+		Host:     "example.com",
+		Status:   FrontierStatusPending,
+		DedupKey: "legacy-url-only-key",
+	}).Error; err != nil {
+		t.Fatalf("seeding legacy frontier row: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("closing first store: %v", err)
+	}
+
+	reopened, err := Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+
+	var count int64
+	if err := reopened.DB.Model(&FrontierItem{}).Count(&count).Error; err != nil {
+		t.Fatalf("counting frontier rows: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("frontier rows after dedup-semantics migration = %d, want 0", count)
+	}
+}
+
+// -- concurrent first open --------------------------------------------------
+
+// dropAllTables returns the database to a pre-migration state so the next
+// Open has to create the whole schema.
+func dropAllTables(t *testing.T, b matrixBackend) {
+	t.Helper()
+	db := openRawMatrix(t, b)
+	if err := db.Migrator().DropTable(allModels...); err != nil {
+		t.Fatalf("dropping tables on %s: %v", b.driver, err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("unwrapping %s handle: %v", b.driver, err)
+	}
+	_ = sqlDB.Close()
+}
+
+// A worker fleet starts its processes at once, so several of them call Open
+// against a database whose schema does not exist yet. AutoMigrate issues
+// CREATE TABLE/INDEX per model, and on a server engine the loser of a
+// concurrent create gets a catalog unique-violation
+// (pg_class_relname_nsp_index / pg_type_typname_nsp_index on postgres,
+// "table already exists" on mysql) rather than a benign no-op — so the worker
+// exits before it has even opened its event log.
+func TestOpen_ConcurrentFirstOpenIsSafe(t *testing.T) {
+	for _, b := range matrixBackends(t) {
+		t.Run(b.driver, func(t *testing.T) {
+			dropAllTables(t, b)
+
+			const openers = 10
+			var wg sync.WaitGroup
+			start := make(chan struct{})
+			errs := make(chan error, openers)
+
+			for i := 0; i < openers; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					<-start // release them together to maximize overlap
+					st, err := Open(b.driver, b.dsn)
+					if err == nil {
+						_ = st.Close()
+					}
+					errs <- err
+				}()
+			}
+			close(start)
+			wg.Wait()
+			close(errs)
+
+			var failed int
+			for err := range errs {
+				if err != nil {
+					failed++
+					t.Errorf("concurrent Open failed: %v", err)
+				}
+			}
+			if failed > 0 {
+				t.Fatalf("%d of %d concurrent opens failed against %s", failed, openers, b.driver)
+			}
+		})
 	}
 }

@@ -43,6 +43,12 @@ const (
 	FrontierStatusFailed   = "failed"
 )
 
+// FrontierDedupVersion identifies the relationship-aware dedup semantics used
+// by current enqueues. Store.Open discards rows written by older algorithms;
+// their keys cannot safely coexist because they collapse different
+// provenance relationships.
+const FrontierDedupVersion = 2
+
 // Domain discovery sources.
 const (
 	DiscoverySourceSeed             = "seed"
@@ -59,19 +65,44 @@ const (
 	DiscoverySourceCommonCrawl      = "commoncrawl"
 )
 
-// Domain ARD status.
+// Domain ARD status, ordered as a promotion ladder from least to most
+// information about the host:
+//
+//	unprobed → not_found | advertised → found_invalid | found_valid
+//
+// The column answers two different questions that usually coincide but are
+// not the same: does this host *advertise* ARD (a property of the host,
+// known as soon as it is probed), and does this host *serve* a catalog that
+// verified (a property of the catalog document, attributed to whichever host
+// actually serves it). When a host advertises a catalog served elsewhere —
+// a robots.txt Agentmap pointing at a sibling domain, say — only the first
+// question has an answer for it, which is what ARDStatusAdvertised records.
+//
+// A status is only ever promoted, never demoted, by a weaker observation;
+// see Store.PromoteDomainAdvertised.
 const (
-	ARDStatusUnprobed     = "unprobed"
-	ARDStatusNotFound     = "not_found"
+	ARDStatusUnprobed = "unprobed"
+	ARDStatusNotFound = "not_found"
+	// ARDStatusAdvertised means the host was probed and points at an ARD
+	// document, but no verification verdict is attributed to this host —
+	// either because another host serves that document, or because the
+	// catalog fetch has not completed yet.
+	ARDStatusAdvertised   = "advertised"
 	ARDStatusFoundInvalid = "found_invalid"
 	ARDStatusFoundValid   = "found_valid"
 )
 
-// Probe methods.
+// Probe methods. These are additive: values are stored as free text, so
+// adding one does not require a migration, and rows written by older
+// versions keep their original value.
 const (
 	ProbeMethodWellKnown      = "well_known"
 	ProbeMethodRobotsAgentmap = "robots_agentmap"
 	ProbeMethodLinkTag        = "link_tag"
+	// ProbeMethodInPage marks a catalog found in a page's inline
+	// <script type="application/ld+json"> markup rather than at a URL of
+	// its own.
+	ProbeMethodInPage = "in_page"
 )
 
 // Probe outcomes.
@@ -149,23 +180,23 @@ type FrontierItem struct {
 	Attempts  int
 	LastError string `gorm:"type:text"`
 	// DedupKey is the frontier's uniqueness key: at most one row per distinct
-	// (kind, natural key) may exist. It is a hex-encoded SHA-256 of
-	// "kind:natural" (see internal/crawler.dedupKey), so it is always exactly
-	// 64 lowercase hex chars — fixed width, driver-independent, and safely
-	// under MySQL's utf8mb4 768-char unique-index key limit — regardless of how
-	// long the source URL is. The column must stay at size:64: it must not be
-	// widened toward the URL column's size:2048, which would exceed the index
-	// key limit and fail migration. Upgrading from <=0.4.0 (which stored raw
-	// "kind:natural" strings up to varchar(512) here) cannot narrow this column
-	// in place: on mysql/postgres a populated 0.4.0 frontier almost always
-	// holds keys longer than 64 chars, so AutoMigrate's ALTER to varchar(64)
-	// would hard-fail (strict sql_mode) or silently truncate-and-collide
-	// (non-strict). The stale raw keys are worthless after the upgrade anyway —
-	// new enqueues hash their keys and would never match them again — so
-	// store.Open drops and recreates the frontier table before AutoMigrate
-	// runs, discarding pending work that is harmlessly re-discovered on the
-	// next crawl (see store.migrateFrontierDedupKey and dedupKey).
-	DedupKey string `gorm:"uniqueIndex;size:64"`
+	// kind/resource relationship may exist. It is a hex-encoded SHA-256 of
+	// "kind:natural" where natural includes provenance for relationship-bound
+	// work (see internal/crawler.dedupKey), so it is always exactly 64 lowercase
+	// hex chars — fixed width and driver-independent. The column must stay at
+	// size:64: it must not be widened toward the URL column's size:2048, which
+	// would exceed the index key limit and fail migration. Upgrading from
+	// <=0.4.0 (which stored raw "kind:natural" strings up to varchar(512) here)
+	// cannot narrow this column in place: on mysql/postgres a populated 0.4.0
+	// frontier almost always holds keys longer than 64 chars, so AutoMigrate's
+	// ALTER to varchar(64) would hard-fail (strict sql_mode) or silently
+	// truncate-and-collide (non-strict). The stale raw keys are worthless after
+	// the upgrade anyway — new enqueues hash their keys and would never match
+	// them again — so store.Open drops and recreates the frontier table before
+	// AutoMigrate runs. Operators repopulate this derived queue by re-running
+	// their seed/crawl inputs (see store.migrateFrontierDedupKey and dedupKey).
+	DedupKey     string `gorm:"uniqueIndex;size:64"`
+	DedupVersion int    `gorm:"index;not null;default:0"`
 
 	// HostShard is fnv32a(fetchHost) % HostShardCount, computed once at
 	// enqueue time (see internal/frontier.Enqueue), where fetchHost is the

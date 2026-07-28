@@ -427,3 +427,29 @@ func TestSaveRegistry(t *testing.T) {
 		t.Fatal("expected registry ID to be set")
 	}
 }
+
+func TestSaveRegistry_IsIdempotentForSameReference(t *testing.T) {
+	s := newTestStore(t)
+	first := &Registry{EntryID: 42, BaseURL: "https://registry.example/api", HarvestStatus: HarvestStatusPending}
+	second := &Registry{EntryID: 42, BaseURL: "https://registry.example/api", HarvestStatus: HarvestStatusPending}
+
+	if err := s.SaveRegistry(first); err != nil {
+		t.Fatalf("SaveRegistry(first): %v", err)
+	}
+	if err := s.SaveRegistry(second); err != nil {
+		t.Fatalf("SaveRegistry(second): %v", err)
+	}
+	if second.ID != first.ID {
+		t.Errorf("second.ID = %d, want existing ID %d", second.ID, first.ID)
+	}
+
+	var count int64
+	if err := s.DB.Model(&Registry{}).
+		Where("entry_id = ? AND base_url = ? AND referral_source_id IS NULL", first.EntryID, first.BaseURL).
+		Count(&count).Error; err != nil {
+		t.Fatalf("counting registries: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("registry rows = %d, want 1", count)
+	}
+}

@@ -1,6 +1,8 @@
 package store
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -61,12 +63,19 @@ func Open(driver, dsn string) (*Store, error) {
 		return nil, fmt.Errorf("store: opening %s database: %w", driver, err)
 	}
 
-	if err := migrateFrontierDedupKey(db); err != nil {
-		return nil, fmt.Errorf("store: reconciling frontier_items before migration: %w", err)
-	}
-
-	if err := db.AutoMigrate(allModels...); err != nil {
-		return nil, fmt.Errorf("store: migrating schema: %w", err)
+	if err := withMigrationLock(db, driver, func() error {
+		if err := migrateFrontierDedupKey(db); err != nil {
+			return fmt.Errorf("store: reconciling frontier_items before migration: %w", err)
+		}
+		if err := db.AutoMigrate(allModels...); err != nil {
+			return fmt.Errorf("store: migrating schema: %w", err)
+		}
+		if err := migrateFrontierDedupVersion(db); err != nil {
+			return fmt.Errorf("store: reconciling frontier dedup semantics: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 
 	if driver == "sqlite" || driver == "sqlite3" {
@@ -82,6 +91,98 @@ func Open(driver, dsn string) (*Store, error) {
 	}
 
 	return &Store{DB: db}, nil
+}
+
+// Schema-migration mutex identifiers. The key/name are arbitrary but must
+// stay stable across versions, since older and newer ardvark processes
+// starting against the same database have to contend for the same lock.
+const (
+	// migrationLockKey is postgres's advisory-lock key: ASCII "ARDV".
+	migrationLockKey int64 = 0x41524456
+	// migrationLockName is mysql's GET_LOCK name (max 64 chars).
+	migrationLockName = "ardvark:schema-migration"
+	// migrationLockTimeout bounds the wait so a stuck peer surfaces as a
+	// clear error rather than a process that hangs at startup forever.
+	migrationLockTimeout = 2 * time.Minute
+)
+
+// withMigrationLock runs migrate while holding a database-wide advisory lock,
+// so that processes starting at the same time apply schema changes one at a
+// time.
+//
+// This is load-bearing for any worker fleet. Open runs AutoMigrate on every
+// open, and AutoMigrate issues a CREATE TABLE/INDEX per model. Those are not
+// atomic against a concurrent identical create: on a server engine the loser
+// gets a hard error rather than a benign no-op — postgres reports a system
+// catalog unique violation (pg_class_relname_nsp_index /
+// pg_type_typname_nsp_index), mysql reports "table already exists" (1050).
+// Because Open runs before a command has opened its event log, such a worker
+// dies at startup with nothing written to its log, which is exceptionally
+// hard to diagnose from the outside.
+//
+// sqlite takes no lock: it serializes writers at the file level, and it has
+// no advisory-lock primitive to use here.
+func withMigrationLock(db *gorm.DB, driver string, migrate func() error) error {
+	switch driver {
+	case "postgres", "postgresql", "mysql":
+	default:
+		return migrate()
+	}
+
+	sqlDB, err := db.DB()
+	if err != nil {
+		return fmt.Errorf("store: getting underlying sql.DB: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), migrationLockTimeout)
+	defer cancel()
+
+	// Both engines scope these locks to a session, so acquire and release
+	// must run on the same pooled connection.
+	conn, err := sqlDB.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("store: opening migration-lock connection: %w", err)
+	}
+	// Returns the connection to the pool; the unlock deferred below runs
+	// first, so the lock is always released before that happens.
+	defer func() { _ = conn.Close() }()
+
+	if driver == "mysql" {
+		var acquired sql.NullInt64
+		if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)",
+			migrationLockName, int(migrationLockTimeout.Seconds())).Scan(&acquired); err != nil {
+			return fmt.Errorf("store: acquiring schema migration lock: %w", err)
+		}
+		if !acquired.Valid || acquired.Int64 != 1 {
+			return fmt.Errorf("store: timed out waiting for the schema migration lock")
+		}
+		// Released on a fresh context: ctx may already be done if migration
+		// used its full budget, and the lock must be released regardless.
+		defer func() {
+			_, _ = conn.ExecContext(context.Background(), "SELECT RELEASE_LOCK(?)", migrationLockName)
+		}()
+	} else {
+		if _, err := conn.ExecContext(ctx, "SELECT pg_advisory_lock($1)", migrationLockKey); err != nil {
+			return fmt.Errorf("store: acquiring schema migration lock: %w", err)
+		}
+		defer func() {
+			_, _ = conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1)", migrationLockKey)
+		}()
+	}
+
+	return migrate()
+}
+
+// migrateFrontierDedupVersion removes work rows whose keys were generated
+// under older URL-only semantics. Relationship-aware keys cannot match or
+// safely merge those rows. The frontier is derived crawl state: operators
+// repopulate it by re-running their seed/crawl inputs after upgrading.
+func migrateFrontierDedupVersion(db *gorm.DB) error {
+	if err := db.Where("dedup_version IS NULL OR dedup_version <> ?", FrontierDedupVersion).
+		Delete(&FrontierItem{}).Error; err != nil {
+		return fmt.Errorf("discarding stale frontier rows: %w", err)
+	}
+	return nil
 }
 
 // migrateFrontierDedupKey reconciles a pre-0.4.1 frontier_items table so that
@@ -262,6 +363,34 @@ func (s *Store) DomainByID(id uint) (*Domain, error) {
 	return &d, nil
 }
 
+// PromoteDomainAdvertised records that a host advertises an ARD document,
+// without overwriting a verification verdict already attributed to it.
+//
+// "Advertised" is strictly weaker information than found_valid/found_invalid:
+// it says a pointer exists, not that this host serves a catalog that
+// verified. So it fills in only where nothing better is known, which is
+// expressed as a single conditional UPDATE — atomic, and free of the
+// read-then-write race a check-in-Go version would have.
+func (s *Store) PromoteDomainAdvertised(domainID uint) error {
+	if err := s.DB.Model(&Domain{}).
+		Where("id = ? AND ard_status IN ?", domainID, []string{ARDStatusUnprobed, ARDStatusNotFound}).
+		Update("ard_status", ARDStatusAdvertised).Error; err != nil {
+		return fmt.Errorf("store: promoting domain %d to advertised: %w", domainID, err)
+	}
+	return nil
+}
+
+// RestoreDomainLastProbedAt resets the freshness marker after an
+// indeterminate probe attempt. Probe rows remain as history, but a transient
+// failure must not make the host look freshly and conclusively probed.
+func (s *Store) RestoreDomainLastProbedAt(domainID uint, previous *time.Time) error {
+	if err := s.DB.Model(&Domain{}).Where("id = ?", domainID).
+		Update("last_probed_at", previous).Error; err != nil {
+		return fmt.Errorf("store: restoring domain %d last_probed_at: %w", domainID, err)
+	}
+	return nil
+}
+
 // RecentlyProbed reports whether host has a domains.last_probed_at within
 // window of now.
 func (s *Store) RecentlyProbed(host string, window time.Duration) (bool, error) {
@@ -396,8 +525,22 @@ func (s *Store) CatalogByHash(contentHash string) (*Catalog, error) {
 // so change detection keys on source_url/domain first and content_hash
 // second.
 func (s *Store) LatestCatalogBySource(domainID uint, sourceURL string) (*Catalog, error) {
+	return s.LatestCatalogBySourceAndParent(domainID, sourceURL, nil)
+}
+
+// LatestCatalogBySourceAndParent returns the most recently fetched catalog
+// for one serving domain, final source URL, and parent relationship. The
+// parent is part of document identity because the current schema represents
+// each nested-catalog edge with its own Catalog row.
+func (s *Store) LatestCatalogBySourceAndParent(domainID uint, sourceURL string, parentCatalogID *uint) (*Catalog, error) {
 	var c Catalog
-	if err := s.DB.Where("domain_id = ? AND source_url = ?", domainID, sourceURL).
+	query := s.DB.Where("domain_id = ? AND source_url = ?", domainID, sourceURL)
+	if parentCatalogID == nil {
+		query = query.Where("parent_catalog_id IS NULL")
+	} else {
+		query = query.Where("parent_catalog_id = ?", *parentCatalogID)
+	}
+	if err := query.
 		Order("fetched_at desc").First(&c).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, fmt.Errorf("store: catalog for domain %d source %q: %w", domainID, sourceURL, ErrNotFound)
@@ -434,8 +577,27 @@ func (s *Store) SaveArtifact(a *Artifact) error {
 	return nil
 }
 
-// SaveRegistry inserts a registry row.
+// SaveRegistry inserts a registry reference, or returns the existing row for
+// the same declaring entry/base URL/referral parent. A Registry row models a
+// relationship, not a harvest attempt; repeat fan-out must therefore reuse it.
 func (s *Store) SaveRegistry(r *Registry) error {
+	query := s.DB.Where("entry_id = ? AND base_url = ?", r.EntryID, r.BaseURL)
+	if r.ReferralSourceID == nil {
+		query = query.Where("referral_source_id IS NULL")
+	} else {
+		query = query.Where("referral_source_id = ?", *r.ReferralSourceID)
+	}
+
+	var existing Registry
+	err := query.First(&existing).Error
+	if err == nil {
+		*r = existing
+		return nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("store: looking up registry reference: %w", err)
+	}
+
 	if err := s.DB.Create(r).Error; err != nil {
 		return fmt.Errorf("store: creating registry: %w", err)
 	}
