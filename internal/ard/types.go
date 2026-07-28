@@ -42,6 +42,36 @@ type Entry struct {
 	UpdatedAt             string          `json:"updatedAt,omitempty"`
 	Metadata              map[string]any  `json:"metadata,omitempty"`
 	TrustManifest         *TrustManifest  `json:"trustManifest,omitempty"`
+
+	// Raw is the entry's original JSON, captured verbatim when it was
+	// decoded. An ARD entry is a JSON-LD node: it may carry @context, @id,
+	// and terms from namespaces this struct knows nothing about. Decoding
+	// into fixed fields must not be where that data is lost, because Raw is
+	// what gets persisted and exported — re-marshaling the struct would
+	// quietly drop every term ardvark does not model.
+	//
+	// It is capture-only ("-"): it never round-trips back out as a property.
+	// It is empty for entries built in code rather than decoded from JSON.
+	Raw json.RawMessage `json:"-"`
+}
+
+// UnmarshalJSON decodes an entry's known fields while retaining the original
+// document bytes in Raw.
+//
+// Note for embedders: a type embedding Entry inherits this method, which
+// would then decode only Entry's own fields. Such a type must define its own
+// UnmarshalJSON (see registry.Result).
+func (e *Entry) UnmarshalJSON(data []byte) error {
+	// entryFields drops the method set, so unmarshaling into it does not
+	// recurse back into this function.
+	type entryFields Entry
+	var fields entryFields
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*e = Entry(fields)
+	e.Raw = append(json.RawMessage(nil), data...)
+	return nil
 }
 
 // TrustManifest carries verbatim trust/attestation data for a host or entry.

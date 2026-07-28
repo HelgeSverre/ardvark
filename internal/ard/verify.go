@@ -51,7 +51,18 @@ type Check struct {
 	// Subject is the entry URN the check applies to, or "catalog" for
 	// catalog-wide checks.
 	Subject string
+	// EntryIndex is the zero-based position, in the catalog's entries array,
+	// of the entry this check describes — or EntryIndexNone for catalog-wide
+	// checks. Subject alone cannot identify an entry: a catalog may contain
+	// duplicate identifiers (itself an identifier.unique violation), and then
+	// the URN string is shared by two or more entries. EntryIndex is the
+	// authoritative attribution; Subject remains the human-readable label.
+	EntryIndex int
 }
+
+// EntryIndexNone is the Check.EntryIndex value for checks that describe the
+// catalog as a whole rather than one of its entries.
+const EntryIndexNone = -1
 
 // Report is the full set of verification results for one catalog document,
 // plus the rolled-up verdict.
@@ -135,12 +146,13 @@ func newCheck(id, severity, subject string, passed bool, passMsg, failMsg string
 		msg = failMsg
 	}
 	return Check{
-		CheckID:  id,
-		Severity: severity,
-		Passed:   passed,
-		Message:  msg,
-		SpecRef:  specRef,
-		Subject:  subject,
+		CheckID:    id,
+		Severity:   severity,
+		Passed:     passed,
+		Message:    msg,
+		SpecRef:    specRef,
+		Subject:    subject,
+		EntryIndex: EntryIndexNone,
 	}
 }
 
@@ -185,12 +197,13 @@ func verify(raw []byte, servingDomain string, strict bool) Report {
 	var generic any
 	if err := json.Unmarshal(raw, &generic); err != nil {
 		report.Checks = []Check{{
-			CheckID:  "schema.parse",
-			Severity: SeverityError,
-			Passed:   false,
-			Message:  fmt.Sprintf("catalog is not valid JSON: %v", err),
-			SpecRef:  specRef,
-			Subject:  SubjectCatalog,
+			CheckID:    "schema.parse",
+			Severity:   SeverityError,
+			Passed:     false,
+			Message:    fmt.Sprintf("catalog is not valid JSON: %v", err),
+			SpecRef:    specRef,
+			Subject:    SubjectCatalog,
+			EntryIndex: EntryIndexNone,
 		}}
 		report.Verdict = VerdictInvalid
 		return report
@@ -328,12 +341,13 @@ func validateSchema(raw []byte, strict bool) []Check {
 	sch, err := compiledCatalogSchema()
 	if err != nil {
 		return []Check{{
-			CheckID:  "schema.parse",
-			Severity: SeverityError,
-			Passed:   false,
-			Message:  fmt.Sprintf("internal error compiling vendored schema: %v", err),
-			SpecRef:  specRef,
-			Subject:  SubjectCatalog,
+			CheckID:    "schema.parse",
+			Severity:   SeverityError,
+			Passed:     false,
+			Message:    fmt.Sprintf("internal error compiling vendored schema: %v", err),
+			SpecRef:    specRef,
+			Subject:    SubjectCatalog,
+			EntryIndex: EntryIndexNone,
 		}}
 	}
 
@@ -344,12 +358,13 @@ func validateSchema(raw []byte, strict bool) []Check {
 	instance, err := jsonschema.UnmarshalJSON(bytes.NewReader(instanceBytes))
 	if err != nil {
 		return []Check{{
-			CheckID:  "schema.parse",
-			Severity: SeverityError,
-			Passed:   false,
-			Message:  fmt.Sprintf("catalog is not valid JSON: %v", err),
-			SpecRef:  specRef,
-			Subject:  SubjectCatalog,
+			CheckID:    "schema.parse",
+			Severity:   SeverityError,
+			Passed:     false,
+			Message:    fmt.Sprintf("catalog is not valid JSON: %v", err),
+			SpecRef:    specRef,
+			Subject:    SubjectCatalog,
+			EntryIndex: EntryIndexNone,
 		}}
 	}
 
@@ -361,12 +376,13 @@ func validateSchema(raw []byte, strict bool) []Check {
 	ve, ok := verr.(*jsonschema.ValidationError)
 	if !ok {
 		return []Check{{
-			CheckID:  "schema.validation",
-			Severity: SeverityError,
-			Passed:   false,
-			Message:  verr.Error(),
-			SpecRef:  specRef,
-			Subject:  SubjectCatalog,
+			CheckID:    "schema.validation",
+			Severity:   SeverityError,
+			Passed:     false,
+			Message:    verr.Error(),
+			SpecRef:    specRef,
+			Subject:    SubjectCatalog,
+			EntryIndex: EntryIndexNone,
 		}}
 	}
 
@@ -400,13 +416,15 @@ func validateSchema(raw []byte, strict bool) []Check {
 		if leaf.Error != nil {
 			detail = leaf.Error.String()
 		}
+		subject, entryIdx := schemaEntryRef(leaf.InstanceLocation, raw)
 		checks = append(checks, Check{
-			CheckID:  "schema.validation",
-			Severity: severity,
-			Passed:   false,
-			Message:  fmt.Sprintf("at %s: %s", loc, detail),
-			SpecRef:  specRef,
-			Subject:  schemaSubject(leaf.InstanceLocation, raw),
+			CheckID:    "schema.validation",
+			Severity:   severity,
+			Passed:     false,
+			Message:    fmt.Sprintf("at %s: %s", loc, detail),
+			SpecRef:    specRef,
+			Subject:    subject,
+			EntryIndex: entryIdx,
 		})
 	}
 	return checks
@@ -463,13 +481,20 @@ func isRepresentativeQueriesCountFailure(leaf jsonschema.OutputUnit) bool {
 	}
 }
 
-// schemaSubject best-efforts a Subject (entry URN or "catalog") for a JSON
-// Schema failure by resolving its RFC 6901 instance location against the
-// raw document.
-func schemaSubject(instanceLocation string, raw []byte) string {
+// schemaEntryRef best-efforts the entry a JSON Schema failure describes, by
+// resolving its RFC 6901 instance location against the raw document. It
+// returns the entry's Subject (URN, or "catalog" when it has no identifier)
+// and its index in the entries array. A failure that isn't inside /entries/
+// resolves to (SubjectCatalog, EntryIndexNone).
+//
+// The index is returned alongside the URN because it, not the URN, is what
+// uniquely identifies the entry: duplicate identifiers within one catalog
+// are possible, and the location is the only evidence of which occurrence
+// actually failed.
+func schemaEntryRef(instanceLocation string, raw []byte) (string, int) {
 	const prefix = "/entries/"
 	if !strings.HasPrefix(instanceLocation, prefix) {
-		return SubjectCatalog
+		return SubjectCatalog, EntryIndexNone
 	}
 	rest := strings.TrimPrefix(instanceLocation, prefix)
 	idxStr := rest
@@ -478,7 +503,7 @@ func schemaSubject(instanceLocation string, raw []byte) string {
 	}
 	idx, err := strconv.Atoi(idxStr)
 	if err != nil {
-		return SubjectCatalog
+		return SubjectCatalog, EntryIndexNone
 	}
 
 	var doc struct {
@@ -487,15 +512,15 @@ func schemaSubject(instanceLocation string, raw []byte) string {
 		} `json:"entries"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
-		return SubjectCatalog
+		return SubjectCatalog, EntryIndexNone
 	}
 	if idx < 0 || idx >= len(doc.Entries) {
-		return SubjectCatalog
+		return SubjectCatalog, EntryIndexNone
 	}
 	if id := doc.Entries[idx].Identifier; id != "" {
-		return id
+		return id, idx
 	}
-	return SubjectCatalog
+	return SubjectCatalog, idx
 }
 
 // semanticChecks runs the seven spec-defined semantic checks that JSON
@@ -515,8 +540,12 @@ func semanticChecks(c Catalog, servingDomain string, schemaFailed bool) []Check 
 		checks = append(checks, checkSpecVersion(c))
 	}
 
-	for _, e := range c.Entries {
+	for i, e := range c.Entries {
 		subject := entrySubject(e)
+		// Every check appended below describes entry i. Stamping the index
+		// once, after the fact, keeps the individual check constructors free
+		// of an argument none of them actually reason about.
+		entryStart := len(checks)
 
 		if !schemaFailed {
 			checks = append(checks, checkValueOrReference(e, subject))
@@ -542,6 +571,10 @@ func semanticChecks(c Catalog, servingDomain string, schemaFailed bool) []Check 
 			checks = append(checks, checkQueriesCount(e, subject))
 		}
 		checks = append(checks, checkMediaType(e, mt, subject))
+
+		for j := entryStart; j < len(checks); j++ {
+			checks[j].EntryIndex = i
+		}
 	}
 
 	return checks
@@ -587,12 +620,13 @@ func checkIdentifierUnique(c Catalog) Check {
 		msg = fmt.Sprintf("duplicate identifiers found: %s", strings.Join(dups, ", "))
 	}
 	return Check{
-		CheckID:  "identifier.unique",
-		Severity: SeverityError,
-		Passed:   passed,
-		Message:  msg,
-		SpecRef:  specRef,
-		Subject:  SubjectCatalog,
+		CheckID:    "identifier.unique",
+		Severity:   SeverityError,
+		Passed:     passed,
+		Message:    msg,
+		SpecRef:    specRef,
+		Subject:    SubjectCatalog,
+		EntryIndex: EntryIndexNone,
 	}
 }
 
@@ -610,12 +644,13 @@ func checkValueOrReference(e Entry, subject string) Check {
 		msg = "neither url nor data is present; exactly one is required"
 	}
 	return Check{
-		CheckID:  "entry.value_or_reference",
-		Severity: SeverityError,
-		Passed:   passed,
-		Message:  msg,
-		SpecRef:  specRef,
-		Subject:  subject,
+		CheckID:    "entry.value_or_reference",
+		Severity:   SeverityError,
+		Passed:     passed,
+		Message:    msg,
+		SpecRef:    specRef,
+		Subject:    subject,
+		EntryIndex: EntryIndexNone,
 	}
 }
 
@@ -628,12 +663,13 @@ func checkURNFormat(urnErr error, subject string) Check {
 		msg = urnErr.Error()
 	}
 	return Check{
-		CheckID:  "urn.format",
-		Severity: SeverityError,
-		Passed:   passed,
-		Message:  msg,
-		SpecRef:  specRef,
-		Subject:  subject,
+		CheckID:    "urn.format",
+		Severity:   SeverityError,
+		Passed:     passed,
+		Message:    msg,
+		SpecRef:    specRef,
+		Subject:    subject,
+		EntryIndex: EntryIndexNone,
 	}
 }
 
@@ -686,12 +722,13 @@ func checkQueriesCount(e Entry, subject string) Check {
 	n := len(e.RepresentativeQueries)
 	passed := n >= 2 && n <= 5
 	return Check{
-		CheckID:  "queries.count",
-		Severity: SeverityWarning,
-		Passed:   passed,
-		Message:  fmt.Sprintf("%d representativeQueries present (recommended: 2-5)", n),
-		SpecRef:  specRef,
-		Subject:  subject,
+		CheckID:    "queries.count",
+		Severity:   SeverityWarning,
+		Passed:     passed,
+		Message:    fmt.Sprintf("%d representativeQueries present (recommended: 2-5)", n),
+		SpecRef:    specRef,
+		Subject:    subject,
+		EntryIndex: EntryIndexNone,
 	}
 }
 
