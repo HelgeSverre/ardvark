@@ -413,7 +413,7 @@ go install github.com/helgesverre/ardvark/cmd/ardvark@latest</pre>
         <button class="copy" data-copy="go install github.com/helgesverre/ardvark/cmd/ardvark@latest">copy</button>
       </div>
       <p>Or grab a binary from the <a href="https://github.com/helgesverre/ardvark/releases">releases page</a> — macOS, Linux, and Windows are all published.</p>
-      <p><b>Availability</b> — everything on this page is in v0.3.0 or later.</p>
+      <p><b>Availability</b> — everything on this page is in v0.5.0 or later.</p>
     </section>
 
     <section id="quickstart">
@@ -464,12 +464,14 @@ ardvark export --format jsonl --out resources.jsonl">copy</button>
 
     <section id="discovery">
       <h2>How discovery works</h2>
-      <p>ardvark checks a host for an ARD catalog through three mechanisms. Each is attempted and recorded independently — a host publishing through more than one gets a result row for each, and every discovered catalog is fetched:</p>
+      <p>ardvark checks a host for an ARD catalog through four mechanisms. Each is attempted and recorded independently — a host publishing through more than one gets a result row for each, and every discovered catalog is fetched:</p>
       <ol>
-        <li><code>/.well-known/ai-catalog.json</code> — the canonical location the spec defines.</li>
+        <li>The well-known path: <code>/.well-known/ard.json</code> first, falling back to <code>/.well-known/ai-catalog.json</code>. The two are aliases for the same resource, so the first one that answers wins and the second is not requested.</li>
         <li><code>Agentmap:</code> directive in <code>robots.txt</code> — a pointer to a catalog served from somewhere else.</li>
-        <li><code>&lt;link rel="ai-catalog"&gt;</code> tag on a crawled page — found while spidering during <code>ardvark crawl</code> (not tried by <code>ardvark probe</code>, which does no HTML spidering).</li>
+        <li><code>&lt;link rel="ard"&gt;</code> (or the legacy <code>rel="ai-catalog"</code>) tag on a crawled page — found while spidering during <code>ardvark crawl</code> (not tried by <code>ardvark probe</code>, which does no HTML spidering).</li>
+        <li>An ARD catalog embedded inline in a page as <code>&lt;script type="application/ld+json"&gt;</code> — also spidering-only. Unrelated JSON-LD (Schema.org <code>Organization</code> markup and the like) is ignored.</li>
       </ol>
+      <p>DNS Service Binding discovery is not implemented.</p>
       <p>Every probe is recorded regardless of outcome, one row per attempt:</p>
       <ul>
         <li><b>hit</b> — a document was found at that location. It still goes through verification; a hit can be a valid catalog, one with warnings, or an invalid one — invalid catalogs are stored too, since "found but broken" is useful data.</li>
@@ -546,7 +548,7 @@ ardvark verify --strict ./my-catalog.json">copy</button>
           <thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
           <tbody>
             <tr><td><code>--count int</code></td><td>entries to harvest (default: config <code>seed.ct.entryCount</code>, 1000)</td></tr>
-            <tr><td><code>--log string</code></td><td>operator token (<code>oak</code>, <code>argon</code>, <code>all</code>) or explicit log URL (default: config <code>seed.ct.logs</code>)</td></tr>
+            <tr><td><code>--log string</code></td><td>operator token (<code>oak</code>, <code>argon</code>, <code>nimbus</code>, <code>all</code>) or explicit log URL (default: config <code>seed.ct.logs</code>)</td></tr>
           </tbody>
         </table>
       </article>
@@ -684,9 +686,9 @@ ardvark verify --strict ./my-catalog.json">copy</button>
       </div>
       <p>The moving parts: <code>specVersion</code> must be exactly <code>"1.0"</code>; each entry needs an <a href="#verification">ARD URN</a> identifier, a <code>displayName</code>, a media <code>type</code>, exactly one of <code>url</code> or <code>data</code>, and ideally 2–5 <code>representativeQueries</code> (fewer only warns, but indexers use them).</p>
       <h4 id="publishing-exposure">Exposing it</h4>
-      <p>Any one of the three <a href="#discovery">discovery mechanisms</a> is enough; publishing through several gets you found by more crawler configurations:</p>
+      <p>Any one of the <a href="#discovery">discovery mechanisms</a> is enough; publishing through several gets you found by more crawler configurations:</p>
       <ol>
-        <li>Serve it at <code>/.well-known/ai-catalog.json</code> — the canonical spec location, checked by every probe.</li>
+        <li>Serve it at <code>/.well-known/ard.json</code>, and keep <code>/.well-known/ai-catalog.json</code> alongside it as an alias — both are checked by every probe, and older crawlers only know the second name.</li>
         <li>Add an <code>Agentmap:</code> directive to <code>robots.txt</code>, pointing wherever the catalog actually lives:
           <div class="docs-code" data-copy="Agentmap: https://example.com/.well-known/ai-catalog.json">
             <pre>Agentmap: https://example.com/.well-known/ai-catalog.json</pre>
@@ -694,9 +696,9 @@ ardvark verify --strict ./my-catalog.json">copy</button>
           </div>
         </li>
         <li>Add a link tag to your pages — only found by spidering crawls, so don't make it your only mechanism:
-          <div class="docs-code" data-copy='&lt;link rel="ai-catalog" href="/.well-known/ai-catalog.json"&gt;'>
-            <pre>&lt;link rel="ai-catalog" href="/.well-known/ai-catalog.json"&gt;</pre>
-            <button class="copy" data-copy='&lt;link rel="ai-catalog" href="/.well-known/ai-catalog.json"&gt;'>copy</button>
+          <div class="docs-code" data-copy='&lt;link rel="ard" href="/.well-known/ard.json"&gt;'>
+            <pre>&lt;link rel="ard" href="/.well-known/ard.json"&gt;</pre>
+            <button class="copy" data-copy='&lt;link rel="ard" href="/.well-known/ard.json"&gt;'>copy</button>
           </div>
         </li>
       </ol>
@@ -749,7 +751,7 @@ ardvark verify --strict https://example.com/.well-known/ai-catalog.json">copy</b
 
       <article id="json-output">
         <h3>JSON output (--json)</h3>
-        <p><code>crawl</code>, <code>probe</code>, every <code>seed</code> source, <code>verify</code> (including <code>--stored</code>), <code>stats</code>, and <code>info</code> accept a <code>--json</code> flag: the command runs exactly as before but emits one pretty-printed JSON document on stdout instead of human-readable rows. <code>export</code> has no <code>--json</code> because its output is already machine-readable — pick JSONL or CSV with <code>--format</code>.</p>
+        <p><code>crawl</code>, <code>work</code>, <code>probe</code>, every <code>seed</code> source, <code>verify</code> (including <code>--stored</code>), <code>stats</code>, and <code>info</code> accept a <code>--json</code> flag: the command runs exactly as before but emits one pretty-printed JSON document on stdout instead of human-readable rows. <code>export</code> has no <code>--json</code> because its output is already machine-readable — pick JSONL or CSV with <code>--format</code>.</p>
         <ul>
           <li><b>stdout is the document</b> — live per-host rows are suppressed and diagnostics go to stderr, so piping stdout into <code>jq</code> is always safe.</li>
           <li><b>Exit codes are unchanged</b> — <code>verify --json</code> still exits 1 when the verdict is <code>invalid</code>. See <a href="#exit-codes">exit codes</a>.</li>
@@ -1021,6 +1023,7 @@ ardvark verify --strict https://example.com/.well-known/ai-catalog.json">copy</b
           <thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
           <tbody>
             <tr><td><code>--stored</code></td><td>re-verify every catalog stored in the database instead of a single document</td></tr>
+            <tr><td><code>--strict</code></td><td>validate against the exact published schema, promoting format assertions to errors</td></tr>
             <tr><td><code>--json</code></td><td>emit the check report as JSON instead of the printed report card</td></tr>
           </tbody>
         </table>
@@ -1088,7 +1091,7 @@ ardvark verify --strict https://example.com/.well-known/ai-catalog.json">copy</b
           <div class="term-bar"><span></span><span></span><span></span><span class="term-title">ardvark info</span></div>
           <pre><span class="c-p">$</span> ardvark info
 ardvark
-<span class="c-m">  version</span>                      0.3.0
+<span class="c-m">  version</span>                      0.5.0
 config
 <span class="c-m">  path</span>                         /Users/you/ardvark.json
 <span class="c-m">  exists</span>                       false
@@ -1138,7 +1141,7 @@ log
           <tr><td><code>crawler.perHostRequestsPerSecond</code></td><td><code>1</code></td><td>Politeness rate limit</td></tr>
           <tr><td><code>crawler.requestTimeoutSeconds</code></td><td><code>15</code></td><td>Per-request timeout</td></tr>
           <tr><td><code>crawler.maxBodyBytes</code></td><td><code>5242880</code></td><td>Response body size cap (5 MiB)</td></tr>
-          <tr><td><code>crawler.userAgent</code></td><td><code>ardvark/0.1 (+https://github.com/helgesverre/ardvark)</code></td><td>User-Agent header sent on every request</td></tr>
+          <tr><td><code>crawler.userAgent</code></td><td><code>ardvark (+https://github.com/helgesverre/ardvark)</code></td><td>User-Agent header sent on every request</td></tr>
           <tr><td><code>crawler.respectRobotsTxt</code></td><td><code>true</code></td><td>Honor robots.txt disallow rules</td></tr>
           <tr><td><code>crawler.refreshAfterHours</code></td><td><code>168</code></td><td>Skip hosts probed within this window (see <code>--force</code>)</td></tr>
           <tr><td><code>crawler.leaseSeconds</code></td><td><code>600</code></td><td>How long a dequeued frontier item stays leased before a peer may reclaim it; only matters for <a href="#distributed">distributed crawling</a>. Must outlast the slowest handler.</td></tr>

@@ -18,7 +18,7 @@ Publishers advertise their AI agents, MCP servers, and skills in an `ai-catalog.
 ## Features
 
 - **Domain harvesting** — crawl from seed URLs or URL lists, follow anchors to collect hosts, then probe each host once
-- **Every ARD discovery mechanism** — `/.well-known/ai-catalog.json`, `Agentmap:` directives in robots.txt, and `<link rel="ai-catalog">` tags
+- **Web ARD discovery** — `/.well-known/ard.json` (falling back to the legacy `/.well-known/ai-catalog.json`), `Agentmap:` directives in robots.txt, `<link rel="ard">` / `<link rel="ai-catalog">` tags, and ARD catalogs embedded inline as `<script type="application/ld+json">`. DNS Service Binding discovery is not implemented.
 - **Full catalog resolution** — recurses into nested catalogs, fetches referenced artifact documents (agent cards, MCP server cards), and harvests discovered registries via `POST /search`, including registry referrals
 - **Spec verification** — official JSON Schema plus seven semantic checks (URN grammar, value-or-reference exclusivity, query counts, …), each recorded pass/fail with a message; lenient by default toward real-world catalogs, with `verify --strict` for the exact published spec
 - **Bootstrap seeding** — fill the frontier from Certificate Transparency logs, crt.sh, the Tranco top list, GitHub code search, the MCP registry, curated awesome-lists, or Common Crawl domain ranks (`ardvark seed ct|crtsh|tranco|github|mcp|curated|commoncrawl`)
@@ -80,7 +80,7 @@ ardvark export --format jsonl --out resources.jsonl
 | `ardvark crawl [url\|domain]... [--list file] [--force]` | Seed the frontier and run the crawler until the queue is empty. Resumes pending work from earlier runs. With a worker fleet configured, this process only drains its own shard, so pair it with `ardvark work` for the other worker indices. |
 | `ardvark work [--worker i/n] [--force]` | Drain the shared frontier without seeding it. Multiple `work` processes can point at the same mysql/postgres database, each taking a disjoint `--worker` share of hosts (0-based index / total count) so they crawl cooperatively; sqlite is single-process only. Exits cleanly if the frontier is empty. |
 | `ardvark probe <host>...` | Probe specific hosts for ARD documents, no crawling. |
-| `ardvark seed ct [--count N] [--log oak\|argon\|all\|URL]` | Harvest domains from the newest Certificate Transparency log entries. Logs resolve live from the CT log list (Oak by default), so shard URLs never go stale. |
+| `ardvark seed ct [--count N] [--log oak\|argon\|nimbus\|all\|URL]` | Harvest domains from the newest Certificate Transparency log entries. Logs resolve live from the CT log list (Oak, Argon, and Nimbus by default), so shard URLs never go stale. |
 | `ardvark seed crtsh [--count N] [--match keyword]` | Harvest domains from crt.sh, narrowed to certificate identities mentioning `--match` (e.g. `agent`, `mcp`); without `--match`, queries a curated agent/mcp/ai keyword set instead of an unfiltered wildcard, which crt.sh can't serve. |
 | `ardvark seed tranco [--top N] [--url URL]` | Queue the top N domains from the Tranco list — the established web CT seeding misses. |
 | `ardvark seed github [--count N] [--query q]` | Search GitHub code search for well-known ARD catalog files and queue the owning repositories' domains. Highest-precision source — a hit is a real deployed catalog. Requires `GITHUB_TOKEN`. |
@@ -111,7 +111,7 @@ ardvark runs with sensible defaults and no config file. To change anything, drop
     "perHostRequestsPerSecond": 1,
     "requestTimeoutSeconds": 15,
     "maxBodyBytes": 5242880,
-    "userAgent": "ardvark/0.1 (+https://github.com/helgesverre/ardvark)",
+    "userAgent": "ardvark (+https://github.com/helgesverre/ardvark)",
     "respectRobotsTxt": true,
     "refreshAfterHours": 168,
     "leaseSeconds": 600,
@@ -120,13 +120,17 @@ ardvark runs with sensible defaults and no config file. To change anything, drop
   "ard":      { "maxCatalogDepth": 3, "fetchArtifacts": true },
   "registry": { "harvest": true, "maxReferralDepth": 2, "pageLimit": 20 },
   "seed": {
-    "ct":     { "logListUrl": "https://www.gstatic.com/ct/log_list/v3/log_list.json", "logs": ["oak"], "entryCount": 1000 },
+    "ct":     { "logListUrl": "https://www.gstatic.com/ct/log_list/v3/log_list.json", "logs": ["oak", "argon", "nimbus"], "entryCount": 1000 },
     "crtsh":  { "endpoint": "https://crt.sh", "count": 1000 },
     "tranco": { "listUrl": "https://tranco-list.eu/top-1m.csv.zip", "top": 1000 },
     "github": { "query": "filename:ai-catalog.json path:.well-known", "count": 100 },
     "mcp":    { "registryUrl": "https://registry.modelcontextprotocol.io", "count": 1000 },
     "curated": {
-      "urls": ["https://raw.githubusercontent.com/punkpeye/awesome-mcp-servers/main/README.md"],
+      "urls": [
+        "https://raw.githubusercontent.com/punkpeye/awesome-mcp-servers/main/README.md",
+        "https://raw.githubusercontent.com/wong2/awesome-mcp-servers/main/README.md",
+        "https://raw.githubusercontent.com/appcypher/awesome-mcp-servers/main/README.md"
+      ],
       "count": 500
     },
     "commoncrawl": {

@@ -160,8 +160,10 @@ re-crawling.
 
 - **domains** — id, host (unique), first_seen_at, last_probed_at,
   discovery_source (`seed | anchor | url_list | catalog_ref |
-  registry_referral | ct_log | crtsh | tranco`), ard_status (`unprobed | not_found | found_invalid |
-  found_valid`).
+  registry_referral | ct_log | crtsh | tranco`), ard_status (`unprobed | not_found | advertised |
+  found_invalid | found_valid`, a promotion ladder — `advertised` means the host points at an ARD
+  document but no verification verdict is attributed to this host, e.g. because another host serves
+  it).
 - **probes** — id, domain_id, method (`well_known | robots_agentmap |
   link_tag`), url, http_status, content_type, outcome (`hit | miss | error`),
   error_detail, probed_at. One row per attempt → probe history over time.

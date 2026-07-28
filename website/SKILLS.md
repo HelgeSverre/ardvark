@@ -149,7 +149,7 @@ misbehaving. Relevant knobs under `crawler`:
 - `respectRobotsTxt` (default `true`)
 - `refreshAfterHours` (default `168`) — skip hosts probed within this window;
   `crawl --force` bypasses it
-- `userAgent` (default `ardvark/0.1 (+https://github.com/helgesverre/ardvark)`)
+- `userAgent` (default `ardvark (+https://github.com/helgesverre/ardvark)`)
 
 Crawls are resumable: the frontier lives in the database, so killing a run
 and re-running `ardvark crawl` picks up where it stopped.

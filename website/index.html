@@ -22,6 +22,7 @@
   <meta name="robots" content="index, follow">
   <meta name="theme-color" content="#FDF8F1">
   <link rel="canonical" href="https://ardvark.no/">
+  <link rel="ard" href="/.well-known/ard.json">
   <link rel="ai-catalog" href="/.well-known/ai-catalog.json">
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
@@ -70,14 +71,14 @@
   <div class="term">
     <div class="term-bar"><span></span><span></span><span></span><span class="term-title">ardvark crawl</span></div>
     <pre><span class="c-p">$</span> ardvark seed ct --count 1000
-<span class="c-m">seeded 847 unique domains from oak.ct.letsencrypt.org (153 duplicates skipped)</span>
+<span class="c-m">seed ct_log complete: 1000 entries from oak,argon,nimbus log(s) · 847 added · 153 skipped (already queued)</span>
 <span class="c-p">$</span> ardvark crawl
-<span class="c-ok">  hit</span>   acme.com            well-known    catalog valid          <span class="c-m">14 entries</span>
+<span class="c-ok">  hit</span>   acme.com            well_known   catalog valid          <span class="c-m">14 entries</span>
 <span class="c-warn">  hit</span>   tools.example.dev   robots_agentmap  valid_with_warnings <span class="c-m">queries.count</span>
-<span class="c-m">  miss</span>  blog.someone.net    well-known    404
-<span class="c-err">  hit</span>   broken.startup.ai   well-known    invalid                <span class="c-m">urn.format ×3</span>
+<span class="c-m">  miss</span>  blog.someone.net    well_known   404
+<span class="c-err">  hit</span>   broken.startup.ai   well_known   invalid                <span class="c-m">urn.format ×3</span>
 <span class="c-m">  ...</span>
-<span class="c-m">run complete: 847 hosts probed · 3 catalogs · 2 registries harvested · 41 resources indexed</span></pre>
+<span class="c-m">run complete: 41 pages fetched · 847 hosts probed · 3 catalogs found · 2 valid · 1 error</span></pre>
   </div>
   <div class="demo-legend">
     <span><b>Every probe recorded</b> — hits, misses, and broken catalogs alike</span>
@@ -94,7 +95,7 @@
       <div class="card">
         <span class="num">01</span>
         <h3>Finds catalogs three ways</h3>
-        <p><code>/.well-known/ai-catalog.json</code>, <code>Agentmap:</code> directives in robots.txt, and <code>&lt;link rel="ai-catalog"&gt;</code> tags on crawled pages.</p>
+        <p><code>/.well-known/ard.json</code> (falling back to <code>/.well-known/ai-catalog.json</code>), <code>Agentmap:</code> directives in robots.txt, <code>&lt;link rel="ard"&gt;</code> tags, and inline <code>application/ld+json</code> catalogs on crawled pages.</p>
       </div>
       <div class="card">
         <span class="num">02</span>
@@ -187,7 +188,7 @@ ardvark export --format jsonl --out resources.jsonl</pre>
     <span class="spacer"></span>
     <a href="docs.html">Docs</a>
     <a href="https://github.com/helgesverre/ardvark">GitHub</a>
-    <a href="https://helgesverre.com">Helge Sverre</a>
+    <a href="https://helgesver.re">Helge Sverre</a>
   </div>
 </footer>
 

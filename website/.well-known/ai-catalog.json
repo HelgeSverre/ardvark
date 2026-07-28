@@ -37,7 +37,7 @@
       "displayName": "ardvark MCP server",
       "type": "application/mcp-server-card+json",
       "url": "https://ardvark.no/.well-known/ardvark-mcp.json",
-      "description": "stdio MCP server embedded in the ardvark CLI (`ardvark mcp`), exposing probe, verify, crawl, seed, stats, and export as tools that return the same typed JSON as the CLI's --json output.",
+      "description": "stdio MCP server embedded in the ardvark CLI (`ardvark mcp`), exposing probe, verify, crawl, seed, stats, info, and export as tools that return the same typed JSON as the CLI's --json output.",
       "tags": ["ard", "mcp", "crawler", "verification"],
       "representativeQueries": [
         "probe a host for an ARD ai-catalog.json document over MCP",

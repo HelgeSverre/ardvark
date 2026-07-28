@@ -6,6 +6,98 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-28
+
+### Added
+
+- **Preferred discovery aliases** — probes `/.well-known/ard.json` first and
+  falls back to `/.well-known/ai-catalog.json`, and accepts `rel="ard"`
+  alongside `rel="ai-catalog"` in HTML link tags. The two well-known paths are
+  aliases, so the first hit wins and the second is not fetched.
+- **In-page JSON-LD ingestion** — ARD catalog documents embedded in
+  `<script type="application/ld+json">` are now discovered, verified, stored,
+  and followed exactly like hosted documents, with the page URL plus a stable
+  per-block fragment as provenance. Unrelated Schema.org markup is ignored,
+  and malformed JSON-LD never interrupts ordinary link harvesting.
+- **JSON-LD and extension terms are preserved** — an entry's original JSON is
+  stored verbatim, so `@context`, `@id`, and namespaced terms such as
+  `acme:serviceTier` survive crawl, storage, and export instead of being
+  dropped when the entry is decoded into ardvark's struct.
+
+### Fixed
+
+- Worker fleets no longer die at startup on MySQL/Postgres. `store.Open` runs
+  `AutoMigrate` on every open, and its per-model `CREATE TABLE`/`CREATE INDEX`
+  statements are not atomic against an identical concurrent create: the loser
+  got a hard error (`pg_class_relname_nsp_index` /`pg_type_typname_nsp_index`
+  unique violations on Postgres, `Error 1050 table already exists` on MySQL)
+  rather than a no-op. Starting 10 workers together against a fresh database
+  failed 38/50 opens on Postgres and 9/10 on MySQL. Because `Open` runs before
+  a command opens its event log, affected workers exited with nothing logged.
+  Schema migration now holds a database advisory lock (`pg_advisory_lock` /
+  `GET_LOCK`); the same race is 0/50 after the fix. SQLite is unaffected and
+  takes no lock.
+- Hosts that advertise a catalog served by a *different* host — a robots.txt
+  `Agentmap` pointing at a sibling domain — are no longer reported as
+  `unprobed`. `domains.ard_status` conflated two questions: whether a host
+  advertises ARD (known when it is probed) and whether it serves a catalog
+  that verified (attributed to whichever host serves the document). When those
+  hosts differ, the advertising host was the subject of neither write. It now
+  reports the new `advertised` status, which also replaces the misleading
+  `unprobed` window between a probe hit and its catalog fetch completing.
+  Statuses are only ever promoted, so a re-probe cannot demote a host that
+  already has a verification verdict.
+- Registry referral harvesting now actually requests referrals. Harvests sent
+  `federation: "none"` while expecting referrals in the response, so a
+  spec-compliant registry returned none and referral crawling never happened.
+  A registry answering 501 to federation transparently falls back, so an
+  unsupported optional feature costs referrals rather than every result.
+- Verification checks for duplicate entry identifiers are attributed to the
+  entry that produced them, instead of being split proportionally across
+  occurrences by an approximation that could report a defect against a
+  conformant entry.
+
+- Preserve serving-host and per-reference provenance for nested catalogs,
+  artifacts, and registries instead of collapsing shared URLs onto one parent.
+- Retry indeterminate host probes and registry 429/5xx responses; robots.txt
+  caches are now origin-scoped and never downgrade after an HTTP error.
+- Crash-recovery fan-out now fills missing work without reactivating completed
+  children or duplicating registry rows.
+- `verify --stored`, explicit-port URL seeds, queue error propagation, public
+  examples, MCP metadata, and documented defaults now match runtime behavior.
+
+### Upgrading
+
+- The frontier is cleared once when opening a database written with older
+  URL-only dedup semantics. Re-run the original seed/crawl inputs to repopulate
+  this derived queue. Stop older workers before upgrading so they cannot
+  recreate obsolete frontier rows.
+- Well-known probing can now issue two requests per host instead of one: a
+  host publishing neither alias is probed at `/.well-known/ard.json` and then
+  at `/.well-known/ai-catalog.json`. A host publishing the preferred path
+  still costs a single request. Existing per-host rate limits and politeness
+  settings apply unchanged.
+- Catalogs discovered in page markup are recorded with probe method `in_page`
+  and a `#ld+json=<block>.<node>` source-URL fragment. The value is additive;
+  no migration is required and existing rows are untouched.
+- `domains.ard_status` gains the `advertised` value. It is free text in an
+  existing column, so no migration runs and existing rows keep their value;
+  anything grouping by this column (`ardvark stats`) will show the new bucket.
+
+### Known limitations
+
+- `seed github` still searches only the legacy filename
+  (`filename:ai-catalog.json path:.well-known`), so publishers that expose
+  *only* `/.well-known/ard.json` are not surfaced by that seed source. Every
+  other discovery path finds them. Left unchanged deliberately: covering both
+  names needs a code-search query this release could not verify against the
+  live GitHub API, and silently breaking a working seed source is worse than a
+  documented gap.
+- ARD v0.91 is not implemented. Its specification and authoritative schemas
+  are still unpublished upstream, so the entry-centric migration remains
+  blocked; see `internal/ard/schema/PROVENANCE.md`. This release is a
+  compatibility and correctness release against the current published spec.
+
 ## [0.5.0] - 2026-07-27
 
 ### Added
@@ -264,7 +356,8 @@ First release.
   with live per-host result rows and a JSON config validated with friendly
   error messages.
 
-[Unreleased]: https://github.com/helgesverre/ardvark/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/helgesverre/ardvark/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/helgesverre/ardvark/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/helgesverre/ardvark/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/helgesverre/ardvark/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/helgesverre/ardvark/compare/v0.3.0...v0.4.0

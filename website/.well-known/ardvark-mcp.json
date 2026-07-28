@@ -2,7 +2,7 @@
   "name": "ardvark",
   "title": "ardvark ARD crawler",
   "description": "stdio MCP server embedded in the ardvark CLI (`ardvark mcp`): probe hosts for ARD ai-catalog.json documents, verify catalogs against the spec, seed and run crawls, and query the indexed dataset.",
-  "version": "0.2.0",
+  "version": "0.5.0",
   "websiteUrl": "https://ardvark.no",
   "documentationUrl": "https://ardvark.no/docs.html#mcp",
   "repository": {
@@ -20,6 +20,7 @@
     "ardvark_crawl",
     "ardvark_seed",
     "ardvark_stats",
+    "ardvark_info",
     "ardvark_export"
   ]
 }

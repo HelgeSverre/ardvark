@@ -1,5 +1,33 @@
 # Schema provenance
 
+## v0.91 status: not yet vendorable (checked 2026-07-28)
+
+The v0.91 migration plan
+(`docs/superpowers/plans/2026-07-28-ard-v0.91-migration.md`) gates all
+implementation on Task 0: the final specification and its authoritative
+artifacts must be published before anything is built against them. **That gate
+is not satisfied.** As of 2026-07-28, `github.com/ards-project/ard-spec`:
+
+- publishes only `ai-catalog.schema.json`, `ard.cddl`, and `ard.openapi.yaml`
+  under `spec/schemas` — there is no `ard-entry.schema.json`;
+- has no git tags and no releases, so there is no immutable revision to pin;
+- was last pushed 2026-07-15, predating the 2026-07-23 editorial draft the
+  plan was written from.
+
+`ai-catalog.schema.json` therefore remains **authoritative** for ARD entry
+conformance in this codebase — not a legacy transport-only artifact. The
+plan's entry-centric tasks (its Tasks 1–4, 7–8, 10–11) stay blocked, because
+implementing them means guessing the six wire-shape questions the plan
+explicitly records as unresolved.
+
+Work that is correct regardless of which spec version lands has been done
+anyway: preferred/legacy discovery aliases, in-page JSON-LD ingestion,
+verbatim preservation of `@context`/`@id`/namespaced entry terms, and the
+registry federation fix. None of these depend on the final entry schema.
+
+Re-check this section before starting any entry-schema work.
+
+
 The following files are vendored **verbatim**, byte-for-byte, from the
 official ARD specification repository, pinned to a single commit so the
 whole spec surface (schema, CDDL, OpenAPI) stays in sync:

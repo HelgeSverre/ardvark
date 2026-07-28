@@ -14,9 +14,14 @@
     "perHostRequestsPerSecond": 1,
     "requestTimeoutSeconds": 15,
     "maxBodyBytes": 5242880,
-    "userAgent": "ardvark/0.1 (+https://github.com/helgesverre/ardvark)",
+    "userAgent": "ardvark (+https://github.com/helgesverre/ardvark)",
     "respectRobotsTxt": true,
-    "refreshAfterHours": 168
+    "refreshAfterHours": 168,
+    "leaseSeconds": 600,
+    "worker": {
+      "index": 0,
+      "count": 1
+    }
   },
   "ard": {
     "maxCatalogDepth": 3,
@@ -34,10 +39,34 @@
       "entryCount": 1000
     },
     "crtsh": {
-      "endpoint": "https://crt.sh"
+      "endpoint": "https://crt.sh",
+      "count": 1000
     },
     "tranco": {
-      "listUrl": "https://tranco-list.eu/top-1m.csv.zip"
+      "listUrl": "https://tranco-list.eu/top-1m.csv.zip",
+      "top": 1000
+    },
+    "github": {
+      "query": "filename:ai-catalog.json path:.well-known",
+      "count": 100
+    },
+    "mcp": {
+      "registryUrl": "https://registry.modelcontextprotocol.io",
+      "count": 1000
+    },
+    "curated": {
+      "urls": [
+        "https://raw.githubusercontent.com/punkpeye/awesome-mcp-servers/main/README.md",
+        "https://raw.githubusercontent.com/wong2/awesome-mcp-servers/main/README.md",
+        "https://raw.githubusercontent.com/appcypher/awesome-mcp-servers/main/README.md"
+      ],
+      "count": 500
+    },
+    "commoncrawl": {
+      "graphInfoUrl": "https://index.commoncrawl.org/graphinfo.json",
+      "graph": "",
+      "top": 1000,
+      "offset": 0
     }
   }
 }
