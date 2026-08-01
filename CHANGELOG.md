@@ -6,6 +6,33 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-01
+
+### Added
+
+- **Indexed data lookup** — `ardvark search` finds catalog entries by text,
+  host, publisher, media type, tag, and catalog verdict with stable cursor
+  pagination. `ardvark get catalog` returns the stored document, checks, and
+  cursor-paginated entries; `ardvark get entry` returns one complete entry.
+  All three commands support `--json`.
+- **MCP data access** — `ardvark_search`, `ardvark_get_catalog`, and
+  `ardvark_get_entry` expose the same typed results to agents. Catalogs and
+  entries are also readable through `ardvark://catalog/{id}` and
+  `ardvark://entry/{id}` resource templates.
+- **MCP safety annotations** — every tool now declares read-only,
+  destructive, idempotent, and open-world hints.
+
+### Changed
+
+- `ardvark export --out` rejects an existing file by default. Pass
+  `--overwrite` to replace it. The MCP export tool applies the same rule with
+  its `overwrite` argument.
+
+### Known limitations
+
+- `ardvark://catalog/{id}` MCP resources return the first 50-entry page. Use
+  `ardvark_get_catalog` with `entry_cursor` to read later pages.
+
 ## [0.6.0] - 2026-07-28
 
 ### Added
@@ -356,7 +383,8 @@ First release.
   with live per-host result rows and a JSON config validated with friendly
   error messages.
 
-[Unreleased]: https://github.com/helgesverre/ardvark/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/helgesverre/ardvark/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/helgesverre/ardvark/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/helgesverre/ardvark/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/helgesverre/ardvark/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/helgesverre/ardvark/compare/v0.4.0...v0.4.1
