@@ -361,6 +361,7 @@
         <summary><svg class="chev" width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 2.5 8 6l-3.5 3.5"/></svg><a href="#programmatic">Programmatic use</a></summary>
         <ul>
           <li><a href="#json-output">JSON output</a></li>
+          <li><a href="#search-index">Search and get</a></li>
           <li><a href="#mcp">MCP server</a></li>
           <li><a href="#jsonl-log">JSONL event log</a></li>
           <li><a href="#exit-codes">Exit codes</a></li>
@@ -377,6 +378,8 @@
           <li><a href="#cmd-probe">probe</a></li>
           <li><a href="#cmd-seed">seed</a></li>
           <li><a href="#cmd-verify">verify</a></li>
+          <li><a href="#cmd-search">search</a></li>
+          <li><a href="#cmd-get">get</a></li>
           <li><a href="#cmd-export">export</a></li>
           <li><a href="#cmd-stats">stats</a></li>
           <li><a href="#cmd-info">info</a></li>
@@ -413,7 +416,7 @@ go install github.com/helgesverre/ardvark/cmd/ardvark@latest</pre>
         <button class="copy" data-copy="go install github.com/helgesverre/ardvark/cmd/ardvark@latest">copy</button>
       </div>
       <p>Or grab a binary from the <a href="https://github.com/helgesverre/ardvark/releases">releases page</a> — macOS, Linux, and Windows are all published.</p>
-      <p><b>Availability</b> — everything on this page is in v0.5.0 or later.</p>
+      <p><b>Availability</b> — this page documents v0.7.0.</p>
     </section>
 
     <section id="quickstart">
@@ -751,7 +754,7 @@ ardvark verify --strict https://example.com/.well-known/ai-catalog.json">copy</b
 
       <article id="json-output">
         <h3>JSON output (--json)</h3>
-        <p><code>crawl</code>, <code>work</code>, <code>probe</code>, every <code>seed</code> source, <code>verify</code> (including <code>--stored</code>), <code>stats</code>, and <code>info</code> accept a <code>--json</code> flag: the command runs exactly as before but emits one pretty-printed JSON document on stdout instead of human-readable rows. <code>export</code> has no <code>--json</code> because its output is already machine-readable — pick JSONL or CSV with <code>--format</code>.</p>
+        <p><code>crawl</code>, <code>work</code>, <code>probe</code>, every <code>seed</code> source, <code>verify</code> (including <code>--stored</code>), <code>search</code>, both <code>get</code> subcommands, <code>stats</code>, and <code>info</code> accept a <code>--json</code> flag: the command runs exactly as before but emits one pretty-printed JSON document on stdout instead of human-readable rows. <code>export</code> has no <code>--json</code> because its output is already machine-readable — pick JSONL or CSV with <code>--format</code>.</p>
         <ul>
           <li><b>stdout is the document</b> — live per-host rows are suppressed and diagnostics go to stderr, so piping stdout into <code>jq</code> is always safe.</li>
           <li><b>Exit codes are unchanged</b> — <code>verify --json</code> still exits 1 when the verdict is <code>invalid</code>. See <a href="#exit-codes">exit codes</a>.</li>
@@ -788,7 +791,25 @@ ardvark verify --strict https://example.com/.well-known/ai-catalog.json">copy</b
   }
 }</pre>
         </div>
-        <p>The other shapes: <code>crawl --json</code> returns the final run summary once the frontier is drained (<code>seeds_requested</code>, <code>seeded</code>, <code>pages_fetched</code>, <code>hosts_probed</code>, <code>catalogs_found</code>, <code>catalogs_valid</code>, <code>errors</code>). <code>verify --json</code> returns the full report card — <code>source</code>, <code>verdict</code>, and every check's <code>id</code>, <code>severity</code>, <code>subject</code>, <code>passed</code>, and <code>message</code>. <code>stats --json</code> returns domain, catalog, and entry totals with their per-status breakdowns; <code>seed &lt;source&gt; --json</code> returns the source label and seeded/duplicate counts.</p>
+        <p>The other shapes: <code>crawl --json</code> returns the final run summary once the frontier is drained (<code>seeds_requested</code>, <code>seeded</code>, <code>pages_fetched</code>, <code>hosts_probed</code>, <code>catalogs_found</code>, <code>catalogs_valid</code>, <code>errors</code>). <code>verify --json</code> returns the full report card — <code>source</code>, <code>verdict</code>, and every check's <code>id</code>, <code>severity</code>, <code>subject</code>, <code>passed</code>, and <code>message</code>. <code>search --json</code> returns an <code>entries</code> page and an optional <code>next_cursor</code>; <code>get entry --json</code> returns one complete stored entry, and <code>get catalog --json</code> returns catalog details with an entry page. <code>stats --json</code> returns domain, catalog, and entry totals with their per-status breakdowns; <code>seed &lt;source&gt; --json</code> returns the source label and seeded/duplicate counts.</p>
+      </article>
+
+      <article id="search-index">
+        <h3>Search and get indexed data</h3>
+        <p><code>ardvark search</code> provides a portable query layer over SQLite, MySQL, and Postgres. Free text matches URNs, display names, descriptions, tags, representative queries, and reference URLs without case sensitivity. Exact filters can narrow the result by serving host, URN publisher, media type, tag, or catalog verdict.</p>
+        <div class="docs-code" data-copy="ardvark search &quot;database agent&quot; --type application/mcp-server-card+json --verdict valid --json">
+          <pre>ardvark search "database agent" \
+  --type application/mcp-server-card+json \
+  --verdict valid \
+  --json</pre>
+          <button type="button" class="copy" data-copy="ardvark search &quot;database agent&quot; --type application/mcp-server-card+json --verdict valid --json">copy</button>
+        </div>
+        <p>Results are ordered by entry ID. <code>--limit</code> accepts 1–200 entries. When another page exists, JSON output includes <code>next_cursor</code>; pass that value to <code>--cursor</code> to continue without repeating earlier rows.</p>
+        <p><code>ardvark get catalog &lt;id|url&gt;</code> returns one stored catalog with its verbatim document, catalog checks, and an entry page. Entry pages contain up to 50 rows by default and include <code>next_entry_cursor</code> when another page exists; continue with <code>--entry-cursor</code>. <code>ardvark get entry &lt;id|urn&gt;</code> returns one stored entry with its catalog context and checks. URL and URN selectors return the newest matching stored version; numeric IDs select an exact row. Raw documents are JSON strings because ardvark also stores malformed catalogs for diagnostics.</p>
+        <div class="docs-code" data-copy="ardvark get entry urn:air:example.com:tools:search --json">
+          <pre>ardvark get entry urn:air:example.com:tools:search --json</pre>
+          <button type="button" class="copy" data-copy="ardvark get entry urn:air:example.com:tools:search --json">copy</button>
+        </div>
       </article>
 
       <article id="mcp">
@@ -804,7 +825,10 @@ ardvark verify --strict https://example.com/.well-known/ai-catalog.json">copy</b
             <tr><td><code>ardvark_seed</code></td><td><code>source</code>, <code>count</code>, <code>offset</code></td><td>Bootstrap the frontier from <code>ct</code>, <code>crtsh</code>, <code>tranco</code>, <code>github</code> (needs <code>GITHUB_TOKEN</code>), <code>mcp</code>, <code>curated</code>, or <code>commoncrawl</code>.</td></tr>
             <tr><td><code>ardvark_stats</code></td><td>—</td><td>Summarize the indexed dataset. Read-only and fast — a good first call.</td></tr>
             <tr><td><code>ardvark_info</code></td><td>—</td><td>Report installation metadata: version, resolved config path, storage backend (with absolute sqlite path, existence, size), and event log location. Read-only and instant; never opens the database or the network, so it works even when storage is misconfigured.</td></tr>
-            <tr><td><code>ardvark_export</code></td><td><code>format</code>, <code>out</code></td><td>Dump every indexed entry to a file as JSONL or CSV and return the row count. Writes to a file, not stdout — stdout carries the protocol.</td></tr>
+            <tr><td><code>ardvark_search</code></td><td><code>query</code>, <code>host</code>, <code>publisher</code>, <code>media_type</code>, <code>tag</code>, <code>verdict</code>, <code>limit</code>, <code>cursor</code></td><td>Search indexed entries with stable cursor pagination. Read-only.</td></tr>
+            <tr><td><code>ardvark_get_catalog</code></td><td><code>selector</code>, <code>entry_limit</code>, <code>entry_cursor</code></td><td>Read a stored catalog by numeric ID or exact URL, including its raw document, checks, and a cursor-paginated entry page. Read-only.</td></tr>
+            <tr><td><code>ardvark_get_entry</code></td><td><code>selector</code></td><td>Read a stored entry by numeric ID or exact URN, including its catalog context and checks. Read-only.</td></tr>
+            <tr><td><code>ardvark_export</code></td><td><code>format</code>, <code>out</code>, <code>overwrite</code></td><td>Dump every indexed entry to a file as JSONL or CSV and return the row count. Existing files are rejected unless <code>overwrite</code> is true.</td></tr>
           </tbody>
         </table>
         <p>Register it in any client that takes an <code>mcpServers</code> map (Claude, Cursor, and friends):</p>
@@ -833,6 +857,8 @@ ardvark verify --strict https://example.com/.well-known/ai-catalog.json">copy</b
   }
 }'>copy</button>
         </div>
+        <p><b>Resources</b> — clients that support MCP resources can read <code>ardvark://catalog/{id}</code> and <code>ardvark://entry/{id}</code>. Search first to obtain the numeric IDs. A catalog resource returns its first 50-entry page; use <code>ardvark_get_catalog</code> with <code>entry_cursor</code> for later pages. Resource contents use <code>application/json</code>.</p>
+        <p><b>Safety metadata</b> — every tool declares MCP read-only, destructive, idempotent, and open-world hints. These hints help clients present suitable confirmation controls. They do not replace client policy. In particular, <code>ardvark_export</code> writes to the local filesystem and requires <code>overwrite: true</code> before it can replace a file.</p>
         <p>Clients rarely launch servers from your project directory, so either pass an absolute <code>--config</code> path or keep your config in the user config dir (<code>~/.config/ardvark/ardvark.json</code>, <code>%AppData%\ardvark\ardvark.json</code>). Relative paths in a config file resolve against the config file's directory, so a user-dir config keeps its database and event log there — no absolute paths needed. Only with no config file at all do the defaults land in whatever directory the client starts the server in.</p>
         <p><b>Long-running crawls</b> — <code>ardvark_crawl</code> drains the entire frontier at polite per-host rates and can take minutes to hours depending on what's queued, and many MCP clients time out tool calls well before that. Prefer <code>ardvark_probe</code> for quick checks of specific hosts, keep <code>ardvark_crawl</code> for small seed lists, and run big crawls from the CLI.</p>
         <p><b>Testing by hand</b> — piping a one-shot request into stdin (<code>echo '...' | ardvark mcp</code>) closes stdin immediately, and the server exits when its input does — usually before you see the responses. Hold stdin open for the whole session, the way real clients do (an interactive terminal, a coprocess, or an MCP inspector tool), and start with the protocol's initialize handshake.</p>
@@ -866,6 +892,7 @@ ardvark verify --strict https://example.com/.well-known/ai-catalog.json">copy</b
 
     <section id="querying">
       <h2>Querying the dataset</h2>
+      <p>Use <a href="#search-index"><code>ardvark search</code></a> for portable entry lookup and <code>ardvark get</code> for stored catalog and entry details. Use direct SQL for aggregation and joins that the CLI does not provide.</p>
       <p>The crawl output is a plain relational schema (<a href="#storage">nine tables</a>), identical across SQLite, MySQL, and Postgres — the queries below run unchanged on any of them; the <code>sqlite3</code> invocations just match the default backend. Column names are snake_case versions of the model fields.</p>
       <p>Catalogs by verdict, with the host that served them:</p>
       <div class="docs-code" data-copy="sqlite3 ardvark.db &quot;
@@ -953,7 +980,7 @@ ardvark verify --strict https://example.com/.well-known/ai-catalog.json">copy</b
 
     <section id="commands">
       <h2>Commands</h2>
-      <p class="section-sub-docs">Every command accepts the global flags <code>--config &lt;path&gt;</code> (default: <code>./ardvark.json</code>, then <code>~/.config/ardvark/ardvark.json</code> on Unix/macOS or <code>%AppData%\ardvark\ardvark.json</code> on Windows) and <code>--color auto|always|never</code>. <code>crawl</code>, <code>work</code>, <code>probe</code>, every <code>seed</code> source, <code>verify</code>, <code>stats</code>, and <code>info</code> also accept <code>--json</code> — see <a href="#json-output">JSON output</a>.</p>
+      <p class="section-sub-docs">Every command accepts the global flags <code>--config &lt;path&gt;</code> (default: <code>./ardvark.json</code>, then <code>~/.config/ardvark/ardvark.json</code> on Unix/macOS or <code>%AppData%\ardvark\ardvark.json</code> on Windows) and <code>--color auto|always|never</code>. <code>crawl</code>, <code>work</code>, <code>probe</code>, every <code>seed</code> source, <code>verify</code>, <code>search</code>, both <code>get</code> subcommands, <code>stats</code>, and <code>info</code> also accept <code>--json</code> — see <a href="#json-output">JSON output</a>.</p>
 
       <article id="cmd-crawl">
         <h3>crawl</h3>
@@ -1042,6 +1069,32 @@ ardvark verify --strict https://example.com/.well-known/ai-catalog.json">copy</b
         <p>See <a href="#verification-failure">what failure looks like</a> for a failing report, and <a href="#publishing">Publishing a catalog</a> for using this as a pre-publish check.</p>
       </article>
 
+      <article id="cmd-search">
+        <h3>search</h3>
+        <p>Search indexed catalog entries. The optional text argument is matched without case sensitivity across URNs, display names, descriptions, tags, representative queries, and reference URLs. Filters are combined with AND. Results are ordered by entry ID.</p>
+        <pre class="docs-synopsis">ardvark search [text] [flags]</pre>
+        <table class="docs-flags">
+          <thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><code>--host string</code></td><td>exact serving host</td></tr>
+            <tr><td><code>--publisher string</code></td><td>exact URN publisher</td></tr>
+            <tr><td><code>--type string</code></td><td>exact entry media type</td></tr>
+            <tr><td><code>--tag string</code></td><td>exact entry tag</td></tr>
+            <tr><td><code>--verdict string</code></td><td><code>valid</code>, <code>valid_with_warnings</code>, or <code>invalid</code></td></tr>
+            <tr><td><code>--limit int</code></td><td>maximum results, 1–200 (default: 50)</td></tr>
+            <tr><td><code>--cursor uint</code></td><td>last entry ID returned by the previous page</td></tr>
+            <tr><td><code>--json</code></td><td>emit entries and <code>next_cursor</code> as JSON</td></tr>
+          </tbody>
+        </table>
+      </article>
+
+      <article id="cmd-get">
+        <h3>get</h3>
+        <p>Read one stored catalog or entry. Numeric IDs select an exact stored row. Exact catalog URLs and entry URNs select the newest matching stored version. JSON output includes the verbatim stored document and verification checks. Catalog entries use cursor pagination.</p>
+        <pre class="docs-synopsis">ardvark get catalog &lt;id|url&gt; [--entry-limit 50] [--entry-cursor id] [--json]
+ardvark get entry &lt;id|urn&gt; [--json]</pre>
+      </article>
+
       <article id="cmd-export">
         <h3>export</h3>
         <p>Dump catalog entries, joined with domain and verification status, as JSONL or CSV. Reads the database configured by <code>storage.driver</code>/<code>storage.dsn</code>.</p>
@@ -1051,6 +1104,7 @@ ardvark verify --strict https://example.com/.well-known/ai-catalog.json">copy</b
           <tbody>
             <tr><td><code>--format string</code></td><td>output format: jsonl or csv (default "jsonl")</td></tr>
             <tr><td><code>--out string</code></td><td>output file path (default: stdout)</td></tr>
+            <tr><td><code>--overwrite</code></td><td>replace an existing output file; without this flag an existing path is rejected</td></tr>
           </tbody>
         </table>
         <div class="docs-code" data-copy="ardvark export --format jsonl --out resources.jsonl">
@@ -1061,7 +1115,7 @@ ardvark verify --strict https://example.com/.well-known/ai-catalog.json">copy</b
 
       <article id="cmd-stats">
         <h3>stats</h3>
-        <p>Summarize the dataset: hosts probed, catalogs by verdict, entries by media type. For anything deeper, query the database directly — see <a href="#querying">Querying the dataset</a>.</p>
+        <p>Summarize the dataset: hosts probed, catalogs by verdict, entries by media type. Use <a href="#cmd-search"><code>search</code></a> to find entries and direct SQL for custom aggregation.</p>
         <pre class="docs-synopsis">ardvark stats [flags]</pre>
         <div class="term docs-term">
           <div class="term-bar"><span></span><span></span><span></span><span class="term-title">ardvark stats</span></div>
@@ -1091,7 +1145,7 @@ ardvark verify --strict https://example.com/.well-known/ai-catalog.json">copy</b
           <div class="term-bar"><span></span><span></span><span></span><span class="term-title">ardvark info</span></div>
           <pre><span class="c-p">$</span> ardvark info
 ardvark
-<span class="c-m">  version</span>                      0.5.0
+<span class="c-m">  version</span>                      0.7.0
 config
 <span class="c-m">  path</span>                         /Users/you/ardvark.json
 <span class="c-m">  exists</span>                       false

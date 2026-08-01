@@ -10,7 +10,7 @@
       "displayName": "ardvark CLI skill",
       "type": "application/ai-skill+md",
       "url": "https://ardvark.no/SKILLS.md",
-      "description": "Teaches an agent to install ardvark, run verify/probe/crawl/seed/export, interpret verdicts and exit codes, and query the resulting SQLite dataset.",
+      "description": "Teaches an agent to install ardvark, run verify/probe/crawl/seed/search/get/export, use its MCP server, interpret verdicts and exit codes, and query the resulting dataset.",
       "tags": ["ard", "crawler", "verification", "cli"],
       "representativeQueries": [
         "how do I verify an ai-catalog.json file against the ARD spec",
@@ -37,12 +37,12 @@
       "displayName": "ardvark MCP server",
       "type": "application/mcp-server-card+json",
       "url": "https://ardvark.no/.well-known/ardvark-mcp.json",
-      "description": "stdio MCP server embedded in the ardvark CLI (`ardvark mcp`), exposing probe, verify, crawl, seed, stats, info, and export as tools that return the same typed JSON as the CLI's --json output.",
+      "description": "stdio MCP server embedded in the ardvark CLI (`ardvark mcp`), exposing crawl operations plus typed search and read access to indexed catalogs and entries.",
       "tags": ["ard", "mcp", "crawler", "verification"],
       "representativeQueries": [
         "probe a host for an ARD ai-catalog.json document over MCP",
         "verify an ai-catalog.json document from an agent",
-        "summarize what the ardvark index currently holds"
+        "search the ardvark index for valid MCP servers and read their stored catalog entries"
       ]
     }
   ]

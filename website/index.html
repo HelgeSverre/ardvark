@@ -122,6 +122,11 @@
         <h3>Crawls politely</h3>
         <p>Per-host rate limiting, robots.txt compliance, size and redirect caps, exponential backoff. One host having a bad day never sinks a run.</p>
       </div>
+      <div class="card">
+        <span class="num">07</span>
+        <h3>Works with AI agents</h3>
+        <p><code>ardvark mcp</code> exposes crawl, search, and read tools over stdio. Agents can query the index without shell commands or direct SQL. <a href="docs.html#mcp">Set up MCP</a>.</p>
+      </div>
     </div>
   </div>
 </section>
@@ -159,12 +164,13 @@ ardvark probe huggingface.co github.com</pre>
         <div class="step-label">
           <span class="num">3</span>
           <h3>Use the data</h3>
-          <p>Everything lands in SQLite + JSONL, ready to query.</p>
+          <p>Search the index, inspect totals, or export every entry.</p>
         </div>
         <div class="codeblock">
           <pre>ardvark stats
+ardvark search "database agent" --verdict valid
 ardvark export --format jsonl --out resources.jsonl</pre>
-          <button class="copy" data-copy="ardvark export --format jsonl --out resources.jsonl">copy</button>
+          <button type="button" class="copy" data-copy="ardvark stats&#10;ardvark search &quot;database agent&quot; --verdict valid&#10;ardvark export --format jsonl --out resources.jsonl">copy</button>
         </div>
       </div>
     </div>

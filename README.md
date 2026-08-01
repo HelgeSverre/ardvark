@@ -23,7 +23,7 @@ Publishers advertise their AI agents, MCP servers, and skills in an `ai-catalog.
 - **Spec verification** — official JSON Schema plus seven semantic checks (URN grammar, value-or-reference exclusivity, query counts, …), each recorded pass/fail with a message; lenient by default toward real-world catalogs, with `verify --strict` for the exact published spec
 - **Bootstrap seeding** — fill the frontier from Certificate Transparency logs, crt.sh, the Tranco top list, GitHub code search, the MCP registry, curated awesome-lists, or Common Crawl domain ranks (`ardvark seed ct|crtsh|tranco|github|mcp|curated|commoncrawl`)
 - **Swappable storage** — SQLite by default; MySQL and Postgres via one config key; append-only JSONL event log alongside
-- **Agent-ready** — `--json` on `crawl`, `work`, `probe`, `seed`, `verify`, and `stats` for machine-readable results, plus an embedded stdio MCP server (`ardvark mcp`) exposing the same operations as tools
+- **Agent-ready** — `--json` on operational and query commands, plus an embedded stdio MCP server (`ardvark mcp`) that can crawl, search, and read indexed catalogs and entries
 - **Resumable runs** — the crawl queue lives in the database; kill a run, start it again, it picks up where it stopped
 - **Polite by default** — per-host rate limiting, robots.txt compliance, body-size caps, redirect caps, backoff on transient failures
 
@@ -70,6 +70,7 @@ Results land in `ardvark.db` (SQLite) and `ardvark.jsonl`. See what you caught:
 
 ```sh
 ardvark stats
+ardvark search "database agent" --verdict valid
 ardvark export --format jsonl --out resources.jsonl
 ```
 
@@ -88,13 +89,16 @@ ardvark export --format jsonl --out resources.jsonl
 | `ardvark seed curated [--count N] [--url U]...` | Extract candidate domains from curated awesome-lists (community MCP server lists by default), dropping hosting/badge/social infrastructure so only real product domains remain. Repeated `--url` replaces the default list set. |
 | `ardvark seed commoncrawl [--top N] [--offset M] [--graph ID]` | Queue the top N domains from the latest Common Crawl web-graph domain ranks (~121M ranked domains vs Tranco's 1M). Streams the gzipped ranks file and stops reading as soon as N domains are collected; `--offset` skips the first M ranks to sample deeper slices. |
 | `ardvark verify <path\|url>` | Verify one catalog — local file or remote URL — and print the check report. Exits 1 if invalid. `--strict` validates against the exact published spec schema (format assertions as errors); `--stored` re-verifies everything in the database. |
-| `ardvark export [--format jsonl\|csv] [--out file]` | Dump discovered resources with their verification status. |
+| `ardvark search [text] [filters]` | Search indexed entries by text, host, publisher, media type, tag, and catalog verdict. Supports stable cursor pagination and `--json`. |
+| `ardvark get catalog <id\|url>` | Read one stored catalog, including its raw document, checks, and a cursor-paginated entry page. Supports `--json`. |
+| `ardvark get entry <id\|urn>` | Read one stored entry with its catalog context, raw entry, and checks. Supports `--json`. |
+| `ardvark export [--format jsonl\|csv] [--out file] [--overwrite]` | Dump discovered resources with their verification status. Existing files are rejected unless `--overwrite` is set. |
 | `ardvark stats` | Summarize the dataset: hosts probed, catalogs by verdict, entries by type. |
 | `ardvark info` | Show installation metadata: version, resolved config path, database and log locations. Never opens the database. |
 | `ardvark migrate` | Create/update the database schema. |
-| `ardvark mcp` | Serve ardvark's commands as MCP tools over stdio: `ardvark_probe`, `ardvark_verify`, `ardvark_crawl`, `ardvark_seed`, `ardvark_stats`, `ardvark_info`, `ardvark_export`. |
+| `ardvark mcp` | Serve crawl operations and read-only search/get operations as MCP tools over stdio. Catalogs and entries are also available as `ardvark://` resource templates. |
 
-`crawl`, `work`, `probe`, every `seed` source, `verify`, `stats`, and `info` also take `--json` to emit the result as pretty-printed JSON on stdout (diagnostics go to stderr; exit codes are unchanged) — the same typed structures the MCP tools return.
+`crawl`, `work`, `probe`, every `seed` source, `verify`, `search`, both `get` subcommands, `stats`, and `info` also take `--json` to emit the result as pretty-printed JSON on stdout (diagnostics go to stderr; exit codes are unchanged) — the same typed structures the MCP tools return.
 
 ## Configuration
 
@@ -196,6 +200,23 @@ ardvark verify https://example.com/.well-known/ai-catalog.json
 ```
 
 ardvark.no publishes its own `ai-catalog.json` and dogfoods the CLI as an agent skill — see [SKILLS.md](SKILLS.md). The catalog also carries a server card for `ardvark mcp` at [`/.well-known/ardvark-mcp.json`](https://ardvark.no/.well-known/ardvark-mcp.json).
+
+## MCP server
+
+`ardvark mcp` runs a local stdio MCP server. Register the binary in an MCP client and pass an absolute config path so the server uses the intended database:
+
+```json
+{
+  "mcpServers": {
+    "ardvark": {
+      "command": "ardvark",
+      "args": ["mcp", "--config", "/absolute/path/to/ardvark.json"]
+    }
+  }
+}
+```
+
+The server exposes crawl operations plus `ardvark_search`, `ardvark_get_catalog`, and `ardvark_get_entry`. Clients can also read `ardvark://catalog/{id}` and `ardvark://entry/{id}` resources. Catalog entry pages contain up to 50 entries by default and include `next_entry_cursor` when another page exists. A catalog resource returns the first page; use `ardvark_get_catalog` with `entry_cursor` for later pages. See the [MCP documentation](https://ardvark.no/docs.html#mcp) for the complete tool list and operational notes.
 
 ## Development
 

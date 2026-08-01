@@ -53,9 +53,19 @@ ardvark crawl
 # Summarize the dataset
 ardvark stats
 
+# Search indexed entries and read stored catalog data
+ardvark search "database agent" --verdict valid --json
+ardvark get entry urn:air:example.com:tools:search --json
+ardvark get catalog 42 --json
+
 # Dump discovered resources with verification status
 ardvark export --format jsonl --out resources.jsonl
 ardvark export --format csv --out resources.csv
+# Existing files require an explicit replacement flag
+ardvark export --format jsonl --out resources.jsonl --overwrite
+
+# Serve the same operations to an MCP client over stdio
+ardvark mcp
 
 # Apply schema migrations without crawling
 ardvark migrate
@@ -92,6 +102,9 @@ where the response headers are available.
 Default DSN is `ardvark.db` in the working directory. Tables:
 `domains`, `probes`, `catalogs`, `catalog_entries`, `artifacts`,
 `registries`, `verification_checks`, `crawl_runs`, `frontier_items`.
+
+Use `ardvark search` and `ardvark get` for portable lookup across SQLite,
+MySQL, and Postgres. Use direct SQL for custom joins and aggregation.
 
 ```sh
 # Every host that failed verification, with its checks
