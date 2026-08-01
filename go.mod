@@ -5,7 +5,7 @@ go 1.26.3
 require (
 	github.com/glebarez/sqlite v1.11.0
 	github.com/google/certificate-transparency-go v1.3.3
-	github.com/modelcontextprotocol/go-sdk v1.6.1
+	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	github.com/spf13/cobra v1.10.2
 	github.com/temoto/robotstxt v1.1.2
