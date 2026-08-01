@@ -11,7 +11,7 @@ var mcpCmd = &cobra.Command{
 	Short: "Serve ardvark's commands as MCP tools over stdio",
 	Long: "mcp runs a stdio MCP (Model Context Protocol) server exposing ardvark's commands as tools: " +
 		"ardvark_probe, ardvark_verify, ardvark_crawl, ardvark_seed, ardvark_stats, ardvark_info, and " +
-		"ardvark_export. " +
+		"ardvark_export, plus read-only search and get tools for indexed data. " +
 		"Each tool returns the same typed JSON structure as the corresponding command's --json output, " +
 		"and uses the same config resolution (--config / ardvark.json in the working directory). " +
 		"Protocol messages flow over stdout; diagnostics go to stderr.",

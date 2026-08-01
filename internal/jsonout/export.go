@@ -62,21 +62,30 @@ const exportWriteBufferSize = 256 * 1024
 
 // Export dumps every catalog entry, joined with domain and verification
 // status, as JSONL or CSV — to the file at outPath when non-empty, else to
-// stdout. Rows stream from the database cursor straight to the writer, so
-// memory use is constant regardless of dataset size and output starts
-// immediately.
+// stdout. An existing output file is rejected unless overwrite is true.
+// Rows stream from the database cursor straight to the writer, so memory use
+// is constant regardless of dataset size and output starts immediately.
 // A close error is reported only when nothing else already failed: on a
 // write path, a failing Close can be the first sign the data never reached
 // disk, so it must not be silently dropped.
-func Export(st *store.Store, format, outPath string, stdout io.Writer) (res ExportResult, err error) {
+func Export(st *store.Store, format, outPath string, stdout io.Writer, overwrite bool) (res ExportResult, err error) {
 	if format != "jsonl" && format != "csv" {
 		return ExportResult{}, fmt.Errorf("export: --format must be \"jsonl\" or \"csv\", got %q", format)
 	}
 
 	w := stdout
 	if outPath != "" {
-		f, cerr := os.Create(outPath)
+		flags := os.O_WRONLY | os.O_CREATE
+		if overwrite {
+			flags |= os.O_TRUNC
+		} else {
+			flags |= os.O_EXCL
+		}
+		f, cerr := os.OpenFile(outPath, flags, 0o644)
 		if cerr != nil {
+			if os.IsExist(cerr) {
+				return ExportResult{}, fmt.Errorf("export: output %s already exists (use --overwrite to replace it)", outPath)
+			}
 			return ExportResult{}, fmt.Errorf("export: creating %s: %w", outPath, cerr)
 		}
 		defer func() {

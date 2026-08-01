@@ -7,11 +7,14 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -47,7 +50,8 @@ func New(configPath, version string) *Server {
 	}, nil)
 
 	mcp.AddTool(s.srv, &mcp.Tool{
-		Name: "ardvark_probe",
+		Name:        "ardvark_probe",
+		Annotations: toolAnnotations("Probe ARD hosts", false, false, false, true),
 		Description: "Probe hosts directly for ARD (Agentic Resource Discovery) ai-catalog.json documents " +
 			"via the well-known path and robots.txt Agentmap directives, recording results to the database. " +
 			"Use this to check specific hosts without HTML spidering. Makes a few polite HTTP requests per " +
@@ -55,7 +59,8 @@ func New(configPath, version string) *Server {
 	}, s.probe)
 
 	mcp.AddTool(s.srv, &mcp.Tool{
-		Name: "ardvark_verify",
+		Name:        "ardvark_verify",
+		Annotations: toolAnnotations("Verify an ARD catalog", true, true, false, true),
 		Description: "Verify a single ARD catalog document against the spec (JSON Schema + semantic checks) " +
 			"and return the full check report: verdict (valid, valid_with_warnings, invalid) plus every " +
 			"check's id, severity, subject, and message. Target is a URL (https://...) or a local file path. " +
@@ -63,7 +68,8 @@ func New(configPath, version string) *Server {
 	}, s.verify)
 
 	mcp.AddTool(s.srv, &mcp.Tool{
-		Name: "ardvark_crawl",
+		Name:        "ardvark_crawl",
+		Annotations: toolAnnotations("Crawl for ARD catalogs", false, false, false, true),
 		Description: "Seed the persistent frontier from the given URLs and/or bare domains, then run the " +
 			"crawler until the frontier is empty, and return the final run summary (pages fetched, hosts " +
 			"probed, catalogs found, valid, errors). Pending work from prior runs is resumed automatically. " +
@@ -73,7 +79,8 @@ func New(configPath, version string) *Server {
 	}, s.crawl)
 
 	mcp.AddTool(s.srv, &mcp.Tool{
-		Name: "ardvark_seed",
+		Name:        "ardvark_seed",
+		Annotations: toolAnnotations("Seed the crawl frontier", false, false, false, true),
 		Description: "Bootstrap the crawl frontier from an external domain source: ct (Certificate " +
 			"Transparency logs), crtsh (crt.sh certificate search), tranco (Tranco top domains), github " +
 			"(GitHub code search for deployed catalogs; needs GITHUB_TOKEN), mcp (the MCP server registry), " +
@@ -84,14 +91,16 @@ func New(configPath, version string) *Server {
 	}, s.seed)
 
 	mcp.AddTool(s.srv, &mcp.Tool{
-		Name: "ardvark_stats",
+		Name:        "ardvark_stats",
+		Annotations: toolAnnotations("Read index statistics", true, true, false, false),
 		Description: "Summarize the indexed dataset: total domains by ARD status, catalogs by verification " +
 			"verdict, and catalog entries by media type. Read-only and fast; call this first to see what " +
 			"the index currently holds.",
 	}, s.stats)
 
 	mcp.AddTool(s.srv, &mcp.Tool{
-		Name: "ardvark_info",
+		Name:        "ardvark_info",
+		Annotations: toolAnnotations("Read installation information", true, true, false, false),
 		Description: "Report installation metadata: ardvark version, resolved config file path and whether " +
 			"it exists, the storage backend (driver, DSN, absolute sqlite database path, existence, size), " +
 			"and the event log location. Read-only and instant; never opens the database or the network, " +
@@ -99,13 +108,64 @@ func New(configPath, version string) *Server {
 	}, s.info)
 
 	mcp.AddTool(s.srv, &mcp.Tool{
-		Name: "ardvark_export",
+		Name:        "ardvark_export",
+		Annotations: toolAnnotations("Export indexed entries", false, false, true, false),
 		Description: "Dump every indexed catalog entry (joined with its domain and verification status) to " +
-			"a file as JSONL or CSV, and return the row count. Read-only apart from creating the output " +
-			"file; fast for typical dataset sizes.",
+			"a file as JSONL or CSV, and return the row count. Existing files are rejected unless overwrite " +
+			"is true. Fast for typical dataset sizes.",
 	}, s.export)
 
+	mcp.AddTool(s.srv, &mcp.Tool{
+		Name:        "ardvark_search",
+		Annotations: toolAnnotations("Search indexed entries", true, true, false, false),
+		Description: "Search indexed catalog entries by free text, serving host, URN publisher, media type, " +
+			"tag, and catalog verdict. Returns stable entry-ID cursor pagination. Read-only; use this " +
+			"to find resources before reading entry or catalog details.",
+	}, s.search)
+
+	mcp.AddTool(s.srv, &mcp.Tool{
+		Name:        "ardvark_get_catalog",
+		Annotations: toolAnnotations("Read an indexed catalog", true, true, false, false),
+		Description: "Read one stored catalog by numeric ID or exact source URL, including its verbatim raw " +
+			"document, catalog checks, and a cursor-paginated entry page. An exact URL selects the newest " +
+			"stored version.",
+	}, s.getCatalog)
+
+	mcp.AddTool(s.srv, &mcp.Tool{
+		Name:        "ardvark_get_entry",
+		Annotations: toolAnnotations("Read an indexed entry", true, true, false, false),
+		Description: "Read one stored catalog entry by numeric ID or exact URN, including its verbatim raw " +
+			"entry, catalog context, and verification checks. An exact URN selects the newest stored version.",
+	}, s.getEntry)
+
+	s.srv.AddResourceTemplate(&mcp.ResourceTemplate{
+		Name:        "ardvark_catalog",
+		Title:       "Indexed ARD catalog",
+		Description: "A stored ARD catalog addressed by its numeric database ID.",
+		MIMEType:    "application/json",
+		URITemplate: "ardvark://catalog/{id}",
+	}, s.catalogResource)
+	s.srv.AddResourceTemplate(&mcp.ResourceTemplate{
+		Name:        "ardvark_entry",
+		Title:       "Indexed ARD entry",
+		Description: "A stored agent, MCP server, skill, or other ARD entry addressed by its numeric database ID.",
+		MIMEType:    "application/json",
+		URITemplate: "ardvark://entry/{id}",
+	}, s.entryResource)
+
 	return s
+}
+
+func boolPtr(v bool) *bool { return &v }
+
+func toolAnnotations(title string, readOnly, idempotent, destructive, openWorld bool) *mcp.ToolAnnotations {
+	return &mcp.ToolAnnotations{
+		Title:           title,
+		ReadOnlyHint:    readOnly,
+		IdempotentHint:  idempotent,
+		DestructiveHint: boolPtr(destructive),
+		OpenWorldHint:   boolPtr(openWorld),
+	}
 }
 
 // Run serves MCP over stdio until ctx is cancelled or the client
@@ -271,8 +331,9 @@ func (s *Server) info(ctx context.Context, req *mcp.CallToolRequest, args any) (
 
 // ExportArgs are the arguments to ardvark_export.
 type ExportArgs struct {
-	Format string `json:"format" jsonschema:"output format: jsonl or csv"`
-	Out    string `json:"out" jsonschema:"file path to write the export to"`
+	Format    string `json:"format" jsonschema:"output format: jsonl or csv"`
+	Out       string `json:"out" jsonschema:"file path to write the export to"`
+	Overwrite bool   `json:"overwrite,omitempty" jsonschema:"replace the output file if it already exists; false rejects existing files"`
 }
 
 func (s *Server) export(ctx context.Context, req *mcp.CallToolRequest, args ExportArgs) (*mcp.CallToolResult, jsonout.ExportResult, error) {
@@ -285,9 +346,114 @@ func (s *Server) export(ctx context.Context, req *mcp.CallToolRequest, args Expo
 	}
 	defer st.Close()
 
-	res, err := jsonout.Export(st, args.Format, args.Out, nil)
+	res, err := jsonout.Export(st, args.Format, args.Out, nil, args.Overwrite)
 	if err != nil {
 		return nil, jsonout.ExportResult{}, err
 	}
 	return nil, res, nil
+}
+
+func (s *Server) search(ctx context.Context, req *mcp.CallToolRequest, args jsonout.SearchOptions) (*mcp.CallToolResult, jsonout.SearchResult, error) {
+	_, st, err := s.openApp()
+	if err != nil {
+		return nil, jsonout.SearchResult{}, err
+	}
+	defer st.Close()
+
+	res, err := jsonout.Search(ctx, st, args)
+	if err != nil {
+		return nil, jsonout.SearchResult{}, err
+	}
+	return nil, res, nil
+}
+
+// GetArgs identifies one stored object by numeric ID or its exact external
+// identifier (catalog URL or entry URN).
+type GetArgs struct {
+	Selector string `json:"selector" jsonschema:"numeric database ID, exact catalog URL, or exact entry URN as required by the tool"`
+}
+
+func (s *Server) getCatalog(ctx context.Context, req *mcp.CallToolRequest, args jsonout.GetCatalogOptions) (*mcp.CallToolResult, jsonout.CatalogDetail, error) {
+	_, st, err := s.openApp()
+	if err != nil {
+		return nil, jsonout.CatalogDetail{}, err
+	}
+	defer st.Close()
+
+	detail, err := jsonout.GetCatalog(ctx, st, args)
+	if err != nil {
+		return nil, jsonout.CatalogDetail{}, err
+	}
+	return nil, detail, nil
+}
+
+func (s *Server) getEntry(ctx context.Context, req *mcp.CallToolRequest, args GetArgs) (*mcp.CallToolResult, jsonout.EntryDetail, error) {
+	_, st, err := s.openApp()
+	if err != nil {
+		return nil, jsonout.EntryDetail{}, err
+	}
+	defer st.Close()
+
+	detail, err := jsonout.GetEntry(ctx, st, args.Selector)
+	if err != nil {
+		return nil, jsonout.EntryDetail{}, err
+	}
+	return nil, detail, nil
+}
+
+func (s *Server) catalogResource(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+	return s.readResource(ctx, req.Params.URI, "catalog", func(ctx context.Context, st *store.Store, id string) (any, error) {
+		return jsonout.GetCatalog(ctx, st, jsonout.GetCatalogOptions{Selector: id})
+	})
+}
+
+func (s *Server) entryResource(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+	return s.readResource(ctx, req.Params.URI, "entry", func(ctx context.Context, st *store.Store, id string) (any, error) {
+		return jsonout.GetEntry(ctx, st, id)
+	})
+}
+
+func (s *Server) readResource(ctx context.Context, uri, kind string, load func(context.Context, *store.Store, string) (any, error)) (*mcp.ReadResourceResult, error) {
+	id, ok := resourceID(uri, kind)
+	if !ok {
+		return nil, mcp.ResourceNotFoundError(uri)
+	}
+	_, st, err := s.openApp()
+	if err != nil {
+		return nil, err
+	}
+	defer st.Close()
+
+	value, err := load(ctx, st, id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, mcp.ResourceNotFoundError(uri)
+		}
+		return nil, err
+	}
+	body, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("encoding %s resource: %w", kind, err)
+	}
+	return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{
+		URI:      uri,
+		MIMEType: "application/json",
+		Text:     string(body),
+	}}}, nil
+}
+
+func resourceID(rawURI, kind string) (string, bool) {
+	u, err := url.Parse(rawURI)
+	if err != nil || u.Scheme != "ardvark" || u.Host != kind || u.RawQuery != "" || u.Fragment != "" {
+		return "", false
+	}
+	id := strings.TrimPrefix(u.Path, "/")
+	if id == "" || strings.Contains(id, "/") {
+		return "", false
+	}
+	n, err := strconv.ParseUint(id, 10, 64)
+	if err != nil || n == 0 {
+		return "", false
+	}
+	return strconv.FormatUint(n, 10), true
 }

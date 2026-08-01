@@ -7,8 +7,9 @@ import (
 )
 
 var (
-	exportFormat string
-	exportOut    string
+	exportFormat    string
+	exportOut       string
+	exportOverwrite bool
 )
 
 // export deliberately has no --json flag: its default output is already
@@ -24,6 +25,7 @@ var exportCmd = &cobra.Command{
 func init() {
 	exportCmd.Flags().StringVar(&exportFormat, "format", "jsonl", "output format: jsonl or csv")
 	exportCmd.Flags().StringVar(&exportOut, "out", "", "output file path (default: stdout)")
+	exportCmd.Flags().BoolVar(&exportOverwrite, "overwrite", false, "replace an existing output file")
 	rootCmd.AddCommand(exportCmd)
 }
 
@@ -34,7 +36,7 @@ func runExport(cmd *cobra.Command, args []string) error {
 	}
 	defer st.Close()
 
-	res, err := jsonout.Export(st, exportFormat, exportOut, cmd.OutOrStdout())
+	res, err := jsonout.Export(st, exportFormat, exportOut, cmd.OutOrStdout(), exportOverwrite)
 	if err != nil {
 		return err
 	}

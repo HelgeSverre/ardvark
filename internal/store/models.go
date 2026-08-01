@@ -323,7 +323,7 @@ type Catalog struct {
 	RawJSON            LongText
 	ContentHash        string `gorm:"index;size:64"`
 	FetchedAt          time.Time
-	VerificationStatus string `gorm:"size:32"`
+	VerificationStatus string `gorm:"index;size:32"`
 
 	Entries []CatalogEntry `gorm:"foreignKey:CatalogID"`
 
@@ -340,7 +340,7 @@ type CatalogEntry struct {
 	URNNamespace          string `gorm:"size:512"`
 	URNName               string `gorm:"size:255"`
 	DisplayName           string `gorm:"size:255"`
-	MediaType             string `gorm:"size:128"`
+	MediaType             string `gorm:"index;size:128"`
 	RefURL                string `gorm:"size:2048"`
 	HasEmbeddedData       bool
 	Description           string   `gorm:"type:text"`

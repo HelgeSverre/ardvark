@@ -42,7 +42,7 @@ func seedExportRows(t *testing.T, st *store.Store) {
 func TestExport_RejectsUnknownFormat(t *testing.T) {
 	st := newTestStore(t)
 
-	if _, err := Export(st, "xml", "", &bytes.Buffer{}); err == nil {
+	if _, err := Export(st, "xml", "", &bytes.Buffer{}, false); err == nil {
 		t.Fatal("Export(format=xml) error = nil, want a format error")
 	}
 }
@@ -52,7 +52,7 @@ func TestExport_JSONLToStdout(t *testing.T) {
 	seedExportRows(t, st)
 
 	var out bytes.Buffer
-	res, err := Export(st, "jsonl", "", &out)
+	res, err := Export(st, "jsonl", "", &out, false)
 	if err != nil {
 		t.Fatalf("Export: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestExport_JSONLToFileIsFlushedAndClosed(t *testing.T) {
 	seedExportRows(t, st)
 
 	outPath := filepath.Join(t.TempDir(), "export.jsonl")
-	res, err := Export(st, "jsonl", outPath, &bytes.Buffer{})
+	res, err := Export(st, "jsonl", outPath, &bytes.Buffer{}, false)
 	if err != nil {
 		t.Fatalf("Export: %v", err)
 	}
@@ -111,12 +111,47 @@ func TestExport_JSONLToFileIsFlushedAndClosed(t *testing.T) {
 	}
 }
 
+func TestExport_ExistingFileRequiresOverwrite(t *testing.T) {
+	st := newTestStore(t)
+	seedExportRows(t, st)
+
+	outPath := filepath.Join(t.TempDir(), "existing.jsonl")
+	if err := os.WriteFile(outPath, []byte("keep me"), 0o644); err != nil {
+		t.Fatalf("writing existing output: %v", err)
+	}
+	if _, err := Export(st, "jsonl", outPath, &bytes.Buffer{}, false); err == nil {
+		t.Fatal("Export without overwrite: want error")
+	}
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("reading existing output: %v", err)
+	}
+	if string(data) != "keep me" {
+		t.Fatalf("existing output changed to %q", data)
+	}
+
+	res, err := Export(st, "jsonl", outPath, &bytes.Buffer{}, true)
+	if err != nil {
+		t.Fatalf("Export with overwrite: %v", err)
+	}
+	if res.Rows != 2 {
+		t.Errorf("Export with overwrite rows = %d, want 2", res.Rows)
+	}
+	data, err = os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("reading overwritten output: %v", err)
+	}
+	if string(data) == "keep me" {
+		t.Fatal("Export with overwrite did not replace output")
+	}
+}
+
 func TestExport_CSVToFileHasHeaderAndQuotedRows(t *testing.T) {
 	st := newTestStore(t)
 	seedExportRows(t, st)
 
 	outPath := filepath.Join(t.TempDir(), "export.csv")
-	if _, err := Export(st, "csv", outPath, &bytes.Buffer{}); err != nil {
+	if _, err := Export(st, "csv", outPath, &bytes.Buffer{}, false); err != nil {
 		t.Fatalf("Export: %v", err)
 	}
 
@@ -148,7 +183,7 @@ func TestExport_InvalidFormatDoesNotCreateOutputFile(t *testing.T) {
 	seedExportRows(t, st)
 
 	outPath := filepath.Join(t.TempDir(), "never-written.jsonl")
-	if _, err := Export(st, "tsv", outPath, &bytes.Buffer{}); err == nil {
+	if _, err := Export(st, "tsv", outPath, &bytes.Buffer{}, false); err == nil {
 		t.Fatal("Export(format=tsv) error = nil, want a format error")
 	}
 	if _, err := os.Stat(outPath); !os.IsNotExist(err) {

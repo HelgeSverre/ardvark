@@ -12,6 +12,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/helgesverre/ardvark/internal/jsonout"
 	"github.com/helgesverre/ardvark/internal/store"
 )
 
@@ -131,12 +132,48 @@ func TestExportHandler(t *testing.T) {
 	if row["host"] != "b.com" {
 		t.Errorf("host = %v, want b.com", row["host"])
 	}
+	if _, _, err := s.export(t.Context(), nil, ExportArgs{Format: "jsonl", Out: out}); err == nil {
+		t.Error("export handler without overwrite replaced an existing file")
+	}
+	if _, _, err := s.export(t.Context(), nil, ExportArgs{Format: "jsonl", Out: out, Overwrite: true}); err != nil {
+		t.Errorf("export handler with overwrite: %v", err)
+	}
 
 	if _, _, err := s.export(t.Context(), nil, ExportArgs{Format: "xml", Out: out}); err == nil {
 		t.Error("export handler with bad format: want error, got nil")
 	}
 	if _, _, err := s.export(t.Context(), nil, ExportArgs{Format: "jsonl"}); err == nil {
 		t.Error("export handler without out: want error, got nil")
+	}
+}
+
+func TestSearchAndGetHandlers(t *testing.T) {
+	s, dsn := newTestServer(t)
+	seedTestData(t, dsn)
+
+	_, search, err := s.search(t.Context(), nil, jsonout.SearchOptions{Query: "b.com"})
+	if err != nil {
+		t.Fatalf("search handler: %v", err)
+	}
+	if len(search.Entries) != 1 {
+		t.Fatalf("search entries = %+v, want one", search.Entries)
+	}
+	entry := search.Entries[0]
+
+	_, gotEntry, err := s.getEntry(t.Context(), nil, GetArgs{Selector: entry.URN})
+	if err != nil {
+		t.Fatalf("get entry handler: %v", err)
+	}
+	if gotEntry.EntryID != entry.EntryID {
+		t.Errorf("get entry ID = %d, want %d", gotEntry.EntryID, entry.EntryID)
+	}
+
+	_, gotCatalog, err := s.getCatalog(t.Context(), nil, jsonout.GetCatalogOptions{Selector: entry.CatalogSourceURL})
+	if err != nil {
+		t.Fatalf("get catalog handler: %v", err)
+	}
+	if gotCatalog.ID != entry.CatalogID {
+		t.Errorf("get catalog ID = %d, want %d", gotCatalog.ID, entry.CatalogID)
 	}
 }
 
@@ -220,8 +257,8 @@ func TestInfoHandler(t *testing.T) {
 	}
 }
 
-// An MCP client connecting over an in-memory transport must see all seven
-// ardvark tools with descriptions.
+// An MCP client connecting over an in-memory transport must see every
+// ardvark tool with descriptions, schemas, and safety annotations.
 func TestToolsList(t *testing.T) {
 	s, _ := newTestServer(t)
 
@@ -245,19 +282,142 @@ func TestToolsList(t *testing.T) {
 		t.Fatalf("tools/list: %v", err)
 	}
 
-	got := make(map[string]bool, len(res.Tools))
+	got := make(map[string]*mcp.Tool, len(res.Tools))
 	for _, tool := range res.Tools {
-		got[tool.Name] = true
+		got[tool.Name] = tool
 		if tool.Description == "" {
 			t.Errorf("tool %s has no description", tool.Name)
+		}
+		if tool.InputSchema == nil || tool.OutputSchema == nil {
+			t.Errorf("tool %s is missing an inferred schema", tool.Name)
+		}
+		if tool.Annotations == nil {
+			t.Errorf("tool %s has no safety annotations", tool.Name)
 		}
 	}
 	for _, want := range []string{
 		"ardvark_probe", "ardvark_verify", "ardvark_crawl",
 		"ardvark_seed", "ardvark_stats", "ardvark_info", "ardvark_export",
+		"ardvark_search", "ardvark_get_catalog", "ardvark_get_entry",
 	} {
-		if !got[want] {
+		if got[want] == nil {
 			t.Errorf("tools/list missing %s (got %v)", want, res.Tools)
+		}
+	}
+	if tool := got["ardvark_search"]; tool != nil && !tool.Annotations.ReadOnlyHint {
+		t.Error("ardvark_search must be annotated read-only")
+	}
+	if tool := got["ardvark_export"]; tool != nil && (tool.Annotations.DestructiveHint == nil || !*tool.Annotations.DestructiveHint) {
+		t.Error("ardvark_export must be annotated destructive")
+	}
+	if tool := got["ardvark_crawl"]; tool != nil && (tool.Annotations.OpenWorldHint == nil || !*tool.Annotations.OpenWorldHint) {
+		t.Error("ardvark_crawl must be annotated open-world")
+	}
+}
+
+func TestResourceTemplatesAndRead(t *testing.T) {
+	s, dsn := newTestServer(t)
+	seedTestData(t, dsn)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	if _, err := s.srv.Connect(ctx, serverTransport, nil); err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	session, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer session.Close()
+
+	templates := map[string]bool{}
+	for tmpl, err := range session.ResourceTemplates(ctx, nil) {
+		if err != nil {
+			t.Fatalf("resources/templates/list: %v", err)
+		}
+		templates[tmpl.URITemplate] = true
+	}
+	for _, want := range []string{"ardvark://catalog/{id}", "ardvark://entry/{id}"} {
+		if !templates[want] {
+			t.Errorf("resource templates missing %s: %v", want, templates)
+		}
+	}
+	toolResult, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "ardvark_search",
+		Arguments: map[string]any{"query": "b.com"},
+	})
+	if err != nil {
+		t.Fatalf("tools/call ardvark_search: %v", err)
+	}
+	if toolResult.IsError || toolResult.StructuredContent == nil {
+		t.Fatalf("ardvark_search result = %+v", toolResult)
+	}
+	encoded, err := json.Marshal(toolResult.StructuredContent)
+	if err != nil {
+		t.Fatalf("encoding structured search result: %v", err)
+	}
+	var search jsonout.SearchResult
+	if err := json.Unmarshal(encoded, &search); err != nil {
+		t.Fatalf("decoding structured search result: %v", err)
+	}
+	if len(search.Entries) != 1 {
+		t.Fatalf("structured search entries = %+v", search.Entries)
+	}
+
+	res, err := session.ReadResource(ctx, &mcp.ReadResourceParams{URI: "ardvark://entry/1"})
+	if err != nil {
+		t.Fatalf("resources/read entry: %v", err)
+	}
+	if len(res.Contents) != 1 || res.Contents[0].MIMEType != "application/json" {
+		t.Fatalf("entry resource contents = %+v", res.Contents)
+	}
+	var entry jsonout.EntryDetail
+	if err := json.Unmarshal([]byte(res.Contents[0].Text), &entry); err != nil {
+		t.Fatalf("decoding entry resource: %v", err)
+	}
+	if entry.URN != "urn:air:b.com:tools:x" {
+		t.Errorf("entry resource URN = %q", entry.URN)
+	}
+
+	res, err = session.ReadResource(ctx, &mcp.ReadResourceParams{URI: fmt.Sprintf("ardvark://catalog/%d", search.Entries[0].CatalogID)})
+	if err != nil {
+		t.Fatalf("resources/read catalog: %v", err)
+	}
+	if len(res.Contents) != 1 || res.Contents[0].MIMEType != "application/json" {
+		t.Fatalf("catalog resource contents = %+v", res.Contents)
+	}
+	var catalog jsonout.CatalogDetail
+	if err := json.Unmarshal([]byte(res.Contents[0].Text), &catalog); err != nil {
+		t.Fatalf("decoding catalog resource: %v", err)
+	}
+	if catalog.SourceURL != search.Entries[0].CatalogSourceURL || len(catalog.Entries) != 1 {
+		t.Errorf("catalog resource = %+v", catalog)
+	}
+
+	if _, err := session.ReadResource(ctx, &mcp.ReadResourceParams{URI: "ardvark://entry/999"}); err == nil {
+		t.Error("resources/read missing entry: want error")
+	}
+}
+
+func TestResourceID(t *testing.T) {
+	for _, tt := range []struct {
+		uri  string
+		kind string
+		want string
+		ok   bool
+	}{
+		{uri: "ardvark://catalog/42", kind: "catalog", want: "42", ok: true},
+		{uri: "ardvark://entry/1", kind: "entry", want: "1", ok: true},
+		{uri: "ardvark://entry/0", kind: "entry"},
+		{uri: "ardvark://entry/1/2", kind: "entry"},
+		{uri: "ardvark://catalog/1?x=y", kind: "catalog"},
+		{uri: "file://entry/1", kind: "entry"},
+	} {
+		got, ok := resourceID(tt.uri, tt.kind)
+		if got != tt.want || ok != tt.ok {
+			t.Errorf("resourceID(%q, %q) = %q, %v; want %q, %v", tt.uri, tt.kind, got, ok, tt.want, tt.ok)
 		}
 	}
 }

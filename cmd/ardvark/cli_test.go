@@ -9,10 +9,12 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/helgesverre/ardvark/internal/probe"
+	"github.com/helgesverre/ardvark/internal/store"
 	"github.com/helgesverre/ardvark/internal/ui"
 )
 
@@ -159,6 +161,18 @@ func executeRoot(t *testing.T, args ...string) (string, error) {
 		jsonOut = false
 		verifyStored = false
 		verifyStrict = false
+		searchHost = ""
+		searchPublisher = ""
+		searchMediaType = ""
+		searchTag = ""
+		searchVerdict = ""
+		searchLimit = 50
+		searchCursor = 0
+		getCatalogEntryLimit = 50
+		getCatalogEntryCursor = 0
+		exportFormat = "jsonl"
+		exportOut = ""
+		exportOverwrite = false
 		rootCmd.SetArgs(nil)
 		rootCmd.SetOut(nil)
 		rootCmd.SetErr(nil)
@@ -187,10 +201,109 @@ func TestMCPHelp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mcp --help: %v", err)
 	}
-	for _, want := range []string{"stdio", "ardvark_probe", "ardvark_stats"} {
+	for _, want := range []string{"stdio", "ardvark_probe", "ardvark_stats", "search and get"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("mcp --help output missing %q:\n%s", want, out)
 		}
+	}
+}
+
+func newCLIIndex(t *testing.T) (cfgPath string, catalogID, entryID uint) {
+	t.Helper()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	cfgPath = filepath.Join(dir, "ardvark.json")
+	cfg := fmt.Sprintf(`{"storage":{"driver":"sqlite","dsn":%q},"log":{"file":%q}}`,
+		dbPath, filepath.Join(dir, "test.jsonl"))
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+	st, err := store.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	domain, err := st.UpsertDomain("cli.example", store.DiscoverySourceSeed)
+	if err != nil {
+		_ = st.Close()
+		t.Fatalf("UpsertDomain: %v", err)
+	}
+	cat := &store.Catalog{
+		DomainID:           domain.ID,
+		SourceURL:          "https://cli.example/.well-known/ard.json",
+		SpecVersion:        "1.0",
+		RawJSON:            `{"specVersion":"1.0"}`,
+		FetchedAt:          time.Now(),
+		VerificationStatus: store.VerificationStatusValid,
+		Entries: []store.CatalogEntry{{
+			URN:                   "urn:air:cli.example:tools:search",
+			URNPublisher:          "cli.example",
+			DisplayName:           "CLI Search",
+			MediaType:             "application/mcp-server-card+json",
+			Description:           "Search from the command line",
+			Tags:                  `["search"]`,
+			RepresentativeQueries: `["find tools"]`,
+			RawJSON:               `{"identifier":"urn:air:cli.example:tools:search"}`,
+			Source:                store.EntrySourceCatalog,
+		}},
+	}
+	if err := st.SaveCatalog(cat, nil, nil); err != nil {
+		_ = st.Close()
+		t.Fatalf("SaveCatalog: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("closing store: %v", err)
+	}
+	return cfgPath, cat.ID, cat.Entries[0].ID
+}
+
+func TestSearchAndGetJSONOutput(t *testing.T) {
+	cfgPath, catalogID, entryID := newCLIIndex(t)
+
+	out, err := executeRoot(t, "--config", cfgPath, "search", "COMMAND LINE", "--tag", "search", "--json")
+	if err != nil {
+		t.Fatalf("search --json: %v", err)
+	}
+	var search struct {
+		Entries []struct {
+			EntryID uint `json:"entry_id"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal([]byte(out), &search); err != nil {
+		t.Fatalf("decoding search JSON: %v\n%s", err, out)
+	}
+	if len(search.Entries) != 1 || search.Entries[0].EntryID != entryID {
+		t.Fatalf("search JSON = %+v, want entry %d", search, entryID)
+	}
+
+	out, err = executeRoot(t, "--config", cfgPath, "get", "catalog", fmt.Sprint(catalogID), "--json")
+	if err != nil {
+		t.Fatalf("get catalog --json: %v", err)
+	}
+	var catalog struct {
+		ID      uint              `json:"id"`
+		RawJSON string            `json:"raw_json"`
+		Entries []json.RawMessage `json:"entries"`
+	}
+	if err := json.Unmarshal([]byte(out), &catalog); err != nil {
+		t.Fatalf("decoding catalog JSON: %v\n%s", err, out)
+	}
+	if catalog.ID != catalogID || catalog.RawJSON == "" || len(catalog.Entries) != 1 {
+		t.Errorf("catalog JSON = %+v", catalog)
+	}
+
+	out, err = executeRoot(t, "--config", cfgPath, "get", "entry", "urn:air:cli.example:tools:search", "--json")
+	if err != nil {
+		t.Fatalf("get entry --json: %v", err)
+	}
+	var entry struct {
+		EntryID uint   `json:"entry_id"`
+		RawJSON string `json:"raw_json"`
+	}
+	if err := json.Unmarshal([]byte(out), &entry); err != nil {
+		t.Fatalf("decoding entry JSON: %v\n%s", err, out)
+	}
+	if entry.EntryID != entryID || entry.RawJSON == "" {
+		t.Errorf("entry JSON = %+v", entry)
 	}
 }
 

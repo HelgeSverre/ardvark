@@ -63,7 +63,7 @@ func main() {
 	}
 
 	start := time.Now()
-	res, err := jsonout.Export(st, *format, "", w)
+	res, err := jsonout.Export(st, *format, "", w, false)
 	if err != nil {
 		log.Fatal(err)
 	}
