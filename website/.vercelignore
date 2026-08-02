@@ -8,9 +8,10 @@
 *.db-journal
 *.jsonl
 
-# OG image generator source. The generated og.png sits at the site root and
-# is published; the Playwright script that produces it is not.
+# Build helpers. Their generated files sit at the site root and are published;
+# the scripts that produce them are not.
 og/
+scripts/
 
 node_modules/
 .DS_Store

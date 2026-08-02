@@ -3,10 +3,14 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "docs:generate": "node scripts/generate-docs-md.mjs",
+    "docs:check": "node scripts/generate-docs-md.mjs --check",
     "og": "node og/generate.mjs",
     "dev": "python3 -m http.server 8321"
   },
   "devDependencies": {
-    "playwright-core": "^1.61.1"
+    "playwright-core": "^1.61.1",
+    "turndown": "^7.2.4",
+    "turndown-plugin-gfm": "^1.0.2"
   }
 }

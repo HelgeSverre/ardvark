@@ -105,7 +105,10 @@ deploy-website:
     cp -R website/.vercel "$staging/website/.vercel"
     echo "Deploying $(git rev-parse --short HEAD) from a clean export:"
     find "$staging/website" -type f -not -path "*/.vercel/*" | sed "s|$staging/website/|  |" | sort
-    cd "$staging/website" && npx vercel --prod --yes
+    cd "$staging/website"
+    npm ci
+    npm run docs:check
+    npx vercel --prod --yes
 
 # === Release ===
 
